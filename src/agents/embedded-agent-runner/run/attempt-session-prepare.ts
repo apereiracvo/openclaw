@@ -434,6 +434,7 @@ export async function prepareEmbeddedAttemptSessionManager(input: {
 }) {
   const { attempt } = input;
   const transcriptState = await resolveExistingAttemptTranscriptState({
+    sessionManager: attempt.sessionManager,
     agentId: input.sessionAgentId,
     config: attempt.config,
     sessionFile: attempt.sessionFile,
