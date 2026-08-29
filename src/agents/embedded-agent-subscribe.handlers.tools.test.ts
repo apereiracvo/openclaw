@@ -1505,7 +1505,7 @@ describe("handleToolExecutionEnd MCP connect action tracking", () => {
 });
 
 describe("handleToolExecutionEnd sessions_spawn terminal success tracking", () => {
-  it("records accepted sessions_spawn identifiers", async () => {
+  it("records accepted sessions_spawn completion ownership", async () => {
     const { ctx } = createTestContext();
 
     await endTool(ctx, {
@@ -1517,6 +1517,7 @@ describe("handleToolExecutionEnd sessions_spawn terminal success tracking", () =
           status: "accepted",
           runId: " run-child ",
           childSessionKey: " agent:claude:subagent:child ",
+          expectsCompletionMessage: true,
         },
       },
     });
@@ -1525,6 +1526,7 @@ describe("handleToolExecutionEnd sessions_spawn terminal success tracking", () =
       {
         runId: "run-child",
         childSessionKey: "agent:claude:subagent:child",
+        expectsCompletionMessage: true,
       },
     ]);
     expect(ctx.state.replayState).toEqual({
