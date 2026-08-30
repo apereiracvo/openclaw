@@ -4,7 +4,7 @@ import type {
   WorkerPlacementReclaimRequest,
 } from "./service-contract.js";
 
-export type WorkerReclaimStartPlacement = Extract<
+type WorkerReclaimStartPlacement = Extract<
   WorkerDispatchPlacement,
   { state: "draining" | "reclaimed" }
 >;
