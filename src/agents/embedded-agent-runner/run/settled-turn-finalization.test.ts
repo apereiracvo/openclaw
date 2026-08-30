@@ -29,10 +29,19 @@ const backendMocks = vi.hoisted(() => ({
         : undefined,
   ),
 }));
+const transcriptMocks = vi.hoisted(() => ({
+  appendAssistantMirrorMessageByIdentity: vi.fn(),
+}));
+
+const SETTLED_TOOL_FINALIZATION_FALLBACK_TEXT =
+  "The tool run finished, but no final summary was produced. I did not repeat any completed actions.";
 
 vi.mock("./backend.js", () => ({
   resolveRuntimeModelAttempt: backendMocks.resolveRuntimeModelAttempt,
   runEmbeddedSettledTurnFinalizationWithBackend: backendMocks.runSettledFinalization,
+}));
+vi.mock("../../../plugin-sdk/session-transcript-runtime.js", () => ({
+  appendAssistantMirrorMessageByIdentity: transcriptMocks.appendAssistantMirrorMessageByIdentity,
 }));
 
 function settledFailedAttempt(): EmbeddedRunAttemptWithReceiptEvidence {
@@ -147,6 +156,7 @@ function finalizationInput(attempt: ReturnType<typeof settledFailedAttempt>) {
 describe("prepareTerminalWithSettledTurnFinalization", () => {
   beforeEach(() => {
     backendMocks.runSettledFinalization.mockReset();
+    transcriptMocks.appendAssistantMirrorMessageByIdentity.mockReset();
   });
 
   it("replaces a settled failed-tool warning with failure-honest final output", async () => {
@@ -254,12 +264,133 @@ describe("prepareTerminalWithSettledTurnFinalization", () => {
     });
   });
 
-  it("fails closed and preserves the initial terminal preparation", async () => {
+  it("retries an empty tool-free finalization once", async () => {
+    const attempt = settledFailedAttempt();
+    const emptyAssistant = buildEmbeddedRunnerAssistant({
+      content: [{ type: "text", text: "" }],
+    });
+    const finalAssistant = buildEmbeddedRunnerAssistant({
+      content: [{ type: "text", text: "The command completed successfully." }],
+    });
+    backendMocks.runSettledFinalization
+      .mockResolvedValueOnce({
+        outcome: "empty",
+        result: { assistant: emptyAssistant, usage: emptyAssistant.usage },
+      })
+      .mockResolvedValueOnce({
+        outcome: "answered",
+        result: { assistant: finalAssistant, usage: finalAssistant.usage },
+      });
+
+    const result = await prepareTerminalWithSettledTurnFinalization(finalizationInput(attempt));
+
+    expect(backendMocks.runSettledFinalization).toHaveBeenCalledTimes(2);
+    expect(backendMocks.runSettledFinalization.mock.calls).toEqual([
+      [expect.objectContaining({ disableTools: true }), attempt, expect.anything()],
+      [expect.objectContaining({ disableTools: true }), attempt, expect.anything()],
+    ]);
+    expect(result.finalizationOutcome).toBe("answered");
+    expect(result.prepared.payloadsWithToolMedia).toEqual([
+      expect.objectContaining({ text: "The command completed successfully." }),
+    ]);
+    expect(result.prepared.agentMeta).toMatchObject({ assistantTurns: 3 });
+  });
+
+  it("delivers a host fallback after two empty tool-free finalization attempts", async () => {
+    const attempt = settledFailedAttempt();
+    const emptyAssistant = buildEmbeddedRunnerAssistant({
+      content: [{ type: "text", text: "" }],
+    });
+    backendMocks.runSettledFinalization.mockResolvedValue({
+      outcome: "empty",
+      result: { assistant: emptyAssistant, usage: emptyAssistant.usage },
+    });
+
+    const input = finalizationInput(attempt);
+    input.finalization.preparedAttempt.sessionKey = "agent:main:settled";
+    input.finalization.preparedAttempt.agentId = "main";
+    input.finalization.preparedAttempt.sessionTarget = {
+      agentId: "main",
+      sessionId: "session-settled",
+      sessionKey: "agent:main:settled",
+      storePath: "/tmp/sessions.json",
+    } as never;
+    transcriptMocks.appendAssistantMirrorMessageByIdentity.mockResolvedValueOnce({
+      ok: true,
+      messageId: "fallback-message",
+    });
+
+    const result = await prepareTerminalWithSettledTurnFinalization(input);
+
+    expect(backendMocks.runSettledFinalization).toHaveBeenCalledTimes(2);
+    expect(result.finalizationOutcome).toBe("completed-empty");
+    expect(result.prepared.payloadsWithToolMedia).toEqual([
+      expect.objectContaining({ text: SETTLED_TOOL_FINALIZATION_FALLBACK_TEXT }),
+    ]);
+    expect(result.prepared.payloadsWithToolMedia?.[0]?.isError).not.toBe(true);
+    expect(getReplyPayloadMetadata(result.prepared.payloadsWithToolMedia?.[0] ?? {})).toMatchObject(
+      {
+        assistantTranscriptIdempotencyKey: "run-settled:settled-finalization-fallback",
+        assistantTranscriptOwned: true,
+        deliverDespiteSourceReplySuppression: true,
+      },
+    );
+    expect(transcriptMocks.appendAssistantMirrorMessageByIdentity).toHaveBeenCalledWith({
+      agentId: "main",
+      config: undefined,
+      idempotencyKey: "run-settled:settled-finalization-fallback",
+      sessionId: "session-settled",
+      sessionKey: "agent:main:settled",
+      storePath: "/tmp/sessions.json",
+      text: SETTLED_TOOL_FINALIZATION_FALLBACK_TEXT,
+    });
+    expect(result.attempt).toMatchObject({
+      assistantTexts: [SETTLED_TOOL_FINALIZATION_FALLBACK_TEXT],
+      replayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+      toolMetas: attempt.toolMetas,
+    });
+    expect(result.prepared.agentMeta).toMatchObject({ assistantTurns: 3 });
+  });
+
+  it("delivers a host fallback when isolated finalization fails", async () => {
     const attempt = settledFailedAttempt();
     backendMocks.runSettledFinalization.mockRejectedValueOnce(new Error("finalizer failed"));
 
     const result = await prepareTerminalWithSettledTurnFinalization(finalizationInput(attempt));
 
+    expect(backendMocks.runSettledFinalization).toHaveBeenCalledOnce();
+    expect(result.finalizationOutcome).toBe("failed");
+    expect(result.attempt).not.toBe(attempt);
+    expect(result.prepared.payloadsWithToolMedia).toEqual([
+      expect.objectContaining({ text: SETTLED_TOOL_FINALIZATION_FALLBACK_TEXT }),
+    ]);
+    expect(result.prepared.payloadsWithToolMedia?.[0]?.isError).not.toBe(true);
+    expect(result.prepared.failureSignal).toEqual({
+      kind: "execution_denied",
+      source: "tool",
+      toolName: "exec",
+      code: "SYSTEM_RUN_DENIED",
+      message: "post-processing error",
+      fatalForCron: true,
+    });
+    expect(result.attempt).toMatchObject({
+      assistantTexts: [SETTLED_TOOL_FINALIZATION_FALLBACK_TEXT],
+      replayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+      toolMetas: attempt.toolMetas,
+    });
+  });
+
+  it("preserves an explicit cancellation instead of delivering a fallback", async () => {
+    const attempt = settledFailedAttempt();
+    const input = finalizationInput(attempt);
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled by user"));
+    input.finalization.preparedAttempt.abortSignal = controller.signal;
+    backendMocks.runSettledFinalization.mockRejectedValueOnce(new Error("finalizer cancelled"));
+
+    const result = await prepareTerminalWithSettledTurnFinalization(input);
+
+    expect(backendMocks.runSettledFinalization).toHaveBeenCalledOnce();
     expect(result.finalizationOutcome).toBe("failed");
     expect(result.attempt).toBe(attempt);
     expect(result.prepared.payloadsWithToolMedia?.[0]).toMatchObject({ isError: true });
