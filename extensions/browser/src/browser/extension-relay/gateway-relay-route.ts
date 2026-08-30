@@ -212,6 +212,11 @@ export async function handleGatewayExtensionUpgrade(
   }
   const authority = getBrowserRelayAuthV2Authority(token);
   getWss().handleUpgrade(req, socket, head, (ws) => {
+    // Pause before the first read tick, including upgrade-head bytes. Pausing
+    // after receiver events begin cannot hold already-buffered application frames.
+    ws.pause();
+    // Borrowed ingress never passes through the local bridge's socket binding.
+    ws.on("error", (err) => log.warn(`relay socket error: ${String(err)}`));
     if (
       !authority.registerAuthenticatedConnection(ws, () =>
         ws.close(4003, "browser relay key rotated"),
@@ -222,8 +227,14 @@ export async function handleGatewayExtensionUpgrade(
     }
     ws.once("close", () => authority.releaseConnection(ws));
     void prepareGatewayIngress(resolved, ws)
-      .then((attach) => attach())
-      .catch(() => ws.close(1011, "Relay ingress unavailable"));
+      .then((attach) => {
+        if (ws.readyState === 1) {
+          attach();
+        }
+      })
+      .catch(() => ws.close(1011, "Relay ingress unavailable"))
+      // Failure must also drain the closing handshake instead of stranding a paused peer.
+      .finally(() => ws.resume());
     log.warn(`legacy extension authentication accepted for profile "${resolved.profileName}"`);
   });
   return true;

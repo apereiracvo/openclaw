@@ -390,6 +390,20 @@ describe.sequential("extension relay HTTP auth v2", () => {
     connection.close();
   });
 
+  it("closes malformed WebSocket framing before authentication without an unowned error", async () => {
+    handle = await startExtensionRelayServer({ port: 0, token: KEY, allowLegacyAuth: false });
+    const issueChallenge = vi.spyOn(getBrowserRelayAuthV2Authority(KEY), "issueChallenge");
+    // Client frames must be masked. This fails inside ws, before the auth parser.
+    const response = await sendRawV2Frames({
+      port: handle.port,
+      subsequentFrames: [Buffer.from([0x81, 0x00])],
+    });
+    expect(response).toContain("101 Switching Protocols");
+    expect(response).not.toContain("auth.challenge");
+    expect(issueChallenge).not.toHaveBeenCalled();
+    expect(handle.bridge.extensionConnected).toBe(false);
+  });
+
   it.each([
     {
       name: "an oversized first auth message",

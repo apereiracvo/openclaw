@@ -24,6 +24,9 @@ export function authenticateExtensionWebSocket(params: {
   removePreAuthGuard?: () => void;
 }): void {
   const { ws, authority } = params;
+  // ws closes on receiver/sender errors, but still emits an application error.
+  // Own it before proof and through promotion to borrowed ingress or owner streams.
+  ws.on("error", (err) => log.warn(`relay socket error: ${String(err)}`));
   let stage: "hello" | "response" | "authenticated" | "failed" = "hello";
   let preAuthGuardActive = true;
   const removePreAuthGuard = () => {

@@ -99,3 +99,30 @@ it("scopes references to their authenticated connection and releases native clai
     }
   });
 });
+
+it("owns malformed-frame errors after owner authentication without stopping the relay", async () => {
+  await withConnectedDaemon(async ({ port, token, extension }) => {
+    const connect = () =>
+      authenticateRelayOwner({
+        port,
+        token,
+        profile: "chrome",
+        signal: new AbortController().signal,
+      });
+    const failed = await connect();
+    const healthy = await connect();
+    try {
+      const closed = once(failed.ws, "close");
+      failed.ws.send("invalid client frame", { mask: false });
+      const [code] = await closed;
+      expect(code).toBe(1002);
+      await expect(ownerRequests(healthy.ws)("ready", { timeoutMs: 0 })).resolves.toMatchObject({
+        result: { ready: true },
+      });
+      expect(extension.readyState).toBe(1);
+    } finally {
+      failed.ws.terminate();
+      healthy.ws.terminate();
+    }
+  });
+});

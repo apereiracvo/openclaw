@@ -162,6 +162,8 @@ async function mockSuccessfulUpgrade() {
     close: vi.fn(),
     terminate: vi.fn(),
     send: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
   });
   vi.spyOn(wsMod.WebSocketServer.prototype, "handleUpgrade").mockImplementation(
     (_req, _socket, _head, cb) => {
@@ -249,7 +251,7 @@ describe("handleGatewayExtensionUpgrade", () => {
     primeProfile();
     const bridge = { id: "fresh-bridge" };
     ensureExtensionRelayForProfileMock.mockResolvedValue({ bridge });
-    await mockSuccessfulUpgrade();
+    const ws = await mockSuccessfulUpgrade();
 
     const { socket } = fakeSocket();
     const handled = await handleGatewayExtensionUpgrade(
@@ -260,6 +262,7 @@ describe("handleGatewayExtensionUpgrade", () => {
 
     expect(handled).toBe(true);
     expect(readExtensionRelayTokenMock).toHaveBeenCalled();
+    expect(() => ws.emit("error", new Error("Invalid WebSocket frame"))).not.toThrow();
     expect(startBrowserControlServiceFromConfigMock).toHaveBeenCalledOnce();
     await expect
       .poll(() => attachExtensionWebSocketMock.mock.calls)
