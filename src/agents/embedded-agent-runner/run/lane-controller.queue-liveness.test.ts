@@ -538,6 +538,7 @@ describe("scheduler capacity wait projection", () => {
       const placementEntered = createDeferred();
       const resumePlacement = createDeferred();
       const uninstallPlacement = installSessionPlacementAdmissionProvider({
+        assertCompactionSuccessorAllowed: rejectUnexpectedCompactionSuccessor,
         executeLocalTurn: async (_claim, runLocal) => await runLocal(),
         executeTurn: async (_claim, _params, runLocal) => {
           placementEntered.resolve();
