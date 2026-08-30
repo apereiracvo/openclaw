@@ -60,7 +60,7 @@ export function renderSessionLeadingState(
   running: boolean;
   leadingIndicator: TemplateResult | typeof nothing;
   trailingIndicator: TemplateResult | typeof nothing;
-  renderedOwnerIdentity?: SessionParticipantIdentity;
+  renderedIdentities?: readonly SessionParticipantIdentity[];
 } {
   const running = sessionHasRunningWork(session);
   const trailingIndicator = session.isChild ? nothing : renderSessionState(session, false);
@@ -171,9 +171,13 @@ export function renderSessionLeadingState(
         circular: true,
       }),
       trailingIndicator,
-      // Single source for facepile dedup: only the identity actually shown in
-      // the lead may be excluded, else attention/archived rows hide a viewer.
-      renderedOwnerIdentity: ownerActor?.identity,
+      // Exclude only visible avatars; a +N stack still needs individual live viewers.
+      renderedIdentities: [
+        ...(ownerActor?.identity ? [ownerActor.identity] : []),
+        ...((participantCount ?? participants?.length) === 1
+          ? (participants ?? []).slice(0, 1).map((participant) => participant.identity)
+          : []),
+      ],
     };
   }
   return {
