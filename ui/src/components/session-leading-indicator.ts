@@ -35,13 +35,14 @@ function renderPersistentSessionIcon(icon: string) {
 }
 
 export function describeSessionTrailingState(session: SidebarRecentSession) {
-  const runningLabel =
+  const activityLabel = t(
     session.hasActiveRun && session.status === "queued"
-      ? t("sessionsView.statusQueued")
-      : t("sessionsView.activeRun");
+      ? "sessionsView.statusQueued"
+      : "sessionsView.activeRun",
+  );
   return [
     session.forkSource ? t("sessionsView.forkedSession") : "",
-    sessionHasRunningWork(session) ? runningLabel : "",
+    sessionHasRunningWork(session) ? activityLabel : "",
     session.unread ? t("sessionsView.unread") : "",
   ]
     .filter(Boolean)
@@ -63,6 +64,7 @@ export function renderSessionLeadingState(
   renderedOwnerIdentity?: SessionParticipantIdentity;
 } {
   const running = sessionHasRunningWork(session);
+  const queued = session.hasActiveRun && session.status === "queued";
   const trailingIndicator = session.isChild ? nothing : renderSessionState(session, false);
   // Transient attention always outranks the persistent decorative icon.
   if (session.isChild) {
@@ -72,6 +74,7 @@ export function renderSessionLeadingState(
         leadingIndicator: renderSessionGlyph({
           content: renderSessionAttentionIcon(session.attention),
           running,
+          queued,
           badge: session.unread && !session.hasActiveRun ? renderSessionUnreadBadge() : nothing,
         }),
         trailingIndicator,
@@ -83,6 +86,7 @@ export function renderSessionLeadingState(
         leadingIndicator: renderSessionGlyph({
           content: renderPersistentSessionIcon(session.icon),
           running,
+          queued,
           badge: session.unread && !session.hasActiveRun ? renderSessionUnreadBadge() : nothing,
         }),
         trailingIndicator,
@@ -99,6 +103,7 @@ export function renderSessionLeadingState(
             .authReady=${avatarAuth?.authReady ?? false}
           ></openclaw-channel-avatar>`,
           running,
+          queued,
           circular: true,
           badge: session.unread && !session.hasActiveRun ? renderSessionUnreadBadge() : nothing,
         }),
