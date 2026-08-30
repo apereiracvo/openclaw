@@ -10006,7 +10006,7 @@ describe("handleSendChat", () => {
         "chat.send": () => {
           throw new GatewayRequestError({
             code: "UNAUTHORIZED",
-            message: "gateway auth failed",
+            message: "⚠️ ✉️ Message failed:  gateway auth failed",
             retryable: false,
           });
         },
@@ -10025,7 +10025,11 @@ describe("handleSendChat", () => {
       ],
       sessionKey: "agent:main",
       sessionsResult: createSessionsResult([
-        row("agent:other", { hasActiveRun: false, status: "done" }),
+        row("agent:other", {
+          displayName: "Other session",
+          hasActiveRun: false,
+          status: "done",
+        }),
       ]),
     });
     admitHostQueueItems(host);
@@ -10034,12 +10038,20 @@ describe("handleSendChat", () => {
 
     // The invisible pane's inline error stays untouched; the failure surfaces globally.
     expect(host.lastError).toBeNull();
-    await waitForFast(() => expect(document.body.textContent).toContain("gateway auth failed"));
+    await waitForFast(() =>
+      expect(document.querySelector(".app-toast__message")?.textContent).toBe(
+        "Other session:   Message failed:  gateway auth failed",
+      ),
+    );
+    expect(document.querySelector(".app-toast__message")?.textContent).not.toMatch(/[⚠✉]/u);
     expect(
       listStoredChatOutboxes(host)
         .flatMap((outbox) => outbox.queue)
         .find((entry) => entry.id === "hidden-terminal-failure"),
-    ).toMatchObject({ sendState: "failed", sendError: "gateway auth failed" });
+    ).toMatchObject({
+      sendState: "failed",
+      sendError: "⚠️ ✉️ Message failed:  gateway auth failed",
+    });
     document.body.replaceChildren();
   });
 

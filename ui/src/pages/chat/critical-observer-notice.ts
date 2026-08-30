@@ -1,5 +1,6 @@
 import type { SessionObserverDigest } from "@openclaw/gateway-protocol";
 import type { GatewaySessionRow } from "../../api/types.ts";
+import { formatWebUiErrorText } from "../../components/error-presentation.ts";
 import { t } from "../../i18n/index.ts";
 import { isCriticalObserverHealth } from "../../lib/observer-digest.ts";
 import { resolveSessionDisplayName } from "../../lib/session-display.ts";
@@ -100,7 +101,7 @@ export function showCriticalSessionObserverNotice(params: {
   );
   const label = resolveSessionDisplayName(sessionKey, row);
   showToast({
-    message: `${t("sessionsView.attentionRequired")}: ${label} — ${headline}`,
+    message: formatWebUiErrorText(`${t("sessionsView.attentionRequired")}: ${label} — ${headline}`),
     actionLabel: t("sessionsView.openSession"),
     onAction: () =>
       digest.agentId ? params.onOpen(sessionKey, digest.agentId) : params.onOpen(sessionKey),

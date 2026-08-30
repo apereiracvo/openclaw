@@ -1,5 +1,6 @@
 import { asOptionalRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { SessionsListResult } from "../../api/types.ts";
+import { formatWebUiErrorText } from "../../components/error-presentation.ts";
 import { t } from "../../i18n/index.ts";
 import type { ChatAttachment, ChatQueueItem } from "../../lib/chat/chat-types.ts";
 import { sameQueuedDeliveryVersion } from "../../lib/chat/outbox-store-codec.ts";
@@ -296,5 +297,7 @@ export function surfaceChatDeliveryFailure(
         !scopedAgentId ||
         (session.agentId !== undefined && normalizeAgentId(session.agentId) === scopedAgentId)),
   );
-  showToast({ message: `${resolveSessionDisplayName(sessionKey, row)}: ${message}` });
+  showToast({
+    message: formatWebUiErrorText(`${resolveSessionDisplayName(sessionKey, row)}: ${message}`),
+  });
 }
