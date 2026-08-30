@@ -65,6 +65,17 @@ jobs:
           persist-credentials: false
           submodules: false
 
+      - name: Checkout Windows cron proof harness
+        if: ${{ inputs.run_windows_ci }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .proof-harness
+          sparse-checkout: .github/proof/windows-cron-durable-fence.e2e.test.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          submodules: false
+
       - name: Probe native Windows
         env:
           TARGET_REF: ${{ inputs.target_ref || github.ref }}
@@ -268,6 +279,54 @@ jobs:
           node -v
           pnpm -v
           pnpm install --frozen-lockfile --prefer-offline --config.ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true --config.side-effects-cache=true || pnpm install --frozen-lockfile --prefer-offline --config.ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true --config.side-effects-cache=true
+
+      - name: Run Windows cron durable-fence proof
+        id: cron_identity
+        if: ${{ inputs.run_windows_ci }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          EXPECTED_HEAD: ${{ inputs.target_ref }}
+          OPENCLAW_WINDOWS_CRON_PROOF_DIR: ${{ github.workspace }}\.artifacts\windows-cron-identity
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($env:EXPECTED_HEAD -match "^[0-9a-f]{40}$" -and $actualHead -ne $env:EXPECTED_HEAD) {
+            throw "Checked out $actualHead, expected frozen target $env:EXPECTED_HEAD."
+          }
+          New-Item -ItemType Directory -Force -Path $env:OPENCLAW_WINDOWS_CRON_PROOF_DIR | Out-Null
+          Copy-Item `
+            -LiteralPath ".proof-harness/.github/proof/windows-cron-durable-fence.e2e.test.ts" `
+            -Destination "test/e2e/windows-cron-durable-fence.e2e.test.ts"
+          node scripts/run-vitest.mjs run `
+            --config test/vitest/vitest.e2e.config.ts `
+            test/e2e/windows-cron-durable-fence.e2e.test.ts
+
+      - name: Upload Windows cron durable-fence proof
+        id: cron_identity_upload
+        if: ${{ always() && inputs.run_windows_ci }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-cron-identity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/windows-cron-identity/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+      - name: Remove Windows cron proof overlay
+        if: ${{ always() && inputs.run_windows_ci }}
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath "test/e2e/windows-cron-durable-fence.e2e.test.ts" -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath ".proof-harness" -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Enforce Windows cron durable-fence proof
+        if: ${{ always() && inputs.run_windows_ci }}
+        shell: pwsh
+        run: |
+          if ("${{ steps.cron_identity.outcome }}" -ne "success") {
+            throw "Windows cron durable-fence proof failed."
+          }
 
       - name: Run Windows CI tests
         if: ${{ inputs.run_windows_ci }}
