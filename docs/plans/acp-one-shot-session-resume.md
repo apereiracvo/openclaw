@@ -248,11 +248,13 @@ Focused evidence:
 - unrelated authorized sender A2A, scoped denial, ownership denial, expected
   session fencing, audit, attribution, and participant recording remain intact.
 
-### 4. Prove restart durability, then document
+### 4. Prove restart durability in isolation, then document
 
 Run the smallest focused automated set covering the files above, extension
 and core type checks, and lint only where the changed surface requires it.
-Then run a redacted live OpenCode proof:
+Then run a redacted OpenCode proof using automated tests or a fully isolated process with a separate
+state directory and port. Do not edit, build in, reconfigure, or restart the operational Gateway
+checkout:
 
 1. Spawn `mode: "run"` in a known `cwd` with a unique marker; record child key,
    backend, ACP ID, and native OpenCode ID when exposed.
@@ -260,7 +262,7 @@ Then run a redacted live OpenCode proof:
    from the owning parent and prove marker/context continuity with unchanged
    IDs, key, backend, and `cwd`.
 3. Clear only the ACP manager/runtime-handle cache and repeat.
-4. Restart the Gateway and repeat from persisted state.
+4. Restart only the isolated fixture/process and repeat from persisted state.
 5. Send a second follow-up and prove it remains resumable.
 6. Remove or corrupt the backend resume target in an isolated fixture and prove
    one failed resume, no fresh conversation, and no fallback backend.
@@ -271,11 +273,15 @@ not sufficient evidence by itself. After the proof, update
 one-shot retention/resume, fail-closed legacy behavior, and task-owned delivery.
 Add a changelog entry only if the eventual implementation is proposed upstream.
 
+A real production Gateway restart remains a separate operator-controlled promotion gate. Prepare
+its exact procedure and expected evidence, but do not perform it during feature implementation.
+
 ## Acceptance checklist
 
 - [ ] Same OpenClaw child key, ACP protocol ID, native OpenCode ID (when
       exposed), backend, and `cwd` across two follow-ups.
-- [ ] Cache loss and Gateway restart resume from persisted state.
+- [ ] Cache loss and isolated restart evidence resume from persisted state; production restart proof
+      is recorded as a deferred promotion gate.
 - [ ] Explicit resume failure performs no fresh retry and no backend failover.
 - [ ] Active, unsupported, unresolved, cancelled, failed, pre-prompt, legacy,
       and not-ready one-shots fail closed and are cleaned up.
@@ -283,7 +289,7 @@ Add a changelog entry only if the eventual implementation is proposed upstream.
 - [ ] Ownership, scoped access, expected-session fencing, audit, attribution,
       participant recording, continuation admission, and delivery are unchanged.
 - [ ] Exactly one parent-visible completion is produced per follow-up.
-- [ ] Automated tests and redacted live evidence demonstrate the behavior; no
+- [ ] Automated tests and redacted automated/isolated evidence demonstrate the behavior; no
       dependency/config change is required for acpx 0.13.1.
 
 ## Remaining uncertainties to resolve with tests, not design expansion
