@@ -79,7 +79,10 @@ describe("pre-auth WebSocket head admission", () => {
       const rawClosed = vi.fn();
       socket.once("close", rawClosed);
       const req = upgradeRequest();
-      const wss = new WebSocketServer({ noServer: true });
+      const wss = new WebSocketServer({
+        noServer: true,
+        maxPayload: EXTENSION_RELAY_MAX_PAYLOAD_BYTES,
+      });
       const writeResult = vi.fn();
       try {
         let closeWebSocket = () => {};
