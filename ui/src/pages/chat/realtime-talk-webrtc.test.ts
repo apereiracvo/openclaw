@@ -522,6 +522,7 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
         role: "user",
         text: "Please try again",
         final: true,
+        itemId: "input-1",
       });
       transport.stop();
     },
@@ -661,11 +662,17 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
       }),
     );
 
-    expect(onTranscript).toHaveBeenCalledWith({ role: "user", text: "hello", final: true });
+    expect(onTranscript).toHaveBeenCalledWith({
+      role: "user",
+      text: "hello",
+      final: true,
+      itemId: "input-1",
+    });
     expect(onTranscript).toHaveBeenCalledWith({
       role: "assistant",
       text: "hi there",
       final: true,
+      itemId: "response-1",
     });
     expect(onTalkEvent.mock.calls.map(([event]) => event.type)).toEqual([
       "transcript.done",
@@ -800,11 +807,13 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
         role: "assistant",
         text: "hi",
         final: false,
+        itemId: "response-1",
       });
       expect(onTranscript).toHaveBeenCalledWith({
         role: "assistant",
         text: "hi there",
         final: true,
+        itemId: "response-1",
       });
       expect(onTalkEvent.mock.calls.map(([event]) => event.type)).toEqual([
         "output.text.delta",

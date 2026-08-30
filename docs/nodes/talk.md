@@ -38,6 +38,12 @@ their current ephemeral-token and WebRTC data-channel flow.
 
 Finalized realtime user and assistant utterances are always appended live to the active agent session, so later chat and voice turns share one history. Client-owned transports report their finalized transcripts with stable entry ids; Gateway relay and Gateway-controlled WebRTC sessions append the same events server-side. Provider sessions also receive the bounded realtime profile context used by Discord voice.
 
+OpenAI GA browser Talk keeps provider conversation order even when an assistant
+reply finishes before the user's transcription. Text streams immediately in the
+call view; delayed transcripts appear beside the correct reply. Stopping a call
+drains finalized speech, skips unfinished transcriptions, and records a browser
+console warning when a transcript never completed.
+
 Google Live saves complete utterances during the call, including Gemini 3.1
 transcriptions that omit an explicit transcription-finished flag. Partial text
 stays provisional until the provider's completion boundary.

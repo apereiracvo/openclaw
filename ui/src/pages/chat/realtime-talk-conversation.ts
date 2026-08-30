@@ -1,5 +1,6 @@
 // Control UI chat module implements realtime talk conversation behavior.
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import type { RealtimeTalkTranscript } from "./realtime-talk-shared.ts";
 
 type RealtimeTalkConversationRole = "user" | "assistant";
 
@@ -8,6 +9,7 @@ export type RealtimeTalkConversationEntry = {
   role: RealtimeTalkConversationRole;
   text: string;
   isStreaming: boolean;
+  order?: number;
 };
 
 export type RealtimeTalkConversationState = {
@@ -19,10 +21,7 @@ export type RealtimeTalkConversationState = {
   assistantEntryId: string | null;
 };
 
-type RealtimeTalkTranscriptUpdate = {
-  role: RealtimeTalkConversationRole;
-  text: string;
-  final: boolean;
+type RealtimeTalkTranscriptUpdate = RealtimeTalkTranscript & {
   nowMs?: number;
 };
 
@@ -50,6 +49,25 @@ export function updateRealtimeTalkConversation(
   const text = update.text;
   if (update.final ? text.trim() === "" : text === "") {
     return state;
+  }
+  if (update.itemId !== undefined && update.order !== undefined) {
+    const id = `item-${update.itemId}`;
+    const previous = state.entries.find((entry) => entry.id === id);
+    const entry = {
+      id,
+      role: update.role,
+      order: update.order,
+      text: boundRealtimeConversationText(update.final ? text : (previous?.text ?? "") + text),
+      isStreaming: !update.final,
+    };
+    // Provider identities survive delayed ASR and overlapping responses. Text and
+    // wall-clock proximity cannot identify which utterance a final replaces.
+    return {
+      ...state,
+      entries: [...state.entries.filter((candidate) => candidate.id !== id), entry]
+        .toSorted((left, right) => (left.order ?? 0) - (right.order ?? 0))
+        .slice(-MAX_CONVERSATION_ENTRIES),
+    };
   }
   const nowMs = update.nowMs ?? Date.now();
   if (update.role === "assistant") {

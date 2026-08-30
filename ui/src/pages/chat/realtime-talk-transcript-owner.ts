@@ -1,7 +1,145 @@
 import { DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS } from "@openclaw/gateway-client/browser";
 import type { BoundedSerialQueue } from "../../../../src/shared/bounded-serial-queue.js";
+import { createDeferredCore } from "../../../../src/shared/deferred.js";
+import {
+  normalizeVoiceTranscriptText,
+  VOICE_TRANSCRIPT_QUEUE_POLICY,
+} from "../../../../src/talk/voice-transcript.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
-import type { RealtimeTalkTransport } from "./realtime-talk-shared.ts";
+import type {
+  RealtimeTalkTranscript,
+  RealtimeTalkTranscriptItem,
+  RealtimeTalkTransport,
+} from "./realtime-talk-shared.ts";
+
+type ReservedTranscript = {
+  order: number;
+  role: "user" | "assistant";
+  complete?: (text: string | undefined) => void;
+};
+
+// Keep exact identities for the connection: eviction could admit a late duplicate
+// final. This matches the WebRTC response/tool identity budget.
+const MAX_TRANSCRIPT_ITEM_IDENTITIES = 1_024;
+const MAX_TRANSCRIPT_ITEM_ID_CHARS = 1_024;
+
+export class ClientVoiceTranscriptQueue {
+  private sequence = 0;
+  private lastItemId: string | undefined;
+  private readonly items = new Map<string, ReservedTranscript | null>();
+
+  constructor(
+    readonly queue: BoundedSerialQueue,
+    private readonly write: (
+      entryId: string,
+      role: "user" | "assistant",
+      text: string,
+    ) => Promise<void>,
+    private readonly onFailure: (error: unknown) => void,
+  ) {}
+
+  observe(item: RealtimeTalkTranscriptItem): void {
+    if (item.type === "settled") {
+      const reservation = this.requireItem(item.itemId);
+      this.settle(reservation);
+      return;
+    }
+    if (this.items.has(item.itemId)) {
+      return;
+    }
+    if (
+      this.items.size >= MAX_TRANSCRIPT_ITEM_IDENTITIES ||
+      item.itemId.length > MAX_TRANSCRIPT_ITEM_ID_CHARS
+    ) {
+      throw new Error("Realtime transcript item identity limit exceeded");
+    }
+    // This client appends provider items; it never requests historical insertion.
+    // Reject an unknown/rewritten predecessor before committing a false order.
+    if (item.previousItemId != null && item.previousItemId !== this.lastItemId) {
+      throw new Error("Realtime transcript item has an unexpected predecessor");
+    }
+    this.lastItemId = item.itemId;
+    if (item.role === null) {
+      this.items.set(item.itemId, null);
+      return;
+    }
+    const result = createDeferredCore<string | undefined>();
+    const reservation: ReservedTranscript = {
+      order: ++this.sequence,
+      role: item.role,
+      complete: result.resolve,
+    };
+    this.items.set(item.itemId, reservation);
+    // Reserve the existing FIFO position before asynchronous ASR can be overtaken
+    // by assistant finals. Charge the maximum retained text while it is pending.
+    this.enqueue(async () => {
+      const text = await result.promise;
+      if (text) {
+        await this.write(String(reservation.order), reservation.role, text);
+      }
+    }, VOICE_TRANSCRIPT_QUEUE_POLICY.maxEntryChars);
+  }
+
+  publish(entry: RealtimeTalkTranscript): RealtimeTalkTranscript | undefined {
+    if (entry.itemId !== undefined) {
+      const reservation = this.requireItem(entry.itemId);
+      if (reservation.role !== entry.role) {
+        throw new Error("Realtime transcript item changed roles");
+      }
+      if (!reservation.complete) {
+        return undefined;
+      }
+      if (entry.final) {
+        this.settle(reservation, normalizeVoiceTranscriptText(entry.text) || undefined);
+      }
+      return { ...entry, order: reservation.order };
+    }
+    // Google Live and frameless transcripts have no GA item-creation contract.
+    // Their provider completion order continues to own unkeyed admission.
+    if (entry.final) {
+      const text = normalizeVoiceTranscriptText(entry.text);
+      if (text) {
+        const entryId = String(++this.sequence);
+        this.enqueue(() => this.write(entryId, entry.role, text), text.length);
+      }
+    }
+    return entry;
+  }
+
+  close(): string[] {
+    const missing: string[] = [];
+    for (const [itemId, reservation] of this.items) {
+      if (reservation?.complete) {
+        missing.push(itemId);
+        this.settle(reservation);
+      }
+    }
+    this.items.clear();
+    return missing;
+  }
+
+  private settle(reservation: ReservedTranscript, text?: string): void {
+    const complete = reservation.complete;
+    reservation.complete = undefined;
+    complete?.(text);
+  }
+
+  private requireItem(itemId: string): ReservedTranscript {
+    const reservation = this.items.get(itemId);
+    if (!reservation) {
+      throw new Error("Realtime transcript refers to an unknown speech item");
+    }
+    return reservation;
+  }
+
+  private enqueue(run: () => Promise<void>, weight: number): void {
+    const admission = this.queue.enqueue(run, { weight });
+    if (!admission.accepted) {
+      throw new Error(VOICE_TRANSCRIPT_QUEUE_POLICY.overflowMessage);
+    }
+    void admission.completion.catch(this.onFailure);
+  }
+}
 
 export type ClientVoiceSessionOwner = {
   signal: AbortSignal;
