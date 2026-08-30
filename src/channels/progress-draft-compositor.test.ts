@@ -23,6 +23,56 @@ function createTestProgressDraftCompositor(
 const DEFAULT_PROGRESS_DRAFT_INITIAL_DELAY_MS = 1_500;
 
 describe("createChannelProgressDraftCompositor", () => {
+  it("keeps summary presentation stable across tool activity and uses plain milestones", async () => {
+    const update = vi.fn();
+    const progress = createTestProgressDraftCompositor({
+      entry: { streaming: { mode: "progress" } },
+      presentation: "summary",
+      update,
+    });
+    await progress.pushPreambleHeadline("Checking source 🔎");
+    await progress.noteActivity({ startImmediately: true });
+    for (let index = 0; index < 20; index++) {
+      await progress.pushToolEvent({ name: "exec", toolCallId: `call-${index}`, phase: "start" });
+    }
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update.mock.calls[0]?.[0]).toBe("Checking source 🔎");
+    await progress.pushPlanProgress([{ step: "Verify behavior", status: "in_progress" }]);
+    expect(update.mock.lastCall?.[0]).toBe("Checking source 🔎\n\nIn progress: Verify behavior");
+    progress.cancel();
+  });
+
+  it("shows and resolves summary approval attention independently of tool activity", async () => {
+    const update = vi.fn();
+    const progress = createTestProgressDraftCompositor({
+      entry: { streaming: { mode: "progress" } },
+      presentation: "summary",
+      update,
+    });
+    await progress.pushApprovalEvent({
+      phase: "requested",
+      approvalId: "approval-1",
+      title: "Run checks",
+    });
+    expect(update.mock.lastCall?.[0]).toContain("Run checks");
+    expect(update.mock.lastCall?.[1]).toMatchObject({ flush: true });
+    await progress.pushPlanProgress(
+      Array.from({ length: 8 }, (_, index) => ({
+        step: `Milestone ${index + 1}`,
+        status: "pending" as const,
+      })),
+    );
+    expect(update.mock.lastCall?.[0]).toContain("Run checks");
+    await progress.pushPlanProgress([]);
+    for (let index = 0; index < 20; index++) {
+      await progress.pushToolEvent({ name: "read", toolCallId: `call-${index}`, phase: "start" });
+    }
+    expect(update.mock.lastCall?.[0]).toContain("Run checks");
+    await progress.pushApprovalEvent({ phase: "resolved", approvalId: "approval-1" });
+    expect(update.mock.lastCall?.[0]).toBe("Working");
+    progress.cancel();
+  });
+
   it("counts only work tool calls and resets per turn", () => {
     let now = 1_000;
     const work = createChannelProgressWorkCounter({ now: () => now });
