@@ -57,6 +57,10 @@ export type SessionAcpIdentity = {
   acpxRecordId?: string;
   acpxSessionId?: string;
   agentSessionId?: string;
+  /** Observed support from the exact backend session record; never inferred from identifiers. */
+  sessionResumeSupported?: boolean;
+  /** Durable terminal fence proving the completed one-shot is ready for another resume. */
+  sessionResumeReady?: boolean;
   /** Runtime lifecycle point that last supplied the identity fields. */
   source: SessionAcpIdentitySource;
   lastUpdatedAt: number;

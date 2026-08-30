@@ -211,6 +211,15 @@ function readRecordAgentPid(record: unknown): number | undefined {
   return numericPid && Number.isInteger(numericPid) && numericPid > 0 ? numericPid : undefined;
 }
 
+function readRecordSessionResumeSupported(record: AcpLoadedSessionRecord): boolean | undefined {
+  if (!record) {
+    return undefined;
+  }
+  return Boolean(
+    record.agentCapabilities?.sessionCapabilities?.resume || record.agentCapabilities?.loadSession,
+  );
+}
+
 function readOpenClawLeaseIdFromRecord(record: unknown): string | undefined {
   if (typeof record !== "object" || record === null) {
     return undefined;
@@ -1121,6 +1130,13 @@ export class AcpxRuntime implements CompleteAcpRuntime {
     const recordPid = readRecordAgentPid(record);
     const command = readAgentCommandFromRecord(record);
     const identity = readAcpxProcessLeaseIdentity(command);
+    const recordSessionKey = readSessionRecordName(record);
+    // Explicit one-shot resume projects the original OpenClaw key over a synthetic ACPX record.
+    // Lease ownership remains synthetic, so operation validation must accept that exact record key.
+    const leaseSessionKeys = new Set([
+      handle.sessionKey,
+      ...(recordSessionKey ? [recordSessionKey] : []),
+    ]);
     if (
       !command ||
       !isOpenClawLeaseAwareAcpxProcessCommand({
@@ -1147,7 +1163,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         await processLeaseStore.save({
           leaseId: identity.leaseId,
           gatewayInstanceId: identity.gatewayInstanceId,
-          sessionKey: handle.sessionKey,
+          sessionKey: recordSessionKey ?? handle.sessionKey,
           wrapperRoot,
           wrapperPath: extractGeneratedWrapperPath(command),
           rootPid: recordPid ?? 0,
@@ -1159,7 +1175,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
       }
       if (
         existing.gatewayInstanceId !== identity.gatewayInstanceId ||
-        existing.sessionKey !== handle.sessionKey ||
+        !leaseSessionKeys.has(existing.sessionKey) ||
         existing.wrapperRoot !== wrapperRoot
       ) {
         throw new AcpRuntimeError(
@@ -1530,18 +1546,30 @@ export class AcpxRuntime implements CompleteAcpRuntime {
           ? { kind: "applied", model: requestedModel }
           : { kind: "dropped" }
         : undefined;
+    const explicitOneShotResume =
+      input.mode === "oneshot" && Boolean(input.resumeSessionId?.trim());
+    // ACPX one-shots use allow-new reconnect semantics and can retain pending state by session key.
+    // A unique persistent delegate record gives explicit OpenClaw one-shot resumes a fresh lease
+    // and ACPX's same-session-only contract; OpenClaw still owns and closes the result as one-shot.
+    const delegatedInput: OpenClawRuntimeEnsureInput = explicitOneShotResume
+      ? {
+          ...input,
+          sessionKey: `${input.sessionKey}:oneshot-resume:${createAcpxProcessLeaseId()}`,
+          mode: "persistent",
+        }
+      : input;
     const ensureInput = isCodexAcp
-      ? withCodexSessionModel(input, codexModelOverride)
+      ? withCodexSessionModel(delegatedInput, codexModelOverride)
       : claudeModelOverride
-        ? { ...input, model: claudeModelOverride }
-        : input;
+        ? { ...delegatedInput, model: claudeModelOverride }
+        : delegatedInput;
     const stableLaunchCommand =
       codexModelOverride && command
         ? appendCodexAcpConfigOverrides(command, codexModelOverride)
         : command;
     const reusableCommand = await this.readReusablePersistentSessionCommand({
-      sessionKey: input.sessionKey,
-      mode: input.mode,
+      sessionKey: ensureInput.sessionKey,
+      mode: ensureInput.mode,
       cwd: input.cwd,
       command: stableLaunchCommand,
       resumeSessionId: input.resumeSessionId,
@@ -1560,7 +1588,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
             }),
         })
       : await this.runWithLaunchLease({
-          sessionKey: input.sessionKey,
+          sessionKey: ensureInput.sessionKey,
           command: stableLaunchCommand,
           reusableCommand,
           run: () =>
@@ -1572,7 +1600,23 @@ export class AcpxRuntime implements CompleteAcpRuntime {
               }),
             ),
         });
-    return appliedModel ? { ...handle, appliedModel } : handle;
+    const openClawHandle = explicitOneShotResume
+      ? { ...handle, sessionKey: input.sessionKey }
+      : handle;
+    let sessionResumeSupported: boolean | undefined;
+    try {
+      sessionResumeSupported = readRecordSessionResumeSupported(
+        await this.sessionStore.load(handle.acpxRecordId ?? handle.sessionKey),
+      );
+    } catch {
+      // Capability observation is best-effort for a newly ensured session. Durable resume
+      // admission requires an explicit true later, so a read failure must remain unknown.
+    }
+    return {
+      ...openClawHandle,
+      ...(sessionResumeSupported !== undefined ? { sessionResumeSupported } : {}),
+      ...(appliedModel ? { appliedModel } : {}),
+    };
   }
 
   async *runTurn(input: Parameters<AcpRuntime["runTurn"]>[0]): AsyncIterable<AcpRuntimeEvent> {
