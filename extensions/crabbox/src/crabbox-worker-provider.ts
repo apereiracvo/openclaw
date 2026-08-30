@@ -45,6 +45,7 @@ import {
 } from "./crabbox-worker-profile.js";
 import {
   countCrabboxProvisionSetupPhases,
+  CRABBOX_COMMAND_SETTLEMENT_TIMEOUT_MS,
   CRABBOX_DESKTOP_WARMUP_TIMEOUT_MS,
   CRABBOX_LIFECYCLE_TIMEOUT_MS,
   CRABBOX_MACHINE0_READY_WAIT_TIMEOUT,
@@ -57,7 +58,10 @@ import {
   resolveCrabboxReadyPollIntervalMs,
 } from "./crabbox-worker-timeouts.js";
 import { loadCrabboxWorkerWallpaperBase64 } from "./crabbox-worker-wallpaper.js";
-import { createCrabboxWarmImageManager } from "./crabbox-worker-warm-image.js";
+import {
+  createCrabboxWarmImageManager,
+  resolveCrabboxWarmImageCaptureTimeoutMs,
+} from "./crabbox-worker-warm-image.js";
 
 export { resolveOpenClawRoot } from "./crabbox-worker-profile.js";
 
@@ -510,6 +514,16 @@ export function createCrabboxWorkerProvider(
     resolveAllocation,
     resolveProvisionTimeoutMs(profile) {
       return resolveCrabboxProvisionCallTimeoutMs(parseCrabboxProfile(profile));
+    },
+    resolveDestroyTimeoutMs(profile) {
+      const parsed = parseCrabboxProfile(profile);
+      // The lifecycle profile omits placement sizing, which may have enabled capture.
+      // Reserve its full budget unless the profile explicitly disabled warm images.
+      return (
+        resolveCrabboxLifecycleTimeoutMs(parsed.provider) +
+        CRABBOX_COMMAND_SETTLEMENT_TIMEOUT_MS +
+        (parsed.warmImage === false ? 0 : resolveCrabboxWarmImageCaptureTimeoutMs(parsed.provider))
+      );
     },
     async provision(
       profile: WorkerProfile,

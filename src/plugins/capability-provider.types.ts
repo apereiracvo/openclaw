@@ -251,6 +251,8 @@ export type WorkerProvider = {
   renew?: (leaseId: string) => Promise<void>;
   /** Idempotent; resolves only after the provider can prove teardown. */
   destroy: (lease: { leaseId: string; profile: WorkerProfile }) => Promise<void>;
+  /** Maximum core wait for teardown, including provider-owned checkpointing and cleanup. */
+  resolveDestroyTimeoutMs?: (profile: WorkerProfile) => number;
 };
 
 /** Speech capability registered by a plugin. */

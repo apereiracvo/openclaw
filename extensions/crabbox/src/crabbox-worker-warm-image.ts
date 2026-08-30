@@ -40,6 +40,19 @@ const WARM_IMAGE_CAPTURE_TIMEOUT_MS = 180_000;
 const WARM_IMAGE_MACHINE0_CAPTURE_TIMEOUT_MS = 600_000;
 const CHECKPOINT_ID_PATTERN = /^chk_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 
+const checkpointCaptureTimeoutMs = (provider: string) =>
+  provider === "machine0" ? WARM_IMAGE_MACHINE0_CAPTURE_TIMEOUT_MS : WARM_IMAGE_CAPTURE_TIMEOUT_MS;
+
+export function resolveCrabboxWarmImageCaptureTimeoutMs(provider: string): number {
+  // Bound collection, verification, missing-image deletion, capacity reclamation,
+  // and predecessor retirement as well as scrub/create; core must await the owner.
+  return (
+    5 * WARM_IMAGE_COMMAND_TIMEOUT_MS +
+    WARM_IMAGE_CAPTURE_TIMEOUT_MS +
+    checkpointCaptureTimeoutMs(provider)
+  );
+}
+
 // Enrollment roots its identity, device token, bundles, and node-host workspaces
 // under OPENCLAW_STATE_DIR here; deleting it is the cross-session data boundary.
 // Crabbox's separate checkpoint workdir never receives session files (--no-sync).
@@ -504,9 +517,7 @@ export function createCrabboxWarmImageManager(dependencies: {
               "--json",
               ...(context.provider === "machine0" ? ["--strategy", "image"] : []),
             ],
-            context.provider === "machine0"
-              ? WARM_IMAGE_MACHINE0_CAPTURE_TIMEOUT_MS
-              : WARM_IMAGE_CAPTURE_TIMEOUT_MS,
+            checkpointCaptureTimeoutMs(context.provider),
           ),
           context.id,
         );

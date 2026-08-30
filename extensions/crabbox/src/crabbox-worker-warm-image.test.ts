@@ -179,6 +179,10 @@ describe("Crabbox profile warm images", () => {
 
       expect(calls.some(({ argv }) => argv[1] === "checkpoint")).toBe(false);
       expect(calls.at(-1)?.argv[1]).toBe("stop");
+      // Even without capture, the stop command owns termination after its timer fires.
+      expect(provider.resolveDestroyTimeoutMs?.(profile)).toBeGreaterThan(
+        calls.at(-1)!.options.timeoutMs,
+      );
     },
   );
 
@@ -204,6 +208,9 @@ describe("Crabbox profile warm images", () => {
     // them under coordinator latency (live-measured on AWS 2026-08-26).
     expect(scrub?.options.timeoutMs).toBe(180_000);
     expect(calls[1]?.options.timeoutMs).toBe(180_000);
+    expect(provider.resolveDestroyTimeoutMs?.(PROFILE)).toBeGreaterThanOrEqual(
+      calls.reduce((total, call) => total + call.options.timeoutMs, 0),
+    );
     const home = tempDirs.make("openclaw-crabbox-warm-scrub-");
     const workspace = path.join(
       home,
@@ -352,6 +359,11 @@ describe("Crabbox profile warm images", () => {
       options.input?.toString().includes("CRABBOX_SCRUB_NODE_SCRIPT"),
     );
     expect(scrub?.options.timeoutMs).toBe(180_000);
+    const teardownCalls = calls.slice(calls.indexOf(scrub!));
+    // Include stop after capture: the caller must not time out while either still owns the lease.
+    expect(provider.resolveDestroyTimeoutMs?.(profile)).toBeGreaterThanOrEqual(
+      teardownCalls.reduce((total, call) => total + call.options.timeoutMs, 0),
+    );
     calls.length = 0;
     await provisionWarmProfile(provider, profile, `provision:v2:${"2".repeat(64)}`);
     expect(calls.find(({ argv }) => argv[2] === "fork")?.argv[3]).toBe(CHECKPOINT_ID);

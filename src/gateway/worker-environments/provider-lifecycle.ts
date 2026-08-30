@@ -23,7 +23,7 @@ import { deriveEnvironmentIntent } from "./service-contract.js";
 import {
   normalizeWorkerMachineOptions,
   requireInheritedWorkerProfileAuthorization,
-  requireProviderProvisionTimeoutMs,
+  requireProviderOperationTimeoutMs,
   requireWorkerAllocation,
   requireWorkerLease,
   requireWorkerLeaseStatus,
@@ -42,7 +42,8 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
     options;
   const { commitReady, ensurePendingCredential } = options.credentialBroker;
 
-  const { requireCurrentOwner, stopOwner } = createWorkerProviderOwnerLifecycle(options);
+  const { requireCurrentOwner, stopOwner, destroyLease } =
+    createWorkerProviderOwnerLifecycle(options);
 
   function requireWorkerProfile(value: unknown): WorkerProfile {
     const error = validateCloudWorkerProfileSettings(value);
@@ -147,9 +148,7 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
     const draining = move(stopped, "draining", { ...leasePatch, lastError: detail });
     const destroying = move(draining, "destroying", { lastError: detail });
     try {
-      await callProvider(record.environmentId, () =>
-        provider.destroy(lifecycleLease(record, leaseId)),
-      );
+      await destroyLease(destroying, provider, lifecycleLease(destroying, leaseId));
     } catch (cleanupError: unknown) {
       // An indeterminate destroy must remain retryable; never hide a possibly-live paid lease
       // behind terminal failed state.
@@ -247,7 +246,10 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
       }
       const providerTimeoutMs =
         options.providerCallTimeoutMs === undefined
-          ? requireProviderProvisionTimeoutMs(provider.resolveProvisionTimeoutMs?.(profile))
+          ? requireProviderOperationTimeoutMs(
+              "provision",
+              provider.resolveProvisionTimeoutMs?.(profile),
+            )
           : undefined;
       const machineClass =
         typeof record.profileSnapshot.machineClass === "string"
@@ -415,10 +417,7 @@ export function createWorkerProviderLifecycle(options: WorkerProviderLifecycleOp
     const providerOwnsMachine = r.nodeDeviceId !== null && r.sharedHost === false;
     const destroying = providerOwnsMachine ? r : beginDestroy(r);
     try {
-      await callProvider(r.environmentId, () => {
-        requireCurrentOwner(destroying);
-        return owningProvider.destroy(lifecycleLease(r, leaseId));
-      });
+      await destroyLease(destroying, owningProvider, lifecycleLease(destroying, leaseId));
     } catch (error) {
       saveError(requireCurrentOwner(destroying), error);
       throw serviceError("provider_failure", "Worker provider operation failed");
