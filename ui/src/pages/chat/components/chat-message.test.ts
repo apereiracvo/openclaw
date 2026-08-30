@@ -669,29 +669,6 @@ afterEach(() => {
 });
 
 describe("grouped chat rendering", () => {
-  it("removes pictograms from transcript warnings without changing ordinary assistant emoji", () => {
-    const container = document.createElement("div");
-
-    renderAssistantMessage(
-      container,
-      createAssistantMessage("⚠️ 🛠️ Exec failed:  command unavailable", { timestamp: 1000 }),
-    );
-    expect(markdownRenderMock).toHaveBeenCalledWith(
-      "  Exec failed:  command unavailable",
-      expect.any(Object),
-    );
-    expect(container.querySelector("[data-message-text]")?.getAttribute("data-message-text")).toBe(
-      "⚠️ 🛠️ Exec failed:  command unavailable",
-    );
-
-    markdownRenderMock.mockClear();
-    renderAssistantMessage(
-      container,
-      createAssistantMessage("Deployment ready 🚀", { timestamp: 1001 }),
-    );
-    expect(markdownRenderMock).toHaveBeenCalledWith("Deployment ready 🚀", expect.any(Object));
-  });
-
   it("preserves paragraph breaks around assistant attachments in rendered markdown", () => {
     const container = document.createElement("div");
 
@@ -2193,7 +2170,7 @@ describe("grouped chat rendering", () => {
       host,
       agentEvent("run-guardian", 3, "codex_app_server.guardian", {
         phase: "warning",
-        message: "⚠️ 🛠️ Guardian stopped after too many rejected actions.",
+        message: "Guardian stopped after too many rejected actions.",
       }),
     );
     handleAgentEvent(
@@ -2217,9 +2194,6 @@ describe("grouped chat rendering", () => {
     if (!items.every((item) => item.kind === "notice")) {
       throw new Error("Expected guardian notice projections");
     }
-    expect(host.guardianNotices?.[2]?.message).toBe(
-      "⚠️ 🛠️ Guardian stopped after too many rejected actions.",
-    );
     render(html`${items.map((item) => renderChatNotice(item))}`, container);
 
     const notices = [...container.querySelectorAll<HTMLElement>(".chat-notice")];
@@ -2234,7 +2208,6 @@ describe("grouped chat rendering", () => {
     expect(notices[1]?.textContent).toContain("Command reaches the network.");
     expect(notices[2]?.textContent).toContain("Guardian warning");
     expect(notices[2]?.textContent).toContain("Guardian stopped after too many rejected actions.");
-    expect(notices[2]?.textContent).not.toMatch(/[⚠🛠]/u);
     expect(notices[3]?.classList.contains("callout")).toBe(true);
     expect(notices[3]?.classList.contains("danger")).toBe(true);
     expect(notices[3]?.getAttribute("role")).toBe("alert");

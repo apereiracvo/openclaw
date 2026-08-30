@@ -2,7 +2,6 @@ import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { html, nothing } from "lit";
 import { ref } from "lit/directives/ref.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
-import { formatWebUiTranscriptWarningText } from "../../../components/error-presentation.ts";
 import { icons, type IconName } from "../../../components/icons.ts";
 import type { ImageLightboxItem } from "../../../components/image-lightbox.ts";
 import type { MarkdownRenderOptions } from "../../../components/markdown-render-options.ts";
@@ -283,10 +282,6 @@ export function renderGroupedMessage(
 
   const displayMarkdown = resolveMessageDisplayMarkdown(message, normalizedMessage);
   const actionText = opts.actionMarkdown ?? displayMarkdown;
-  const presentedMarkdown =
-    normalizedRole === "assistant"
-      ? formatWebUiTranscriptWarningText(displayMarkdown)
-      : displayMarkdown;
   const assistantAttachments = normalizedMessage.content.filter(
     (item): item is AssistantAttachmentItem =>
       item.type === "attachment" || item.type === "attachment_error",
@@ -314,7 +309,7 @@ export function renderGroupedMessage(
     opts.showReasoning && role === "assistant" ? extractThinkingCached(message) : null;
   const reasoningMarkdown = extractedThinking ? formatReasoningMarkdown(extractedThinking) : null;
   const markdown =
-    (normalizedRole === "user" ? opts.actionMarkdown : undefined) ?? (presentedMarkdown || null);
+    (normalizedRole === "user" ? opts.actionMarkdown : undefined) ?? (displayMarkdown || null);
   const markdownRenderOptions: MarkdownRenderOptions = {
     assistantTranscriptRoleHeaders: role === "assistant",
     codeBlockChrome: role === "user" ? "none" : "copy",

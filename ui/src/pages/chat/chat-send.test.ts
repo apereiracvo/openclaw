@@ -10040,10 +10040,9 @@ describe("handleSendChat", () => {
     expect(host.lastError).toBeNull();
     await waitForFast(() =>
       expect(document.querySelector(".app-toast__message")?.textContent).toBe(
-        "Other session:   Message failed:  gateway auth failed",
+        "Other session: ⚠️ ✉️ Message failed:  gateway auth failed",
       ),
     );
-    expect(document.querySelector(".app-toast__message")?.textContent).not.toMatch(/[⚠✉]/u);
     expect(
       listStoredChatOutboxes(host)
         .flatMap((outbox) => outbox.queue)

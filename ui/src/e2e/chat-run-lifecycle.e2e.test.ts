@@ -30,8 +30,8 @@ suite.define(() => {
     const currentPage = await context.newPage();
     page = currentPage;
     const sessionKey = "agent:main:main";
-    const diagnostic = "⚠️ ✉️ Message failed: delivery unavailable";
-    const renderedDiagnostic = "Message failed: delivery unavailable";
+    const diagnostic = "⚠️ ✉️ Message failed: delivery unavailable near 🧭";
+    const renderedDiagnostic = "Message failed: delivery unavailable near 🧭";
     const gateway = await installMockGateway(currentPage, {
       sessionKey,
       // Account recovery can replace startup with a scoped history request.
@@ -71,10 +71,8 @@ suite.define(() => {
     expect(runId).toEqual(expect.any(String));
     const alert = currentPage.getByRole("alert").filter({ hasText: renderedDiagnostic });
     await alert.waitFor();
-    await alert
-      .locator(".chat-error__summary strong")
-      .getByText(renderedDiagnostic, { exact: true })
-      .waitFor();
+    await alert.locator(".chat-error__content > strong").getByText(renderedDiagnostic).waitFor();
+    expect(await alert.locator("details").count()).toBe(0);
     await gateway.resolveDeferred("chat.send", { runId, status: "started" });
     await currentPage.getByRole("button", { name: "Stop generating" }).waitFor();
     await gateway.emitChatFinal({ sessionKey, runId, text: "Recovery completed." });
@@ -129,8 +127,8 @@ suite.define(() => {
     };
     await currentPage.getByRole("button", { name: "Send message" }).click();
     const failedRunId = await persistUser("First attempt", firstStartedAt, 0);
-    const diagnostic = "⚠️ 🛠️ Exec failed (exit 1): command failed.";
-    const renderedDiagnostic = "Exec failed (exit 1): command failed.";
+    const diagnostic = "⚠️ 🛠️ Exec failed (exit 1): command failed near 🧭.";
+    const renderedDiagnostic = "Exec failed (exit 1): command failed near 🧭.";
     await gateway.emitGatewayEvent("chat", {
       sessionKey,
       runId: failedRunId,
@@ -140,9 +138,10 @@ suite.define(() => {
     const failedAlert = currentPage.getByRole("alert").filter({ hasText: renderedDiagnostic });
     await failedAlert.waitFor();
     await failedAlert
-      .locator(".chat-error__summary strong")
-      .getByText(renderedDiagnostic, { exact: true })
+      .locator(".chat-error__content > strong")
+      .getByText(renderedDiagnostic)
       .waitFor();
+    expect(await failedAlert.locator("details").count()).toBe(0);
     expect(await currentPage.locator(".chat-group.assistant").count()).toBe(0);
     expect(await currentPage.getByRole("button", { name: "Stop generating" }).count()).toBe(0);
 

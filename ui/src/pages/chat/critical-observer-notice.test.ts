@@ -116,9 +116,8 @@ describe("critical session observer notice", () => {
     show("agent:main:other", "stuck", 2);
     await toastHost.updateComplete;
     expect(toastHost.querySelector(".app-toast__message")?.textContent).toContain(
-      "Other work — Repeated test failure",
+      "Other work — ⚠️ Repeated test failure",
     );
-    expect(toastHost.querySelector(".app-toast__message")?.textContent).not.toContain("⚠");
 
     toastHost.querySelector<HTMLButtonElement>(".app-toast__action")?.click();
     expect(onOpen).toHaveBeenCalledExactlyOnceWith("agent:main:other");

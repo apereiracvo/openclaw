@@ -1,6 +1,5 @@
 import { html, nothing } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
-import { formatWebUiErrorText } from "../../../components/error-presentation.ts";
 import { toolIcons } from "../../../components/icons-tools.ts";
 import { toSanitizedMarkdownHtml } from "../../../components/markdown.ts";
 import { t } from "../../../i18n/index.ts";
@@ -77,11 +76,10 @@ export function renderChatDivider(
 }
 
 export function renderChatNotice(item: Extract<ChatItem, { kind: "notice" }>) {
-  const displayText = item.tone === "danger" ? formatWebUiErrorText(item.text) : item.text;
-  const body = displayText
+  const body = item.text
     ? html`
-        <div class="chat-text chat-notice__body" dir=${detectTextDirection(displayText)}>
-          ${unsafeHTML(toSanitizedMarkdownHtml(displayText, { codeBlockChrome: "none" }))}
+        <div class="chat-text chat-notice__body" dir=${detectTextDirection(item.text)}>
+          ${unsafeHTML(toSanitizedMarkdownHtml(item.text, { codeBlockChrome: "none" }))}
         </div>
       `
     : nothing;
@@ -93,7 +91,7 @@ export function renderChatNotice(item: Extract<ChatItem, { kind: "notice" }>) {
       role=${item.tone === "danger" ? "alert" : nothing}
     >
       ${item.label ? renderSystemLine({ icon: item.icon, label: item.label }) : nothing}
-      ${item.collapsedBody && displayText
+      ${item.collapsedBody && item.text
         ? html`
             <details class="chat-notice__collapse">
               <summary class="chat-notice__toggle">${t("chat.systemNotice.showContent")}</summary>

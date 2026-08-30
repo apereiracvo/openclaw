@@ -2,7 +2,7 @@ import { html, nothing, type TemplateResult } from "lit";
 import type { SessionPlacementDiskSpace } from "../../../../packages/gateway-protocol/src/schema/session-placement.ts";
 import type { ApplicationPlacementStartupStatus } from "../../app/session-placement-startup.ts";
 import { renderCopyButton } from "../../components/copy-button.ts";
-import { formatWebUiErrorText } from "../../components/error-presentation.ts";
+import { formatWebUiIconErrorText } from "../../components/error-presentation.ts";
 import { icons } from "../../components/icons.ts";
 import { t } from "../../i18n/index.ts";
 import { formatBytes } from "../../lib/agents/display.ts";
@@ -67,8 +67,11 @@ function renderDiskSpaceNotice(diskSpace: SessionPlacementDiskSpace | undefined)
   `;
 }
 
-function renderErrorNotice(error: string, action: TemplateResult | typeof nothing = nothing) {
-  const displayError = formatWebUiErrorText(error);
+function renderErrorNotice(
+  error: string,
+  action: TemplateResult | typeof nothing = nothing,
+  displayError = formatWebUiIconErrorText(error),
+) {
   const lines = displayError
     .trim()
     .split(/\r?\n/u)
@@ -165,9 +168,16 @@ function renderPlacementStartupError(
     return nothing;
   }
   const checking = status.action === "check-delivery";
+  const statusError = status.error ?? t("newSession.createFailed");
   const error = checking
     ? [t("chat.queue.checkDeliveryHelp"), status.error].filter(Boolean).join("\n\n")
-    : t("newSession.placementStartFailed", { error: status.error ?? t("newSession.createFailed") });
+    : t("newSession.placementStartFailed", { error: statusError });
+  const displayStatusError = formatWebUiIconErrorText(statusError);
+  const displayError = checking
+    ? [t("chat.queue.checkDeliveryHelp"), status.error ? displayStatusError : undefined]
+        .filter(Boolean)
+        .join("\n\n")
+    : t("newSession.placementStartFailed", { error: displayStatusError });
   // History can own the bubble before startup observes its receipt. Keep the
   // banner action reachable when transcript deduplication hides the row.
   const hasInlineTurn =
@@ -178,5 +188,5 @@ function renderPlacementStartupError(
           ${t(checking ? "chat.queue.checkDelivery" : "common.retry")}
         </button>`
       : nothing;
-  return renderErrorNotice(error, retry);
+  return renderErrorNotice(error, retry, displayError);
 }

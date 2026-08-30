@@ -1153,7 +1153,9 @@ describe("chat run error", () => {
     expect(container.querySelector(".chat-error")?.closest(".chat-topbar-notices")).not.toBeNull();
   });
 
-  it.each([false, true])("keeps startup Retry owned by retryable=%s", (retryable) => {
+  it.each([false, true])("keeps startup Retry owned by retryable=%s", async (retryable) => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
     const onRetrySessionPlacementStartup = vi.fn();
     const container = renderChatView({
       placementStartup: {
@@ -1170,6 +1172,12 @@ describe("chat run error", () => {
       "The session was created, but runner startup failed:  Provisioning failed\n  Final diagnostic line  ",
     );
     expect(alert.textContent).not.toContain("⚠");
+    alert.querySelector<HTMLButtonElement>('[aria-label="Copy error"]')?.click();
+    await waitForFast(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        "The session was created, but runner startup failed: ⚠️ Provisioning failed\n  Final diagnostic line  ",
+      ),
+    );
     alert.querySelector<HTMLElement>("summary")?.click();
     expect(onRetrySessionPlacementStartup).not.toHaveBeenCalled();
     const retry = Array.from(alert.querySelectorAll("button")).find(

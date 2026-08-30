@@ -1,7 +1,7 @@
 import { html, nothing } from "lit";
 import { t } from "../i18n/index.ts";
 import type { SidebarRecentSession, SidebarSessionAttention } from "./app-sidebar-session-types.ts";
-import { formatWebUiErrorText } from "./error-presentation.ts";
+import { formatWebUiIconErrorText } from "./error-presentation.ts";
 import { icons } from "./icons.ts";
 import { resolveSessionAttentionIcon } from "./session-attention-icon-registry.ts";
 
@@ -33,7 +33,7 @@ export function sessionAttentionSubtitle(attention: SidebarSessionAttention): st
       return t("sessionsView.waitingForApproval");
     case "error":
       return t("sessionsView.runFailedReason", {
-        reason: formatWebUiErrorText(attention.reason),
+        reason: formatWebUiIconErrorText(attention.reason),
       });
     case "agent":
       return attention.note;
