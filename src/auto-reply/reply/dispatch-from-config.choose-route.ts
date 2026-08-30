@@ -36,7 +36,10 @@ import { suppressPendingFinalDelivery } from "./dispatch-from-config.pending-fin
 import { extendPreparedDispatchState } from "./dispatch-from-config.phase-state.js";
 import type { PrepareDispatchOperationReadyState } from "./dispatch-from-config.prepare-operation.js";
 import { runReplyDispatchTakeover } from "./dispatch-from-config.reply-dispatch-hook.js";
-import { maybeRefuseRestrictedRuntimeTakeover } from "./dispatch-from-config.restricted-runtime.js";
+import {
+  maybeRefuseRestrictedRuntimeTakeover,
+  runtimeTakeoverHooksAllowed,
+} from "./dispatch-from-config.restricted-runtime.js";
 import {
   captureDeliveredTranscriptMirror,
   mirrorDeliveredReplyToTranscript,
@@ -534,7 +537,10 @@ export async function chooseDispatchRoute(state: PrepareDispatchOperationReadySt
   };
 
   // Run before_dispatch hook — let plugins inspect or handle before model dispatch.
-  if (hookRunner?.hasHooks("before_dispatch")) {
+  if (
+    runtimeTakeoverHooksAllowed(params.replyOptions?.admittedSessionSettings) &&
+    hookRunner?.hasHooks("before_dispatch")
+  ) {
     // This outer lookup key is resolved from the routed context; fields inside
     // sessionStoreEntry.entry cannot redirect hook or requester lineage.
     const beforeDispatchSessionKey = sessionStoreEntry.sessionKey ?? sessionKey;
