@@ -120,25 +120,28 @@ const COMMON_REVIEWED_CRITICAL_FINDING_COUNTS = new Map<string, number>([
   ["@openclaw/openshell-sandbox:dangerous-exec:src/openshell-core.test.ts", 1],
 ]);
 
-const REVIEWED_RELEASE_LAYOUTS = Object.freeze([
-  {
-    id: "frozen-legacy",
-    findings: new Map<string, number>([
-      ["@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server/http.ts", 1],
-      ["@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server/processes.ts", 1],
-      ["@openclaw/codex:dangerous-exec:src/node-cli-sessions.ts", 1],
-      ["@openclaw/opencode-provider:dangerous-exec:session-catalog.ts", 1],
-      ["@openclaw/opencode-provider:dangerous-exec:session-catalog.test.ts", 1],
-    ]),
-  },
-  {
-    id: "current",
-    findings: new Map<string, number>([
-      ["@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server/sandbox-child.ts", 1],
-      ["@openclaw/codex:dangerous-exec:src/app-server/transport-process-snapshot.ts", 1],
-      ["@openclaw/codex:dangerous-exec:src/app-server/transport.process.test.ts", 13],
-    ]),
-  },
+const CURRENT_REVIEWED_RELEASE_LAYOUT = {
+  id: "current",
+  findings: new Map<string, number>([
+    ["@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server/sandbox-child.ts", 1],
+    ["@openclaw/codex:dangerous-exec:src/app-server/transport-process-snapshot.ts", 1],
+    ["@openclaw/codex:dangerous-exec:src/app-server/transport.process.test.ts", 13],
+  ]),
+};
+
+const FROZEN_EXTENDED_STABLE_2026_6_33_LAYOUT = {
+  id: "extended-stable-2026.6.33",
+  findings: new Map<string, number>([
+    ["@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server/http.ts", 1],
+    ["@openclaw/codex:dangerous-exec:src/app-server/sandbox-exec-server/processes.ts", 1],
+    ["@openclaw/codex:dangerous-exec:src/node-cli-sessions.ts", 1],
+    ["@openclaw/opencode-provider:dangerous-exec:session-catalog.ts", 1],
+    ["@openclaw/opencode-provider:dangerous-exec:session-catalog.test.ts", 1],
+  ]),
+};
+
+const FROZEN_RELEASE_LAYOUTS = new Map<string, typeof CURRENT_REVIEWED_RELEASE_LAYOUT>([
+  ["extended-stable/2026.6.33", FROZEN_EXTENDED_STABLE_2026_6_33_LAYOUT],
 ]);
 
 // Generated chunks can contain multiple reviewed execution sites. Counts are
@@ -155,9 +158,10 @@ const OPTIONAL_REVIEWED_DIST_CRITICAL_FINDING_COUNTS = new Map<string, number>([
   ["@openclaw/voice-call:dangerous-exec:dist/runtime-entry-<hash>.js", 1],
 ]);
 
-const REVIEWED_LAYOUT_FINDING_COUNTS = new Map<string, number>(
-  REVIEWED_RELEASE_LAYOUTS.flatMap((layout) => [...layout.findings]),
-);
+const REVIEWED_LAYOUT_FINDING_COUNTS = new Map<string, number>([
+  ...CURRENT_REVIEWED_RELEASE_LAYOUT.findings,
+  ...FROZEN_EXTENDED_STABLE_2026_6_33_LAYOUT.findings,
+]);
 
 function expandFindingCounts(counts: ReadonlyMap<string, number>): string[] {
   return [...counts].flatMap(([key, count]) => Array.from({ length: count }, () => key));
@@ -177,13 +181,15 @@ function arraysEqual(left: readonly string[], right: readonly string[]): boolean
 
 export function resolveReviewedSourceLayout(
   reviewedCriticalFindings: readonly string[],
-): (typeof REVIEWED_RELEASE_LAYOUTS)[number] | undefined {
+  targetContextRef = "",
+): typeof CURRENT_REVIEWED_RELEASE_LAYOUT | undefined {
+  const layout = FROZEN_RELEASE_LAYOUTS.get(targetContextRef) ?? CURRENT_REVIEWED_RELEASE_LAYOUT;
   const observedLayoutFindings = sortStrings(
     reviewedCriticalFindings.filter((key) => REVIEWED_LAYOUT_FINDING_COUNTS.has(key)),
   );
-  return REVIEWED_RELEASE_LAYOUTS.find((layout) =>
-    arraysEqual(observedLayoutFindings, sortStrings(expandFindingCounts(layout.findings))),
-  );
+  return arraysEqual(observedLayoutFindings, sortStrings(expandFindingCounts(layout.findings)))
+    ? layout
+    : undefined;
 }
 
 export function normalizePackedFindingPath(packedPath: string): string {
@@ -1036,7 +1042,7 @@ async function scanSupplementalInertPluginInput(
 
 function expectedRequiredFindingsForPackage(
   packageName: string,
-  layout: (typeof REVIEWED_RELEASE_LAYOUTS)[number],
+  layout: typeof CURRENT_REVIEWED_RELEASE_LAYOUT,
 ): string[] {
   return [...COMMON_REVIEWED_CRITICAL_FINDING_COUNTS, ...layout.findings].flatMap(([key, count]) =>
     key.startsWith(`${packageName}:`) ? Array.from({ length: count }, () => key) : [],
@@ -1048,6 +1054,7 @@ export function buildPluginNpmSecurityScanReport(params: {
   maxTotalFindings?: number;
   packageResults: ScanPackageResult[];
   scanErrors?: readonly string[];
+  targetContextRef?: string;
   toolingSha: string;
 }): PluginNpmSecurityScanReport {
   const { candidateSha, packageResults, toolingSha } = params;
@@ -1056,7 +1063,7 @@ export function buildPluginNpmSecurityScanReport(params: {
     (total, result) => total + result.scanFindingCount,
     0,
   );
-  const layout = resolveReviewedSourceLayout(allReviewedFindings);
+  const layout = resolveReviewedSourceLayout(allReviewedFindings, params.targetContextRef);
   const errors: string[] = sortStrings(params.scanErrors ?? []);
 
   if (totalFindingCount > (params.maxTotalFindings ?? MAX_PLUGIN_SCAN_TOTAL_FINDINGS)) {
@@ -1199,6 +1206,7 @@ export async function runPluginNpmSecurityScan(params: {
   limits?: PluginNpmSecurityArtifactLimits;
   preDownloadErrors?: readonly string[];
   preDownloadRejectedPackageNames?: readonly string[];
+  targetContextRef?: string;
   toolingDir: string;
   toolingSha: string;
 }): Promise<PluginNpmSecurityScanReport> {
@@ -1221,6 +1229,7 @@ export async function runPluginNpmSecurityScan(params: {
       candidateSha: params.candidateSha,
       packageResults,
       scanErrors: [...(params.preDownloadErrors ?? []), ...loaded.ingestionErrors, ...scanErrors],
+      targetContextRef: params.targetContextRef,
       toolingSha,
     }),
   );
