@@ -202,7 +202,9 @@ export function coordinateWorkerPlacementDispatch(
         return await operation;
       } finally {
         pending.delete(operation);
-        if (pending.size === 0) reclaimsInFlight.delete(request.sessionId);
+        if (pending.size === 0) {
+          reclaimsInFlight.delete(request.sessionId);
+        }
       }
     },
     reconcile: (mode) => runReconciliation(() => service.reconcile(mode)),

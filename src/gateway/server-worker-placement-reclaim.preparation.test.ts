@@ -97,15 +97,20 @@ it.each(["authorization", "incarnation"] as const)(
     });
     const stop = f.prepare({
       authorize: () => {
-        if (!authorized) throw new Error("access revoked");
+        if (!authorized) {
+          throw new Error("access revoked");
+        }
       },
     });
     const rejected = expect(stop).rejects.toThrow(
       change === "authorization" ? "access revoked" : "Session",
     );
     await entered.promise;
-    if (change === "authorization") authorized = false;
-    else f.entry.lifecycleRevision = "replacement-with-same-session-id";
+    if (change === "authorization") {
+      authorized = false;
+    } else {
+      f.entry.lifecycleRevision = "replacement-with-same-session-id";
+    }
     release.resolve();
     await rejected;
     expect(f.run).not.toHaveBeenCalled();

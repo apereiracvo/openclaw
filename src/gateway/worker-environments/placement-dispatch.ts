@@ -24,6 +24,10 @@ import {
   type WorkerPlacementMoveBarrier,
 } from "./placement-move-service.js";
 import type { WorkerPlacementRunnerAvailabilityReader } from "./placement-projector.js";
+import type {
+  WorkerPlacementReclaimBarriers,
+  WorkerReclaimPlacement,
+} from "./placement-reclaim-contract.js";
 import { placementTurnOwner } from "./placement-record.js";
 import {
   completeMovedWorkspaceTeardown,
@@ -70,42 +74,6 @@ type WorkerLocalDispatchBarrier = (params: {
 }) => Promise<WorkerDispatchPlacement>;
 
 type WorkerDrainingDispatchPlacement = Extract<WorkerDispatchPlacement, { state: "draining" }>;
-type WorkerReclaimStartPlacement = Extract<
-  WorkerDispatchPlacement,
-  { state: "draining" | "reclaimed" }
->;
-type WorkerReclaimPlacement = Extract<WorkerDispatchPlacement, { state: "local" | "reclaimed" }>;
-type WorkerPlacementReclaimBarrier = (
-  params: WorkerPlacementReclaimRequest & {
-    authorize?: WorkerPlacementAuthorization;
-    beforeDrain?: WorkerPlacementAuthorization;
-    begin: () => WorkerReclaimStartPlacement;
-    reclaim: (
-      localPath: string,
-      placement: WorkerReclaimStartPlacement,
-      authorize?: WorkerPlacementAuthorization,
-    ) => Promise<WorkerReclaimPlacement>;
-  },
-) => Promise<WorkerReclaimPlacement>;
-
-type WorkerPlacementFailedReclaimBarrier = (
-  params: WorkerPlacementReclaimRequest & {
-    authorize?: WorkerPlacementAuthorization;
-    reclaim: (authorize?: WorkerPlacementAuthorization) => Promise<WorkerReclaimPlacement>;
-  },
-) => Promise<WorkerReclaimPlacement>;
-
-export type WorkerPlacementReclaimBarriers = {
-  runReclaimPreparation: (
-    params: WorkerPlacementReclaimRequest & {
-      authorize?: WorkerPlacementAuthorization;
-      beforeDrain?: WorkerPlacementAuthorization;
-      run: (authorize?: WorkerPlacementAuthorization) => Promise<WorkerReclaimPlacement>;
-    },
-  ) => Promise<WorkerReclaimPlacement>;
-  runReclaimBarrier: WorkerPlacementReclaimBarrier;
-  runFailedReclaimBarrier: WorkerPlacementFailedReclaimBarrier;
-};
 
 type WorkerPlacementDispatchOptions = WorkerPlacementReclaimBarriers & {
   placements: WorkerDispatchPlacementStore;

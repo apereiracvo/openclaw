@@ -13,7 +13,7 @@ import {
   resolveWorkerPlacementSessionTarget,
   WorkerDispatchTargetChangedError,
 } from "./server-worker-placement-session-target.js";
-import type { WorkerPlacementReclaimBarriers } from "./worker-environments/placement-dispatch.js";
+import type { WorkerPlacementReclaimBarriers } from "./worker-environments/placement-reclaim-contract.js";
 import type { WorkerSessionPlacementStore } from "./worker-environments/placement-store.js";
 import type { WorkerPlacementReclaimRequest } from "./worker-environments/service-contract.js";
 

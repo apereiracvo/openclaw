@@ -43,7 +43,6 @@ describe("worker placement dispatch coordinator", () => {
       const release = createDeferredCore();
       const events: string[] = [];
       let stops = 0;
-      let coordinated: ReturnType<typeof coordinateWorkerPlacementDispatch>;
       const service = {
         dispatch: vi.fn(async (request: WorkerPlacementDispatchRequest) => {
           events.push(`dispatch:${request.sessionId}`);
@@ -54,7 +53,9 @@ describe("worker placement dispatch coordinator", () => {
         reclaim: async (
           ...[_request, _authorize, _beforeDrain, serialize]: Parameters<DispatchService["reclaim"]>
         ) => {
-          if (++stops > 1) throw new Error("second Stop failed");
+          if (++stops > 1) {
+            throw new Error("second Stop failed");
+          }
           entered.resolve();
           await release.promise;
           await coordinated.reconcileActive();
@@ -67,7 +68,7 @@ describe("worker placement dispatch coordinator", () => {
           events.push("recovery");
         }),
       } as unknown as DispatchService;
-      coordinated = coordinateWorkerPlacementDispatch(service);
+      const coordinated = coordinateWorkerPlacementDispatch(service);
       const stopping = coordinated.reclaim(REQUEST);
       await entered.promise;
       await expect(coordinated.reclaim(REQUEST)).rejects.toThrow("second Stop failed");
