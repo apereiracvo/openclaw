@@ -2,6 +2,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { RequestedModelUnsupportedError } from "acpx/runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,7 +19,12 @@ import {
   OPENCLAW_GATEWAY_INSTANCE_ID_ARG,
   readAcpxProcessLeaseIdentity,
 } from "./process-lease.js";
-import { AcpxRuntime, testing, type AcpSessionStore } from "./runtime.js";
+import {
+  AcpxRuntime,
+  decodeAcpxRuntimeHandleState,
+  testing,
+  type AcpSessionStore,
+} from "./runtime.js";
 import { ACPX_PROCESS_LEASE_MAX_ENTRIES } from "./state.js";
 
 type TestSessionStore = {
@@ -157,6 +163,114 @@ function readFirstEnsureSessionInput(ensure: {
     throw new Error("Expected ensureSession to be called with an input object");
   }
   return input as Parameters<AcpRuntime["ensureSession"]>[0];
+}
+
+type FakeAcpWireRequest = {
+  method: string;
+  params: Record<string, unknown>;
+  pid: number;
+};
+
+async function writeFakeResumeAgent(params: {
+  logPath: string;
+  wrapperPath: string;
+}): Promise<void> {
+  const sdkUrl = pathToFileURL(
+    path.resolve("node_modules/@agentclientprotocol/sdk/dist/acp.js"),
+  ).href;
+  await fs.writeFile(
+    params.wrapperPath,
+    `#!/usr/bin/env node
+import fs from "node:fs";
+import { Readable, Writable } from "node:stream";
+import {
+  AgentSideConnection,
+  PROTOCOL_VERSION,
+  RequestError,
+  ndJsonStream,
+} from ${JSON.stringify(sdkUrl)};
+
+const logPath = ${JSON.stringify(params.logPath)};
+const log = (method, params = {}) => {
+  fs.appendFileSync(logPath, JSON.stringify({ method, params, pid: process.pid }) + "\\n");
+};
+
+class FakeResumeAgent {
+  initialize(params) {
+    log("initialize", params);
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      authMethods: [],
+      agentCapabilities: {
+        loadSession: false,
+        sessionCapabilities: { resume: {}, close: {} },
+      },
+    };
+  }
+  authenticate(params) {
+    log("authenticate", params);
+    return {};
+  }
+  newSession(params) {
+    log("session/new", params);
+    return { sessionId: "fresh-" + process.pid };
+  }
+  resumeSession(params) {
+    log("session/resume", params);
+    if (params.sessionId === "missing-target") {
+      throw RequestError.resourceNotFound(params.sessionId);
+    }
+    return {};
+  }
+  prompt(params) {
+    log("session/prompt", params);
+    return { stopReason: "end_turn" };
+  }
+  cancel(params) {
+    log("session/cancel", params);
+  }
+  closeSession(params) {
+    log("session/close", params);
+    return {};
+  }
+}
+
+const stream = ndJsonStream(
+  Writable.toWeb(process.stdout),
+  Readable.toWeb(process.stdin),
+);
+const connection = new AgentSideConnection(() => new FakeResumeAgent(), stream);
+void connection;
+`,
+    { mode: 0o755 },
+  );
+}
+
+async function readFakeAcpWireRequests(logPath: string): Promise<FakeAcpWireRequest[]> {
+  const contents = await fs.readFile(logPath, "utf8").catch(() => "");
+  return contents
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as FakeAcpWireRequest);
+}
+
+function makeRecordStore(): {
+  records: Map<string, Record<string, unknown>>;
+  store: TestSessionStore;
+} {
+  const records = new Map<string, Record<string, unknown>>();
+  return {
+    records,
+    store: {
+      load: vi.fn(async (recordId: string) => {
+        const record = records.get(recordId);
+        return record ? structuredClone(record) : undefined;
+      }),
+      save: vi.fn(async (record) => {
+        records.set(String(record.acpxRecordId), structuredClone(record));
+      }),
+    },
+  };
 }
 
 describe("AcpxRuntime fresh reset wrapper", () => {
@@ -4243,4 +4357,346 @@ describe("AcpxRuntime fresh reset wrapper", () => {
     expect(defaultProbe).not.toHaveBeenCalled();
   });
 });
+describe("AcpxRuntime one-shot resume identity", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    {
+      name: "session/resume",
+      agentCapabilities: { sessionCapabilities: { resume: true } },
+    },
+    {
+      name: "session/load",
+      agentCapabilities: { loadSession: true },
+    },
+  ])("observes $name support from the exact ensured record", async ({ agentCapabilities }) => {
+    const load = vi.fn(async (recordId: string) => ({
+      acpxRecordId: recordId,
+      agentCapabilities,
+    }));
+    const baseStore: TestSessionStore = {
+      load,
+      save: vi.fn(async () => {}),
+    };
+    const { runtime, delegate } = makeRuntime(baseStore);
+    vi.spyOn(delegate, "ensureSession").mockResolvedValue({
+      sessionKey: "agent:opencode:acp:support",
+      backend: "acpx",
+      runtimeSessionName: "opencode",
+      acpxRecordId: "record-support",
+      backendSessionId: "acp-support",
+    });
+
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:opencode:acp:support",
+      agent: "opencode",
+      mode: "oneshot",
+    });
+
+    expect(handle.sessionResumeSupported).toBe(true);
+    expect(load).toHaveBeenCalledWith("record-support");
+  });
+
+  it("records false only when the exact record was read", async () => {
+    const baseStore: TestSessionStore = {
+      load: vi.fn(async (recordId: string) => ({
+        acpxRecordId: recordId,
+        agentCapabilities: { sessionCapabilities: { resume: false }, loadSession: false },
+      })),
+      save: vi.fn(async () => {}),
+    };
+    const { runtime, delegate } = makeRuntime(baseStore);
+    vi.spyOn(delegate, "ensureSession").mockResolvedValue({
+      sessionKey: "agent:opencode:acp:unsupported",
+      backend: "acpx",
+      runtimeSessionName: "opencode",
+      acpxRecordId: "record-unsupported",
+      backendSessionId: "acp-unsupported",
+    });
+
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:opencode:acp:unsupported",
+      agent: "opencode",
+      mode: "oneshot",
+    });
+
+    expect(handle.sessionResumeSupported).toBe(false);
+  });
+
+  it("keeps exact-record read failure best-effort for a fresh one-shot", async () => {
+    const baseStore: TestSessionStore = {
+      load: vi.fn(async () => {
+        throw new Error("record store unavailable");
+      }),
+      save: vi.fn(async () => {}),
+    };
+    const { runtime, delegate } = makeRuntime(baseStore);
+    const ensure = vi.spyOn(delegate, "ensureSession").mockResolvedValue({
+      sessionKey: "agent:opencode:acp:fresh",
+      backend: "acpx",
+      runtimeSessionName: "opencode",
+      acpxRecordId: "record-fresh",
+      backendSessionId: "acp-fresh",
+    });
+
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:opencode:acp:fresh",
+      agent: "opencode",
+      mode: "oneshot",
+      cwd: "/tmp/fresh",
+    });
+
+    expect(handle).not.toHaveProperty("sessionResumeSupported");
+    expect(ensure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "agent:opencode:acp:fresh",
+        mode: "oneshot",
+        cwd: "/tmp/fresh",
+      }),
+    );
+  });
+
+  it("crosses the ACPX manager and transport for strict one-shot resume lifecycle", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-acpx-resume-wire-"));
+    const wrapperRoot = path.join(root, "wrappers");
+    const wrapperPath = path.join(wrapperRoot, "codex-acp-wrapper.mjs");
+    const logPath = path.join(root, "wire.ndjson");
+    const cwd = path.join(root, "workspace");
+    await fs.mkdir(wrapperRoot, { recursive: true });
+    await fs.mkdir(cwd, { recursive: true });
+    await writeFakeResumeAgent({ logPath, wrapperPath });
+    const { records, store } = makeRecordStore();
+    const leaseStore = makeLeaseStore();
+    const listProcesses = vi.fn(async () =>
+      Array.from(records.values()).flatMap((record) => {
+        const pid = Number(record.pid);
+        const command = typeof record.agentCommand === "string" ? record.agentCommand : undefined;
+        return pid > 0 && command ? [{ pid, ppid: 1, command }] : [];
+      }),
+    );
+    const runtime = makeRuntime(
+      store,
+      {
+        cwd,
+        openclawGatewayInstanceId: "gateway-test",
+        openclawProcessLeaseStore: leaseStore.store,
+        openclawWrapperRoot: wrapperRoot,
+        agentRegistry: {
+          resolve: () => `${JSON.stringify(process.execPath)} ${JSON.stringify(wrapperPath)}`,
+          list: () => ["fixture"],
+        },
+      },
+      {
+        openclawProcessCleanup: {
+          listProcesses,
+          killProcess: vi.fn(),
+          sleep: vi.fn(async () => {}),
+        },
+      },
+    ).runtime;
+    const originalKey = "agent:fixture:acp:continuity";
+
+    try {
+      const handle = await runtime.ensureSession({
+        sessionKey: originalKey,
+        agent: "fixture",
+        mode: "oneshot",
+        resumeSessionId: "acp-resume-target",
+        cwd,
+      });
+      const handleState = decodeAcpxRuntimeHandleState(handle.runtimeSessionName);
+      expect(handle).toMatchObject({
+        sessionKey: originalKey,
+        backendSessionId: "acp-resume-target",
+        cwd,
+        sessionResumeSupported: true,
+      });
+      expect(handleState).toMatchObject({
+        mode: "persistent",
+        cwd,
+        acpxRecordId: handle.acpxRecordId,
+        backendSessionId: "acp-resume-target",
+      });
+      expect(handleState?.name).toBe(handle.acpxRecordId);
+      expect(handle.acpxRecordId).not.toBe(originalKey);
+
+      const lease = Array.from(leaseStore.leases.values())[0];
+      expect(lease).toMatchObject({
+        sessionKey: handle.acpxRecordId,
+        rootPid: expect.any(Number),
+        state: "open",
+      });
+
+      const turn = runtime.startTurn({
+        handle,
+        text: "continue exactly",
+        mode: "prompt",
+        requestId: "request-resumed",
+      });
+      await turn.promptStarted;
+      for await (const event of turn.events) {
+        void event;
+      }
+      await expect(turn.result).resolves.toEqual({
+        status: "completed",
+        stopReason: "end_turn",
+      });
+      await expect(runtime.getStatus({ handle })).resolves.toMatchObject({
+        acpxRecordId: handle.acpxRecordId,
+        backendSessionId: "acp-resume-target",
+      });
+
+      await runtime.close({ handle, reason: "one-shot turn complete" });
+
+      const stored = records.get(String(handle.acpxRecordId));
+      expect(stored).toMatchObject({
+        acpxRecordId: handle.acpxRecordId,
+        acpSessionId: "acp-resume-target",
+        name: handle.acpxRecordId,
+        closed: true,
+      });
+      expect(stored?.acpx).not.toMatchObject({ reset_on_next_ensure: true });
+      expect(records.has(originalKey)).toBe(false);
+      expect(leaseStore.leases.size).toBe(0);
+      expect(leaseStore.store.markState.mock.calls).toContainEqual([lease?.leaseId, "closing"]);
+      expect(leaseStore.store.markState.mock.calls).toContainEqual([lease?.leaseId, "closed"]);
+
+      const wire = await readFakeAcpWireRequests(logPath);
+      const resumed = wire.filter((request) => request.method === "session/resume");
+      const prompts = wire.filter((request) => request.method === "session/prompt");
+      expect(resumed).toHaveLength(1);
+      expect(resumed[0]?.params).toMatchObject({ sessionId: "acp-resume-target", cwd });
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]?.params).toMatchObject({ sessionId: "acp-resume-target" });
+      expect(prompts[0]?.pid).toBe(resumed[0]?.pid);
+      expect(wire.some((request) => request.method === "session/new")).toBe(false);
+      expect(wire.some((request) => request.method === "session/close")).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("fails a missing resume target once across the real ACP wire without session/new", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-acpx-missing-wire-"));
+    const wrapperRoot = path.join(root, "wrappers");
+    const wrapperPath = path.join(wrapperRoot, "codex-acp-wrapper.mjs");
+    const logPath = path.join(root, "wire.ndjson");
+    const cwd = path.join(root, "workspace");
+    await fs.mkdir(wrapperRoot, { recursive: true });
+    await fs.mkdir(cwd, { recursive: true });
+    await writeFakeResumeAgent({ logPath, wrapperPath });
+    const { records, store } = makeRecordStore();
+    const runtime = makeRuntime(store, {
+      cwd,
+      agentRegistry: {
+        resolve: () => `${JSON.stringify(process.execPath)} ${JSON.stringify(wrapperPath)}`,
+        list: () => ["fixture"],
+      },
+    }).runtime;
+
+    try {
+      await expect(
+        runtime.ensureSession({
+          sessionKey: "agent:fixture:acp:missing",
+          agent: "fixture",
+          mode: "oneshot",
+          resumeSessionId: "missing-target",
+          cwd,
+        }),
+      ).rejects.toBeDefined();
+
+      const continuationRequests = (await readFakeAcpWireRequests(logPath)).filter((request) =>
+        request.method.startsWith("session/"),
+      );
+      expect(continuationRequests.map((request) => request.method)).toEqual(["session/resume"]);
+      expect(continuationRequests[0]?.params).toMatchObject({
+        sessionId: "missing-target",
+        cwd,
+      });
+      expect(records.size).toBe(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("keeps ordinary fresh one-shot and persistent ACPX behavior unchanged at the wire", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-acpx-fresh-wire-"));
+    const wrapperRoot = path.join(root, "wrappers");
+    const wrapperPath = path.join(wrapperRoot, "codex-acp-wrapper.mjs");
+    const logPath = path.join(root, "wire.ndjson");
+    const cwd = path.join(root, "workspace");
+    await fs.mkdir(wrapperRoot, { recursive: true });
+    await fs.mkdir(cwd, { recursive: true });
+    await writeFakeResumeAgent({ logPath, wrapperPath });
+    const { records, store } = makeRecordStore();
+    const runtime = makeRuntime(store, {
+      cwd,
+      agentRegistry: {
+        resolve: () => `${JSON.stringify(process.execPath)} ${JSON.stringify(wrapperPath)}`,
+        list: () => ["fixture"],
+      },
+    }).runtime;
+
+    try {
+      const oneShotKey = "agent:fixture:acp:fresh-oneshot";
+      const oneShot = await runtime.ensureSession({
+        sessionKey: oneShotKey,
+        agent: "fixture",
+        mode: "oneshot",
+        cwd,
+      });
+      expect(oneShot.sessionKey).toBe(oneShotKey);
+      expect(oneShot.acpxRecordId).not.toBe(oneShotKey);
+      expect(decodeAcpxRuntimeHandleState(oneShot.runtimeSessionName)?.mode).toBe("oneshot");
+      const oneShotTurn = runtime.startTurn({
+        handle: oneShot,
+        text: "fresh one-shot",
+        mode: "prompt",
+        requestId: "request-fresh-oneshot",
+      });
+      for await (const event of oneShotTurn.events) {
+        void event;
+      }
+      await expect(oneShotTurn.result).resolves.toMatchObject({ status: "completed" });
+
+      const persistentKey = "agent:fixture:acp:fresh-persistent";
+      const persistent = await runtime.ensureSession({
+        sessionKey: persistentKey,
+        agent: "fixture",
+        mode: "persistent",
+        cwd,
+      });
+      expect(persistent).toMatchObject({
+        sessionKey: persistentKey,
+        acpxRecordId: persistentKey,
+        sessionResumeSupported: true,
+      });
+      expect(decodeAcpxRuntimeHandleState(persistent.runtimeSessionName)?.mode).toBe("persistent");
+      await expect(runtime.getStatus({ handle: persistent })).resolves.toMatchObject({
+        acpxRecordId: persistentKey,
+        backendSessionId: persistent.backendSessionId,
+      });
+      await runtime.close({ handle: persistent, reason: "persistent test complete" });
+
+      const wire = await readFakeAcpWireRequests(logPath);
+      const sessionMethods = wire
+        .filter((request) => request.method.startsWith("session/"))
+        .map((request) => request.method);
+      expect(sessionMethods).toEqual(["session/new", "session/prompt", "session/new"]);
+      expect(wire.filter((request) => request.method === "session/new")).toHaveLength(2);
+      expect(wire.some((request) => request.method === "session/resume")).toBe(false);
+      expect(wire.some((request) => request.method === "session/load")).toBe(false);
+      expect(records.get(String(oneShot.acpxRecordId))).toMatchObject({
+        acpxRecordId: oneShot.acpxRecordId,
+        name: oneShotKey,
+      });
+      expect(records.get(persistentKey)).toMatchObject({ closed: true });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

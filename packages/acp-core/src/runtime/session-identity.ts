@@ -21,6 +21,10 @@ function normalizeIdentitySource(value: unknown): SessionAcpIdentitySource | und
   return value;
 }
 
+function normalizeOptionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
 /** Normalize an identity object and infer pending/resolved state from stable ids. */
 function normalizeIdentity(
   identity: SessionAcpIdentity | undefined,
@@ -33,12 +37,16 @@ function normalizeIdentity(
   const acpxRecordId = normalizeText(identity.acpxRecordId);
   const acpxSessionId = normalizeText(identity.acpxSessionId);
   const agentSessionId = normalizeText(identity.agentSessionId);
+  const sessionResumeSupported = normalizeOptionalBoolean(identity.sessionResumeSupported);
+  const sessionResumeReady = normalizeOptionalBoolean(identity.sessionResumeReady);
   const lastUpdatedAt =
     typeof identity.lastUpdatedAt === "number" && Number.isFinite(identity.lastUpdatedAt)
       ? identity.lastUpdatedAt
       : undefined;
   const hasAnyId = Boolean(acpxRecordId || acpxSessionId || agentSessionId);
-  if (!state && !source && !hasAnyId && lastUpdatedAt === undefined) {
+  const hasResumeObservation =
+    sessionResumeSupported !== undefined || sessionResumeReady !== undefined;
+  if (!state && !source && !hasAnyId && !hasResumeObservation && lastUpdatedAt === undefined) {
     return undefined;
   }
   const resolved = Boolean(acpxSessionId || agentSessionId);
@@ -48,12 +56,15 @@ function normalizeIdentity(
     ...(acpxRecordId ? { acpxRecordId } : {}),
     ...(acpxSessionId ? { acpxSessionId } : {}),
     ...(agentSessionId ? { agentSessionId } : {}),
+    ...(sessionResumeSupported !== undefined ? { sessionResumeSupported } : {}),
+    ...(sessionResumeReady !== undefined ? { sessionResumeReady } : {}),
     source: source ?? "status",
     lastUpdatedAt: lastUpdatedAt ?? Date.now(),
   };
 }
 
 type IdentityIds = Pick<SessionAcpIdentity, "acpxRecordId" | "acpxSessionId" | "agentSessionId">;
+type IdentityRuntimeCapability = Pick<SessionAcpIdentity, "sessionResumeSupported">;
 
 /** Read identity ids from a runtime handle shape. */
 function readIdentityIdsFromHandle(handle: AcpRuntimeHandle): IdentityIds {
@@ -64,15 +75,22 @@ function readIdentityIdsFromHandle(handle: AcpRuntimeHandle): IdentityIds {
   };
 }
 
-/** Build an identity only when at least one stable id is known. */
+function readRuntimeCapabilityFromHandle(handle: AcpRuntimeHandle): IdentityRuntimeCapability {
+  const sessionResumeSupported = normalizeOptionalBoolean(handle.sessionResumeSupported);
+  return sessionResumeSupported === undefined ? {} : { sessionResumeSupported };
+}
+
+/** Build an identity when a stable id or exact capability observation is known. */
 function buildSessionIdentity(params: {
   ids: IdentityIds;
   state: SessionAcpIdentity["state"];
   source: SessionAcpIdentitySource;
   now: number;
+  capability?: IdentityRuntimeCapability;
 }): SessionAcpIdentity | undefined {
   const { acpxRecordId, acpxSessionId, agentSessionId } = params.ids;
-  if (!acpxRecordId && !acpxSessionId && !agentSessionId) {
+  const sessionResumeSupported = params.capability?.sessionResumeSupported;
+  if (!acpxRecordId && !acpxSessionId && !agentSessionId && sessionResumeSupported === undefined) {
     return undefined;
   }
   return {
@@ -80,6 +98,7 @@ function buildSessionIdentity(params: {
     ...(acpxRecordId ? { acpxRecordId } : {}),
     ...(acpxSessionId ? { acpxSessionId } : {}),
     ...(agentSessionId ? { agentSessionId } : {}),
+    ...(sessionResumeSupported !== undefined ? { sessionResumeSupported } : {}),
     source: params.source,
     lastUpdatedAt: params.now,
   };
@@ -100,14 +119,14 @@ export function identityHasStableSessionId(identity: SessionAcpIdentity | undefi
   return Boolean(identity?.acpxSessionId || identity?.agentSessionId);
 }
 
-/** Resolve the runtime resume id, preferring agent session id over ACP backend id. */
+/** Resolve the runtime resume id, preferring the ACP protocol id over the legacy agent id. */
 export function resolveRuntimeResumeSessionId(
   identity: SessionAcpIdentity | undefined,
 ): string | undefined {
   if (!identity) {
     return undefined;
   }
-  return normalizeText(identity.agentSessionId) ?? normalizeText(identity.acpxSessionId);
+  return normalizeText(identity.acpxSessionId) ?? normalizeText(identity.agentSessionId);
 }
 
 /** Return true when identity is absent or still pending. */
@@ -136,6 +155,8 @@ export function identityEquals(
     a.acpxRecordId === b.acpxRecordId &&
     a.acpxSessionId === b.acpxSessionId &&
     a.agentSessionId === b.agentSessionId &&
+    a.sessionResumeSupported === b.sessionResumeSupported &&
+    a.sessionResumeReady === b.sessionResumeReady &&
     a.source === b.source
   );
 }
@@ -161,14 +182,39 @@ export function mergeSessionIdentity(params: {
   const currentResolved = current.state === "resolved";
   const incomingResolved = incoming.state === "resolved";
   const allowIncomingValue = !currentResolved || incomingResolved;
-  const nextRecordId =
-    allowIncomingValue && incoming.acpxRecordId ? incoming.acpxRecordId : current.acpxRecordId;
-  const nextAcpxSessionId =
-    allowIncomingValue && incoming.acpxSessionId ? incoming.acpxSessionId : current.acpxSessionId;
-  const nextAgentSessionId =
-    allowIncomingValue && incoming.agentSessionId
+  const currentResumeId = resolveRuntimeResumeSessionId(current);
+  const incomingResumeId = resolveRuntimeResumeSessionId(incoming);
+  const replacesIdentityGeneration =
+    allowIncomingValue &&
+    ((incomingResumeId !== undefined && incomingResumeId !== currentResumeId) ||
+      (incoming.acpxRecordId !== undefined && incoming.acpxRecordId !== current.acpxRecordId));
+  // Resume support is evidence from one exact ACPX record, and readiness fences one completed
+  // identity generation. A replacement may carry fresh explicit observations, never old ones.
+  const nextRecordId = replacesIdentityGeneration
+    ? incoming.acpxRecordId
+    : allowIncomingValue && incoming.acpxRecordId
+      ? incoming.acpxRecordId
+      : current.acpxRecordId;
+  const nextAcpxSessionId = replacesIdentityGeneration
+    ? incoming.acpxSessionId
+    : allowIncomingValue && incoming.acpxSessionId
+      ? incoming.acpxSessionId
+      : current.acpxSessionId;
+  const nextAgentSessionId = replacesIdentityGeneration
+    ? incoming.agentSessionId
+    : allowIncomingValue && incoming.agentSessionId
       ? incoming.agentSessionId
       : current.agentSessionId;
+  const nextSessionResumeSupported = replacesIdentityGeneration
+    ? incoming.sessionResumeSupported
+    : incoming.sessionResumeSupported !== undefined
+      ? incoming.sessionResumeSupported
+      : current.sessionResumeSupported;
+  const nextSessionResumeReady = replacesIdentityGeneration
+    ? incoming.sessionResumeReady
+    : incoming.sessionResumeReady !== undefined
+      ? incoming.sessionResumeReady
+      : current.sessionResumeReady;
 
   const nextResolved = Boolean(nextAcpxSessionId || nextAgentSessionId);
   const nextState: SessionAcpIdentity["state"] = nextResolved
@@ -182,6 +228,10 @@ export function mergeSessionIdentity(params: {
     ...(nextRecordId ? { acpxRecordId: nextRecordId } : {}),
     ...(nextAcpxSessionId ? { acpxSessionId: nextAcpxSessionId } : {}),
     ...(nextAgentSessionId ? { agentSessionId: nextAgentSessionId } : {}),
+    ...(nextSessionResumeSupported !== undefined
+      ? { sessionResumeSupported: nextSessionResumeSupported }
+      : {}),
+    ...(nextSessionResumeReady !== undefined ? { sessionResumeReady: nextSessionResumeReady } : {}),
     source: nextSource,
     lastUpdatedAt: params.now,
   };
@@ -195,6 +245,7 @@ export function createIdentityFromEnsure(params: {
 }): SessionAcpIdentity | undefined {
   return buildSessionIdentity({
     ids: readIdentityIdsFromHandle(params.handle),
+    capability: readRuntimeCapabilityFromHandle(params.handle),
     state: "pending",
     source: "ensure",
     now: params.now,
@@ -209,7 +260,8 @@ export function createIdentityFromHandleEvent(params: {
   const ids = readIdentityIdsFromHandle(params.handle);
   return buildSessionIdentity({
     ids,
-    state: ids.agentSessionId ? "resolved" : "pending",
+    capability: readRuntimeCapabilityFromHandle(params.handle),
+    state: ids.acpxSessionId || ids.agentSessionId ? "resolved" : "pending",
     source: "event",
     now: params.now,
   });
@@ -233,7 +285,10 @@ export function createIdentityFromStatus(params: {
     normalizeText(details?.acpxSessionId);
   const agentSessionId =
     normalizeText(params.status.agentSessionId) ?? normalizeText(details?.agentSessionId);
-  if (!acpxRecordId && !acpxSessionId && !agentSessionId) {
+  const sessionResumeSupported =
+    normalizeOptionalBoolean(params.status.sessionResumeSupported) ??
+    normalizeOptionalBoolean(details?.sessionResumeSupported);
+  if (!acpxRecordId && !acpxSessionId && !agentSessionId && sessionResumeSupported === undefined) {
     return undefined;
   }
   const resolved = Boolean(acpxSessionId || agentSessionId);
@@ -242,20 +297,24 @@ export function createIdentityFromStatus(params: {
     ...(acpxRecordId ? { acpxRecordId } : {}),
     ...(acpxSessionId ? { acpxSessionId } : {}),
     ...(agentSessionId ? { agentSessionId } : {}),
+    ...(sessionResumeSupported !== undefined ? { sessionResumeSupported } : {}),
     source: "status",
     lastUpdatedAt: params.now,
   };
 }
 
-/** Convert ACP identity ids into runtime handle resume identifiers. */
+/** Convert ACP identity observations into runtime handle fields. */
 export function resolveRuntimeHandleIdentifiersFromIdentity(
   identity: SessionAcpIdentity | undefined,
-): { backendSessionId?: string; agentSessionId?: string } {
+): { backendSessionId?: string; agentSessionId?: string; sessionResumeSupported?: boolean } {
   if (!identity) {
     return {};
   }
   return {
     ...(identity.acpxSessionId ? { backendSessionId: identity.acpxSessionId } : {}),
     ...(identity.agentSessionId ? { agentSessionId: identity.agentSessionId } : {}),
+    ...(identity.sessionResumeSupported !== undefined
+      ? { sessionResumeSupported: identity.sessionResumeSupported }
+      : {}),
   };
 }
