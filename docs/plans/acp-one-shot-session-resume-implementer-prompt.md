@@ -7,12 +7,40 @@ You are the lead implementation orchestrator for the ACP one-shot session-resume
 - Path: `/home/alejandro-pereira/personal/openclaw/openclaw-acp-one-shot-resume`
 - Branch: `fix/acp-one-shot-resume`
 
+## Absolute runtime-isolation boundary
+
+All implementation, dependency installation, builds, tests, fixtures, documentation edits, Git
+operations, and delegated work for this project must stay inside the feature worktree above.
+
+The running Gateway uses this separate operational checkout:
+
+- Path: `/home/alejandro-pereira/personal/openclaw/openclaw`
+- Branch: `main-custom`
+
+Treat that operational checkout and the running Gateway as read-only external infrastructure. You
+and every delegate must not:
+
+- edit, checkout, reset, rebase, merge, install, build, test, or create artifacts there;
+- change its branch, index, working tree, `node_modules`, `dist`, remotes, or refs;
+- alter OpenClaw configuration, credentials, service files, environment files, or runtime state;
+- stop, start, restart, signal, or otherwise disturb the current Gateway;
+- use a production Gateway restart as an implementation or acceptance step.
+
+If a restart-oriented behavior needs proof, use automated tests, a new-manager/cache-loss test, or a
+fully isolated fixture/process with a separate state directory and port. If that cannot prove a real
+production restart path, mark the production live proof as a deferred promotion gate; do not touch
+the running Gateway to close it.
+
 ## Authoritative plans
 
 1. `docs/plans/acp-one-shot-session-resume.md`
 2. `docs/plans/acp-one-shot-session-resume-delegation.md`
+3. `docs/plans/openclaw-fork-worktree-topology.md`
 
-Read both plans completely before taking action. Also read the repository root `AGENTS.md` and every scoped `AGENTS.md` governing files you inspect or modify.
+Read all three completely before taking action. The topology plan records the completed migration;
+use its isolation model and current topology, not historical pre-migration branch/commit snapshots.
+Also read the repository root `AGENTS.md` and every scoped `AGENTS.md` governing files you inspect or
+modify.
 
 ## Objective
 
@@ -82,6 +110,9 @@ Delegation rules:
 8. Do not use rapid status polling. Completion is push-based; use `sessions_yield` when the current answer depends on delegate completion.
 9. If a delegate lacks permission to spawn further agents, you remain the delegation broker. Do not abandon the review cycle.
 10. If `sessions_spawn` is unexpectedly unavailable, report that exact tooling blocker to the parent. Do not replace independent review with self-review and claim the gate passed.
+11. Every delegate prompt must repeat the absolute feature-worktree path and the prohibition on
+    touching the operational checkout or running Gateway. A generic statement such as “work in the
+    repo” is insufficient.
 
 A prompt cannot grant unavailable tools. Before starting, verify that your session actually has:
 
@@ -109,11 +140,13 @@ Every delegate prompt must include:
 
 ### 2. Repository state
 
-- Absolute repository path.
+- Absolute feature-worktree path.
 - Current branch and expected HEAD.
 - Relevant existing commits.
 - Current working-tree status.
 - All known pre-existing uncommitted changes that must be preserved.
+- Absolute operational-checkout path and an explicit statement that it is forbidden for all writes,
+  builds, tests, Git mutations, service actions, and runtime verification.
 
 ### 3. Authoritative sources
 
@@ -192,25 +225,27 @@ The lead remains responsible for continuity. Delegation does not transfer respon
 
 ## Existing working-tree protection
 
-There are pre-existing planning changes. Preserve them.
-
-At minimum, protect:
+The planning package is committed on the feature branch. Preserve it and any unexpected work that
+appears after launch. At minimum, protect:
 
 - `docs/plans/acp-one-shot-session-resume.md`
 - `docs/plans/acp-one-shot-session-resume-delegation.md`
 - `docs/plans/acp-one-shot-session-resume-implementer-prompt.md`
+- `docs/plans/acp-one-shot-session-resume-launch-prompt.md`
 
 Before editing:
 
 1. Inspect `git status`.
 2. Record the current branch and HEAD.
-3. Identify every pre-existing uncommitted file.
+3. Identify every pre-existing uncommitted file; the expected starting state is clean, so investigate
+   any difference instead of assuming it belongs to you.
 4. Never discard or overwrite unrelated modifications.
 5. Never use destructive Git cleanup or broad reset operations.
 6. Do not stash shared work unless explicitly authorized.
 7. Do not amend or rewrite existing commits unless explicitly requested.
 
-The branch was rebased onto upstream main. Reconfirm current HEAD and plan assumptions instead of trusting stale SHAs blindly.
+The branch was rebased onto `main-custom`, which was itself rebased onto upstream main. Reconfirm the
+current HEAD, merge base, and plan assumptions instead of trusting stale SHAs blindly.
 
 ## Shared durable-resumability predicate
 
@@ -503,16 +538,17 @@ Tests must assert externally meaningful behavior and must not hide failures with
 
 Commit S5 only after independent acceptance.
 
-## S6: Live proof and documentation
+## S6: Isolated proof, documentation, and promotion packet
 
 Scope:
 
 - `docs/tools/acp-agents.md`
 - `docs/automation/tasks.md`
-- live-proof artifact or runbook
+- isolated-proof artifact or runbook
 - changelog only if preparing an upstream contribution
 
-Run a redacted real-path OpenCode proof:
+Run the strongest redacted proof available without touching the operational checkout or running
+Gateway:
 
 1. create initial one-shot;
 2. allow terminal maintenance;
@@ -520,14 +556,19 @@ Run a redacted real-path OpenCode proof:
 4. confirm continuity;
 5. force or simulate cache loss;
 6. follow up again;
-7. obtain approval before any real Gateway restart;
-8. restart and follow up;
+7. prove restart persistence through an isolated process/fixture or automated persisted-state test;
+8. if a real production restart remains necessary, record its exact deferred promotion procedure and
+   expected evidence instead of performing it;
 9. perform a second follow-up;
 10. invalidate or remove the target session in a controlled test;
 11. verify exactly one failed continuation attempt;
 12. verify no new session and no backend fallback.
 
 Document only proven behavior. Do not imply that legacy or unverified sessions are resumable.
+
+Produce a promotion packet containing the exact feature HEAD, base SHA, commit list, isolated test
+evidence, deferred production live-proof steps, expected operational files, and rollback target. Do
+not promote, push, rebase the operational branch, or restart the Gateway.
 
 Commit S6 only after independent acceptance.
 
@@ -543,7 +584,8 @@ The reviewer must inspect the complete branch delta and verify:
 - no unsupported retention;
 - no not-ready retention;
 - stable child key, ACP session, backend, and cwd;
-- restart persistence;
+- restart persistence in automated or isolated evidence, with any production live proof explicitly
+  deferred;
 - normal one-shot process and lease cleanup;
 - unchanged scoped access and ownership checks;
 - unchanged audit and attribution;
@@ -553,7 +595,8 @@ The reviewer must inspect the complete branch delta and verify:
 - no duplicate completion;
 - no unrelated PR #107366 code;
 - coherent production LOC and tests;
-- documentation matches proven behavior.
+- documentation matches proven behavior;
+- the operational checkout and Gateway were not touched.
 
 Address accepted final findings and ask that reviewer to verify the revision.
 
@@ -597,6 +640,10 @@ Ask Alejandro before:
 - opening or modifying a PR;
 - any external or destructive action.
 
+For this execution, do not request or perform Gateway restart, operational-checkout promotion,
+configuration changes, or production live proof. Finish the feature branch and promotion packet
+without those actions. Pushing or opening a PR also remains out of scope unless separately requested.
+
 Do not pause for routine repository reads, edits, tests, or local commits within the approved implementation plan.
 
 ## Progress reporting
@@ -609,7 +656,7 @@ Maintain concise, meaningful updates at these gates:
 - independent review findings received;
 - revisions accepted;
 - slice committed;
-- live proof needs approval;
+- isolated proof complete and any production proof explicitly deferred;
 - final acceptance review complete;
 - concrete blocker.
 
@@ -625,10 +672,12 @@ When finished, provide:
 - files changed by ownership area;
 - review findings and resolutions for every slice;
 - tests and their outcomes;
-- redacted live evidence;
+- redacted automated/isolated evidence;
+- exact deferred production live-proof and promotion packet;
 - production versus test LOC summary;
 - any intentionally deferred work;
 - current working-tree status;
-- whether the branch is ready for upstream preparation.
+- whether the branch is ready for operator-controlled promotion/upstream preparation;
+- explicit confirmation that the operational checkout and running Gateway were untouched.
 
 Start by inspecting the working tree. Then spawn the three parallel read-only evidence delegates, giving each a complete self-contained context package following the mandatory delegate context rules above.

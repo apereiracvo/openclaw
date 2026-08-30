@@ -1,5 +1,11 @@
 # OpenClaw Fork, Branch, and Worktree Migration Plan
 
+> **Status:** Executed on 2026-08-30. Historical migration phases below are retained for recovery and
+> audit. Current ACP implementation work occurs only in
+> `/home/alejandro-pereira/personal/openclaw/openclaw-acp-one-shot-resume` on
+> `fix/acp-one-shot-resume`; the operational checkout remains
+> `/home/alejandro-pereira/personal/openclaw/openclaw` on `main-custom`.
+
 ## Goal
 
 Separate the running OpenClaw Gateway checkout from ACP feature development, while adopting a conventional fork topology:
@@ -12,7 +18,7 @@ Separate the running OpenClaw Gateway checkout from ACP feature development, whi
 - feature agents may build, test, and edit only the feature worktree;
 - the operational checkout is touched only during a reviewed, operator-approved promotion.
 
-## Current verified state
+## Pre-migration state (historical)
 
 - Repository: `/home/alejandro-pereira/personal/openclaw/openclaw`
 - Running Gateway source directory: the same path above.

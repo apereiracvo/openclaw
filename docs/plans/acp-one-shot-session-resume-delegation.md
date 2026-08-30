@@ -8,7 +8,11 @@ This is an execution/delegation plan, not a replacement for the technical plan. 
 
 ## Global controls
 
-- **Branch:** `custom/minisforum-x1-pro`, rebased on `upstream/main` `8b1f6a5d782`.
+- **Feature worktree:** `/home/alejandro-pereira/personal/openclaw/openclaw-acp-one-shot-resume`.
+- **Branch:** `fix/acp-one-shot-resume`, based on operational `main-custom` after its upstream rebase.
+- **Runtime isolation:** every delegate works only in the feature worktree. The operational checkout
+  `/home/alejandro-pereira/personal/openclaw/openclaw` and running Gateway are read-only and must not
+  be edited, built, tested, reconfigured, stopped, started, or restarted.
 - **Reference only:** PR [#107366](https://github.com/openclaw/openclaw/pull/107366) at `c3f8914dec8`; do not cherry-pick it.
 - **Pinned dependency:** ACPX `0.13.1`; no dependency upgrade as part of this work.
 - **Invariant owner:** one shared durable-resumability predicate. No phase may add a competing predicate.
@@ -45,7 +49,7 @@ C: ACPX 0.13.1 contract audit ─────────┘                    
                                                                   ↓
                                                         S6 → R6 → revise
                                                                   ↓
-                                                        final integration review → live proof → docs
+                                                        final integration review → isolated proof → docs
 ```
 
 A–C may run in parallel and produce evidence only. S1–S6 are serial because each establishes a condition required by the next phase.
@@ -141,11 +145,16 @@ Prove same child key/ACP ID/backend/cwd over two follow-ups; cache loss and new 
 
 **Review gate:** tests fail before the implementation, assert external invariants, and do not conceal errors through retries or timing hacks.
 
-### S6. Redacted live proof, docs, final review
+### S6. Redacted isolated proof, docs, final review
 
-**Depends on:** accepted S5. **Scope:** live proof/runbook plus `docs/tools/acp-agents.md` and `docs/automation/tasks.md`.
+**Depends on:** accepted S5. **Scope:** isolated proof/runbook plus `docs/tools/acp-agents.md` and `docs/automation/tasks.md`.
 
-Run a redacted OpenCode proof: initial one-shot, maintenance, follow-up, cache-loss follow-up, controlled Gateway restart follow-up, second follow-up, invalid-target failure. Document only proven conditional retention/resume, fail-closed behavior, and task-owned delivery. Add a changelog only if preparing upstream submission.
+Run a redacted OpenCode proof using tests or a fully isolated process/state directory/port: initial
+one-shot, maintenance, follow-up, cache-loss follow-up, isolated restart-persistence proof, second
+follow-up, and invalid-target failure. Do not touch or restart the running Gateway. Document only
+proven conditional retention/resume, fail-closed behavior, and task-owned delivery. Prepare exact
+production promotion/live-proof steps as a deferred operator gate. Add a changelog only if preparing
+upstream submission.
 
 **Review gate:** real-path evidence proves continuity; docs do not promise resume for legacy or unverified sessions.
 
@@ -155,7 +164,8 @@ Use an independent reviewer who did not implement S1–S6. Confirm:
 
 - no fresh retry or backend failover after explicit resume failure;
 - no unsupported/not-ready retention;
-- same child key, ACP ID, backend, and cwd through restart;
+- same child key, ACP ID, backend, and cwd through isolated restart evidence;
 - normal one-shot lease/process cleanup retained;
 - scoped access, ownership, audit, attribution, participants, expected-session fencing, continuation admission, and single-delivery behavior unchanged;
-- final diff is coherent and excludes unrelated code from PR #107366.
+- final diff is coherent and excludes unrelated code from PR #107366;
+- operational checkout and running Gateway were untouched.
