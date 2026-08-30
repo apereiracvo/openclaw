@@ -305,9 +305,31 @@ describe("Crabbox profile warm images", () => {
     expect(calls.some(({ argv }) => argv[1] === "warmup")).toBe(false);
   });
 
-  it("captures machine0 reusable images with its image strategy and availability timeout", async () => {
-    const { provider, calls } = createWarmProvider();
-    await captureWarmImage(provider, { ...PROFILE, provider: "machine0" });
+  it("captures and reuses machine0 images with native ACTIVE state", async () => {
+    const profile = { ...PROFILE, provider: "machine0" };
+    const { provider, calls } = createWarmProvider(({ argv }) => {
+      if (argv[2] === "create") {
+        return commandResult({
+          stdout: JSON.stringify({
+            id: CHECKPOINT_ID,
+            kind: "machine0-image",
+            leaseId: LEASE_ID,
+            native: { state: "ACTIVE" },
+          }),
+        });
+      }
+      if (argv[2] === "inspect") {
+        return commandResult({
+          stdout: JSON.stringify({
+            localState: "metadata_available",
+            providerState: "ACTIVE",
+            nextAction: "fork_or_delete",
+          }),
+        });
+      }
+      return undefined;
+    });
+    await captureWarmImage(provider, profile);
 
     const create = calls.find(({ argv }) => argv[2] === "create");
     expect(create?.argv).toEqual([
@@ -330,6 +352,10 @@ describe("Crabbox profile warm images", () => {
       options.input?.toString().includes("CRABBOX_SCRUB_NODE_SCRIPT"),
     );
     expect(scrub?.options.timeoutMs).toBe(180_000);
+    calls.length = 0;
+    await provisionWarmProfile(provider, profile, `provision:v2:${"2".repeat(64)}`);
+    expect(calls.find(({ argv }) => argv[2] === "fork")?.argv[3]).toBe(CHECKPOINT_ID);
+    expect(calls.some(({ argv }) => argv[1] === "warmup")).toBe(false);
   });
 
   it.each([
@@ -564,19 +590,25 @@ describe("Crabbox profile warm images", () => {
   });
 
   it.each([
-    { providerState: "available", expectedCommand: "fork", retained: true },
-    { providerState: "missing", expectedCommand: "warmup", retained: false },
-    { providerState: undefined, expectedCommand: "warmup", retained: false },
+    ["available", "fork_or_delete", "fork", true],
+    ["available", "delete", "fork", true],
+    ["Succeeded", "fork_or_delete", "fork", true],
+    ["available", "fork_restore_or_delete", "fork", true],
+    ["ACTIVE", "wait_or_delete", "warmup", true],
+    ["ACTIVE", "check_runtime", "warmup", true],
+    ["unverified_ref", "fork_or_delete_local", "warmup", true],
+    ["missing", "delete_local", "warmup", false],
+    [undefined, "delete_local", "warmup", false],
   ])(
-    "verifies pending images and uses $expectedCommand when provider state is $providerState",
-    async ({ providerState, expectedCommand, retained }) => {
+    "verifies pending image state %s/action %s before %s",
+    async (providerState, nextAction, expectedCommand, retained) => {
       const { provider, calls } = createWarmProvider(({ argv }) =>
         argv[2] === "inspect"
           ? commandResult({
               stdout: JSON.stringify({
-                localState: "available",
+                localState: "metadata_available",
                 ...(providerState ? { providerState } : {}),
-                nextAction: providerState === "available" ? "fork" : "delete",
+                nextAction,
               }),
             })
           : undefined,

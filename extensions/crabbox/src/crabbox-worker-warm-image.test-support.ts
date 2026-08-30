@@ -105,9 +105,9 @@ export function createWarmProvider(
       if (argv[1] === "checkpoint" && argv[2] === "inspect") {
         return commandResult({
           stdout: JSON.stringify({
-            localState: "available",
+            localState: "metadata_available",
             providerState: "available",
-            nextAction: "fork",
+            nextAction: "fork_or_delete",
           }),
         });
       }

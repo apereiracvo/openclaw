@@ -148,7 +148,13 @@ function parseCheckpointAvailability(stdout: string): "available" | "pending" | 
   if (typeof record.providerState !== "string") {
     throw new Error("Crabbox checkpoint inspect returned an invalid provider state");
   }
-  return record.providerState === "available" ? "available" : "pending";
+  // Provider states are native (for example Machine0 ACTIVE); verified fork actions
+  // carry readiness. Docker reports available/delete, so retain that positive state.
+  return record.providerState === "available" ||
+    record.nextAction === "fork_or_delete" ||
+    record.nextAction === "fork_restore_or_delete"
+    ? "available"
+    : "pending";
 }
 
 export function createCrabboxWarmImageManager(dependencies: {
