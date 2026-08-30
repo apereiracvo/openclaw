@@ -230,9 +230,10 @@ export function attachRelayOwner(params: {
   return async () => {
     await close();
     if (ws.readyState === 1) {
-      // The listener sends retirement only after its exact client's cleanup completed.
-      await new Promise<void>((resolve, reject) => {
-        ws.send(JSON.stringify({ retired: true }), (error) => (error ? reject(error) : resolve()));
+      // Cleanup is acknowledged before this notice. A departing peer may reject
+      // its delivery; wait for the write without turning that loss into failed cleanup.
+      await new Promise<void>((resolve) => {
+        ws.send(JSON.stringify({ retired: true }), () => resolve());
       });
     }
   };
