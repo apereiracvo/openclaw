@@ -583,7 +583,7 @@ it("projects only recorded capacity waits as queued and preserves independent ru
     expect(state()).toEqual({ active: true, runIds: [runId] });
   } finally {
     releaseWait?.();
-    registration.cleanup({ force: true });
+    registration.cleanup();
     clearAgentRunContext(runId);
     clearAgentRunContext("capacity-independent");
   }
