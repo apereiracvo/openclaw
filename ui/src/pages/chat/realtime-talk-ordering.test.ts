@@ -361,7 +361,9 @@ describe("browser Talk provider item ordering", () => {
 
   it("persists a keyed final before a consumer synchronously stops the call", async () => {
     const call = createCall((entry) => {
-      if (entry.final) call.session.stop();
+      if (entry.final) {
+        call.session.stop();
+      }
     });
     await call.session.start();
     const peer = Peer.instances[0]!;

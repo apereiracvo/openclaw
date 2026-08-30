@@ -529,10 +529,7 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
   );
 
   it("surfaces speech and response lifecycle status from the OpenAI data channel", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("answer-sdp")) as unknown as typeof fetch,
-    );
+    stubAnswerSdpFetch();
     const onStatus = vi.fn();
     const onTalkEvent = vi.fn();
     const transport = new WebRtcSdpRealtimeTalkTransport(
@@ -621,10 +618,7 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
   });
 
   it("emits common Talk transcript events from the OpenAI data channel", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("answer-sdp")) as unknown as typeof fetch,
-    );
+    stubAnswerSdpFetch();
     const onTranscript = vi.fn();
     const onTalkEvent = vi.fn();
     const transport = new WebRtcSdpRealtimeTalkTransport(
@@ -706,10 +700,7 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
   });
 
   it("maps frameless Codex transcript events by role and finality", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("answer-sdp")) as unknown as typeof fetch,
-    );
+    stubAnswerSdpFetch();
     const onTalkEvent = vi.fn();
     const transport = new WebRtcSdpRealtimeTalkTransport(
       {
@@ -770,10 +761,7 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
   ])(
     "emits assistant transcripts from OpenAI Realtime $label events",
     async ({ deltaType, doneType, doneField }) => {
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async () => new Response("answer-sdp")) as unknown as typeof fetch,
-      );
+      stubAnswerSdpFetch();
       const onTranscript = vi.fn();
       const onTalkEvent = vi.fn();
       const transport = new WebRtcSdpRealtimeTalkTransport(
@@ -828,10 +816,7 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
   );
 
   it("aborts an in-flight OpenAI tool consult when the transport stops", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("answer-sdp")) as unknown as typeof fetch,
-    );
+    stubAnswerSdpFetch();
     const listeners = new Set<(event: { event: string; payload?: unknown }) => void>();
     const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
       if (method === "chat.abort") {
@@ -1060,10 +1045,7 @@ describe("WebRtcSdpRealtimeTalkTransport", () => {
   });
 
   it("does not auto-control ambiguous multilingual speech during an active consult", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("answer-sdp")) as unknown as typeof fetch,
-    );
+    stubAnswerSdpFetch();
     const request = vi.fn(async (method: string) => {
       if (method === "talk.client.toolCall") {
         return { runId: "run-1" };
