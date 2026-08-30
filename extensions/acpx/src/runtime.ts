@@ -70,6 +70,7 @@ import {
   readRecordAgentCommand,
   readRecordCwd,
   readRecordResetOnNextEnsure,
+  readSessionRecordName,
   readOpenClawLeaseIdFromRecord,
   extractGeneratedWrapperPath,
   createResetAwareSessionStore,
@@ -156,6 +157,15 @@ async function readCodexWrapperStderrTail(params: {
   } catch {
     return "";
   }
+}
+
+function readRecordSessionResumeSupported(record: AcpLoadedSessionRecord): boolean | undefined {
+  if (!record) {
+    return undefined;
+  }
+  return Boolean(
+    record.agentCapabilities?.sessionCapabilities?.resume || record.agentCapabilities?.loadSession,
+  );
 }
 
 const CODEX_ACP_AGENT_ID = "codex";
@@ -612,10 +622,17 @@ export class AcpxRuntime implements CompleteAcpRuntime {
           `ACPX process lease ${identity.leaseId} belongs to another gateway`,
         );
       }
+      const recordSessionKey = readSessionRecordName(record);
+      // Explicit one-shot resume projects the original OpenClaw key over a synthetic ACPX record.
+      // Lease ownership remains the synthetic record, so operation validation accepts that exact key.
+      const leaseSessionKeys = new Set([
+        resolveAcpxSessionResource(handle),
+        ...(recordSessionKey ? [recordSessionKey] : []),
+      ]);
       if (
         lease &&
         (lease.gatewayInstanceId !== identity.gatewayInstanceId ||
-          lease.sessionKey !== resolveAcpxSessionResource(handle) ||
+          !leaseSessionKeys.has(lease.sessionKey) ||
           lease.wrapperRoot !== this.wrapperRoot)
       ) {
         throw new AcpRuntimeError(
@@ -971,18 +988,30 @@ export class AcpxRuntime implements CompleteAcpRuntime {
           ? { kind: "applied", model: requestedModel }
           : { kind: "dropped" }
         : undefined;
+    const explicitOneShotResume =
+      input.mode === "oneshot" && Boolean(input.resumeSessionId?.trim());
+    // ACPX one-shots use allow-new reconnect semantics and can retain pending state by session key.
+    // A unique persistent delegate record gives explicit OpenClaw one-shot resumes a fresh lease
+    // and ACPX's same-session-only contract; OpenClaw still owns and closes the result as one-shot.
+    const delegatedInput: OpenClawRuntimeEnsureInput = explicitOneShotResume
+      ? {
+          ...effectiveInput,
+          sessionKey: `${input.sessionKey}:oneshot-resume:${randomUUID()}`,
+          mode: "persistent",
+        }
+      : effectiveInput;
     const ensureInput = isCodexAcp
-      ? withCodexSessionModel(effectiveInput, codexModelOverride)
+      ? withCodexSessionModel(delegatedInput, codexModelOverride)
       : claudeModelOverride
-        ? { ...effectiveInput, model: claudeModelOverride }
-        : effectiveInput;
+        ? { ...delegatedInput, model: claudeModelOverride }
+        : delegatedInput;
     const stableLaunchCommand =
       codexModelOverride && command
         ? appendCodexAcpConfigOverrides(command, codexModelOverride)
         : command;
     const reusableCommand = await this.readReusablePersistentSessionCommand({
-      sessionKey: input.sessionKey,
-      mode: input.mode,
+      sessionKey: ensureInput.sessionKey,
+      mode: ensureInput.mode,
       cwd: input.cwd,
       command: stableLaunchCommand,
       resumeSessionId: input.resumeSessionId,
@@ -1006,9 +1035,21 @@ export class AcpxRuntime implements CompleteAcpRuntime {
                 }, ensureInput),
         }),
     });
+    // The runtime record may be synthetic for explicit one-shot resumption, but
+    // callers retain the original OpenClaw session target and actor.
+    const openClawHandle = { ...handle, ...logicalTarget };
+    let sessionResumeSupported: boolean | undefined;
+    try {
+      sessionResumeSupported = readRecordSessionResumeSupported(
+        await this.sessionStore.load(handle.acpxRecordId ?? handle.sessionKey),
+      );
+    } catch {
+      // Capability observation is best-effort for a newly ensured session. Durable resume
+      // admission requires an explicit true later, so a read failure must remain unknown.
+    }
     return {
-      ...handle,
-      ...logicalTarget,
+      ...openClawHandle,
+      ...(sessionResumeSupported !== undefined ? { sessionResumeSupported } : {}),
       ...(appliedModel ? { appliedModel } : {}),
       ...(dropInheritedCodexMax ? { appliedThinking: { kind: "dropped" as const } } : {}),
     };
