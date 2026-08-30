@@ -220,7 +220,7 @@ posixIt.each(
 );
 
 posixIt.each([1, 23, 124, 125, 143])(
-  "ClawHub resolves origin fallback after safely drained ordinary local miss %s",
+  "ClawHub resolves origin fallback after safely drained ordinary local probe failure %s",
   async (code) => {
     const report = await pluginRun("clawhub-resolve", {
       env: { TARGET_REF: "release/fixture" },
@@ -450,7 +450,13 @@ const terminalCases: Array<{
   revisions?: Record<string, string>;
 }> = [
   { mode: "clawhub-resolve" as const, operation: "fetch", match: "^fetch " },
-  { mode: "clawhub-resolve" as const, operation: "rev-parse", match: "^rev-parse " },
+  {
+    mode: "clawhub-resolve" as const,
+    operation: "rev-parse",
+    match: "^rev-parse --verify --quiet ",
+    env: { TARGET_REF: "release/fixture" },
+    revisions: { "origin/release/fixture^{commit}": sha },
+  },
   {
     mode: "clawhub-resolve" as const,
     operation: "checkout",
@@ -530,6 +536,9 @@ posixIt.each(
     });
     expect(report.code, report.output).toBe(failure === "cancel" ? 143 : 125);
     expect(gitCommands(report).at(-1)?.[0]).toBe(operation);
+    expect(
+      gitCommands(report).filter((args) => new RegExp(match).test(args.join(" "))),
+    ).toHaveLength(1);
     expect(report.githubOutput).toBe("");
     expect(report.commands.some(({ tool }) => ["node", "pnpm"].includes(tool))).toBe(false);
   },
