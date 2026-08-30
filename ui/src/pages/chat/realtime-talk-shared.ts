@@ -38,6 +38,7 @@ export type RealtimeTalkCallbacks = {
   onVideoCapability?: (capable: boolean) => void;
   onInputLevel?: (level: number) => void;
   onTranscript?: (entry: RealtimeTalkTranscript) => void;
+  onTranscriptOrder?: (items: ReadonlyArray<{ itemId: string; order: number }>) => void;
   onTranscriptItem?: (item: RealtimeTalkTranscriptItem) => void;
   onTalkEvent?: (event: RealtimeTalkEvent) => void;
   onVideoStream?: (stream: MediaStream | null) => void;

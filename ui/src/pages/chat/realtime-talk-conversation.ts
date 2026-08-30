@@ -50,7 +50,7 @@ export function updateRealtimeTalkConversation(
   if (update.final ? text.trim() === "" : text === "") {
     return state;
   }
-  if (update.itemId !== undefined && update.order !== undefined) {
+  if (update.itemId !== undefined) {
     const id = `item-${update.itemId}`;
     const previous = state.entries.find((entry) => entry.id === id);
     const entry = {
@@ -62,12 +62,10 @@ export function updateRealtimeTalkConversation(
     };
     // Provider identities survive delayed ASR and overlapping responses. Text and
     // wall-clock proximity cannot identify which utterance a final replaces.
-    return {
+    return orderRealtimeTalkConversation({
       ...state,
-      entries: [...state.entries.filter((candidate) => candidate.id !== id), entry]
-        .toSorted((left, right) => (left.order ?? 0) - (right.order ?? 0))
-        .slice(-MAX_CONVERSATION_ENTRIES),
-    };
+      entries: [...state.entries.filter((candidate) => candidate.id !== id), entry],
+    });
   }
   const nowMs = update.nowMs ?? Date.now();
   if (update.role === "assistant") {
@@ -105,6 +103,20 @@ export function updateRealtimeTalkConversation(
     update.final,
     nowMs,
   );
+}
+
+export function orderRealtimeTalkConversation(
+  state: RealtimeTalkConversationState,
+  orders: ReadonlyArray<{ itemId: string; order: number }> = [],
+): RealtimeTalkConversationState {
+  const byId = new Map(orders.map(({ itemId, order }) => [`item-${itemId}`, order]));
+  return {
+    ...state,
+    entries: state.entries
+      .map((entry) => (byId.has(entry.id) ? { ...entry, order: byId.get(entry.id) } : entry))
+      .toSorted((left, right) => (left.order ?? Infinity) - (right.order ?? Infinity))
+      .slice(-MAX_CONVERSATION_ENTRIES),
+  };
 }
 
 function upsertRealtimeConversationEntry(

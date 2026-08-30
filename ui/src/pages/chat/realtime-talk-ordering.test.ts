@@ -5,6 +5,7 @@ import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import {
   createRealtimeTalkConversationState,
+  orderRealtimeTalkConversation,
   updateRealtimeTalkConversation,
 } from "./realtime-talk-conversation.ts";
 import { useRealtimeTalkMicrophoneFixture } from "./realtime-talk-input.test-support.ts";
@@ -86,6 +87,9 @@ function createCall(onTranscript?: (entry: RealtimeTalkTranscript) => void) {
     {
       onStatus,
       onTalkEvent,
+      onTranscriptOrder: (orders) => {
+        conversation = orderRealtimeTalkConversation(conversation, orders);
+      },
       onTranscript: (entry) => {
         conversation = updateRealtimeTalkConversation(conversation, entry);
         onTranscript?.(entry);
@@ -96,6 +100,7 @@ function createCall(onTranscript?: (entry: RealtimeTalkTranscript) => void) {
   onTestFinished(() => session.stop());
   return {
     session,
+    request,
     requests,
     onStatus,
     onTalkEvent,
@@ -138,9 +143,9 @@ describe("browser Talk provider item ordering", () => {
       const settled = starting.catch((error: unknown) => error);
       await waitForFast(() => expect(Peer.instances[0]?.setRemoteDescription).toHaveBeenCalled());
       const peer = Peer.instances[0]!;
-      item(peer, "early-user", "user", null);
       item(peer, "early-answer", "assistant", "early-user");
       final(peer, "early-answer", "assistant", "answer during setup");
+      item(peer, "early-user", "user", null);
       if (outcome === "ready") {
         setup.resolve();
         await starting;
@@ -237,6 +242,129 @@ describe("browser Talk provider item ordering", () => {
       "second answer",
     ]);
     call.session.stop();
+  });
+
+  it.each(["speech", "non-speech"])(
+    "connects an early successor through a late %s predecessor without delaying streaming",
+    async (predecessor) => {
+      const call = await start();
+      item(call.peer, "a2", "assistant", "middle");
+      emit(call.peer, {
+        type: "response.output_audio_transcript.delta",
+        item_id: "a2",
+        delta: "second answer",
+      });
+      expect(call.peer.close).not.toHaveBeenCalled();
+      expect(call.entries()).toEqual([{ role: "assistant", text: "second answer" }]);
+      final(call.peer, "a2", "assistant", "second answer");
+      item(call.peer, "u1", "user", null);
+      item(call.peer, "a1", "assistant", "u1");
+      final(call.peer, "a1", "assistant", "first answer");
+      final(call.peer, "u1", "user", "first question");
+      await waitForFast(() => expect(call.writes()).toHaveLength(2));
+      emit(call.peer, {
+        type: "conversation.item.added",
+        previous_item_id: "a1",
+        item:
+          predecessor === "speech"
+            ? { id: "middle", type: "message", role: "user", content: [{ type: "input_audio" }] }
+            : { id: "middle", type: "function_call_output" },
+      });
+      // Metadata alone must move a previously streamed row into its known order.
+      expect(call.entries().map(({ text }) => text)).toEqual([
+        "first question",
+        "first answer",
+        "second answer",
+      ]);
+      if (predecessor === "speech") {
+        expect(call.writes()).toHaveLength(2);
+        final(call.peer, "middle", "user", "second question");
+      }
+      const expected = [
+        "first question",
+        "first answer",
+        ...(predecessor === "speech" ? ["second question"] : []),
+        "second answer",
+      ];
+      await waitForFast(() =>
+        expect(call.writes().map(({ params }) => params.text)).toEqual(expected),
+      );
+      expect(call.entries().map(({ text }) => text)).toEqual(expected);
+      expect(call.peer.close).not.toHaveBeenCalled();
+    },
+  );
+
+  it("drains a known successor when its predecessor never arrives before stop", async () => {
+    const call = await start();
+    item(call.peer, "a2", "assistant", "a1");
+    final(call.peer, "a2", "assistant", "next answer");
+    item(call.peer, "a1", "assistant", "missing-user");
+    final(call.peer, "a1", "assistant", "known answer");
+    expect(call.peer.close).not.toHaveBeenCalled();
+    expect(call.writes()).toEqual([]);
+    call.session.stop();
+    await waitForFast(() => expect(call.requests.at(-1)?.method).toBe("talk.client.close"));
+    expect(call.writes().map(({ params }) => params.text)).toEqual(["known answer", "next answer"]);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("unfinished transcript"));
+    item(call.peer, "missing-user", "user", null);
+    final(call.peer, "missing-user", "user", "too late");
+    expect(call.writes()).toHaveLength(2);
+    expect(call.requests.filter(({ method }) => method === "talk.client.close")).toHaveLength(1);
+  });
+
+  it("reports a failed predecessor save while its accepted successor still awaits ASR", async () => {
+    const call = await start();
+    const error = new Error("transcript store unavailable");
+    call.request
+      .mockRejectedValueOnce(error)
+      .mockRejectedValueOnce(error)
+      .mockRejectedValueOnce(error);
+    vi.useFakeTimers();
+    item(call.peer, "u2", "user", "u1");
+    item(call.peer, "u1", "user", null);
+    final(call.peer, "u1", "user", "first question");
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(call.onStatus).toHaveBeenLastCalledWith(
+      "error",
+      "Voice transcript could not be saved: transcript store unavailable",
+    );
+    expect(call.peer.close).not.toHaveBeenCalled();
+    vi.useRealTimers();
+    final(call.peer, "u2", "user", "second question");
+    call.session.stop();
+    await waitForFast(() => expect(call.requests.at(-1)?.method).toBe("talk.client.close"));
+    expect(call.writes().map(({ params }) => params.text)).toEqual(["second question"]);
+    expect(call.onStatus.mock.calls.filter(([status]) => status === "error")).toHaveLength(1);
+  });
+
+  it("keeps a consult flush bound to the accepted successor while its predecessor arrives", async () => {
+    const call = await start();
+    item(call.peer, "a1", "assistant", "u1");
+    final(call.peer, "a1", "assistant", "answer");
+    emit(call.peer, {
+      type: "response.done",
+      response: {
+        status: "completed",
+        output: [
+          {
+            type: "function_call",
+            call_id: "consult-1",
+            name: "openclaw_agent_consult",
+            arguments: JSON.stringify({ question: "check status" }),
+          },
+        ],
+      },
+    });
+    item(call.peer, "u1", "user", null);
+    final(call.peer, "u1", "user", "question");
+    await waitForFast(() =>
+      expect(call.requests.some(({ method }) => method === "talk.client.toolCall")).toBe(true),
+    );
+    expect(
+      call.requests
+        .filter(({ method }) => method !== "talk.client.create")
+        .map(({ method }) => method),
+    ).toEqual(["talk.client.transcript", "talk.client.transcript", "talk.client.toolCall"]);
   });
 
   it.each(["failed", "empty"])(
@@ -338,26 +466,29 @@ describe("browser Talk provider item ordering", () => {
     ]);
   });
 
-  it("bounds unresolved provider items and drains its accepted finals on overflow", async () => {
-    const call = await start();
-    item(call.peer, "u1", "user", null);
-    for (let index = 0; index < 40; index += 1) {
-      item(call.peer, `a${index}`, "assistant", index === 0 ? "u1" : `a${index - 1}`);
-      final(call.peer, `a${index}`, "assistant", `answer-${index}`);
-    }
-    expect(call.writes()).toEqual([]);
-    item(call.peer, "overflow", "user", "a39");
-    expect(call.onStatus).toHaveBeenLastCalledWith(
-      "error",
-      expect.stringContaining("could not keep up"),
-    );
-    await waitForFast(() => expect(call.requests.at(-1)?.method).toBe("talk.client.close"));
-    expect(call.writes().map(({ params }) => params.text)).toEqual(
-      Array.from({ length: 40 }, (_, index) => `answer-${index}`),
-    );
-    final(call.peer, "u1", "user", "too late");
-    expect(call.writes()).toHaveLength(40);
-  });
+  it.each([null, "missing-root"])(
+    "bounds pending items with predecessor %s and drains accepted finals on overflow",
+    async (previous) => {
+      const call = await start();
+      item(call.peer, "u1", "user", previous);
+      for (let index = 0; index < 40; index += 1) {
+        item(call.peer, `a${index}`, "assistant", index === 0 ? "u1" : `a${index - 1}`);
+        final(call.peer, `a${index}`, "assistant", `answer-${index}`);
+      }
+      expect(call.writes()).toEqual([]);
+      item(call.peer, "overflow", "user", "a39");
+      expect(call.onStatus).toHaveBeenLastCalledWith(
+        "error",
+        expect.stringContaining("could not keep up"),
+      );
+      await waitForFast(() => expect(call.requests.at(-1)?.method).toBe("talk.client.close"));
+      expect(call.writes().map(({ params }) => params.text)).toEqual(
+        Array.from({ length: 40 }, (_, index) => `answer-${index}`),
+      );
+      final(call.peer, "u1", "user", "too late");
+      expect(call.writes()).toHaveLength(40);
+    },
+  );
 
   it("persists a keyed final before a consumer synchronously stops the call", async () => {
     const call = createCall((entry) => {

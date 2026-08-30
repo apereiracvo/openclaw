@@ -13,9 +13,12 @@ import type {
 } from "./realtime-talk-shared.ts";
 
 type ReservedTranscript = {
-  order: number;
-  role: "user" | "assistant";
-  complete?: (text: string | undefined) => void;
+  previousItemId: string | null | undefined;
+  order?: number;
+  role: "user" | "assistant" | null;
+  settled: boolean;
+  written?: boolean;
+  text?: string;
 };
 
 // Keep exact identities for the connection: eviction could admit a late duplicate
@@ -25,8 +28,10 @@ const MAX_TRANSCRIPT_ITEM_ID_CHARS = 1_024;
 
 export class ClientVoiceTranscriptQueue {
   private sequence = 0;
+  private nextWriteOrder = 1;
   private lastItemId: string | undefined;
-  private readonly items = new Map<string, ReservedTranscript | null>();
+  private readonly items = new Map<string, ReservedTranscript>();
+  private changed = createDeferredCore();
 
   constructor(
     readonly queue: BoundedSerialQueue,
@@ -38,46 +43,38 @@ export class ClientVoiceTranscriptQueue {
     private readonly onFailure: (error: unknown) => void,
   ) {}
 
-  observe(item: RealtimeTalkTranscriptItem): void {
+  observe(item: RealtimeTalkTranscriptItem): Array<{ itemId: string; order: number }> {
     if (item.type === "settled") {
-      const reservation = this.requireItem(item.itemId);
-      this.settle(reservation);
-      return;
+      this.settle(this.requireItem(item.itemId));
+      return [];
     }
     if (this.items.has(item.itemId)) {
-      return;
+      return [];
     }
     if (
       this.items.size >= MAX_TRANSCRIPT_ITEM_IDENTITIES ||
-      item.itemId.length > MAX_TRANSCRIPT_ITEM_ID_CHARS
+      item.itemId.length > MAX_TRANSCRIPT_ITEM_ID_CHARS ||
+      (item.previousItemId?.length ?? 0) > MAX_TRANSCRIPT_ITEM_ID_CHARS
     ) {
       throw new Error("Realtime transcript item identity limit exceeded");
     }
-    // This client appends provider items; it never requests historical insertion.
-    // Reject an unknown/rewritten predecessor before committing a false order.
-    if (item.previousItemId != null && item.previousItemId !== this.lastItemId) {
-      throw new Error("Realtime transcript item has an unexpected predecessor");
-    }
-    this.lastItemId = item.itemId;
-    if (item.role === null) {
-      this.items.set(item.itemId, null);
-      return;
-    }
-    const result = createDeferredCore<string | undefined>();
     const reservation: ReservedTranscript = {
-      order: ++this.sequence,
+      previousItemId: item.previousItemId === undefined ? this.lastItemId : item.previousItemId,
       role: item.role,
-      complete: result.resolve,
+      settled: item.role === null,
     };
+    if (item.role !== null) {
+      // Each accepted identity owns a FIFO barrier and the maximum text budget.
+      // Its task drains predecessors too, so consult flushes still cover that identity.
+      this.enqueue(
+        () => this.writeThrough(reservation),
+        VOICE_TRANSCRIPT_QUEUE_POLICY.maxEntryChars,
+        // writeThrough reports at the failed write, even if its target is still pending.
+        () => undefined,
+      );
+    }
     this.items.set(item.itemId, reservation);
-    // Reserve the existing FIFO position before asynchronous ASR can be overtaken
-    // by assistant finals. Charge the maximum retained text while it is pending.
-    this.enqueue(async () => {
-      const text = await result.promise;
-      if (text) {
-        await this.write(String(reservation.order), reservation.role, text);
-      }
-    }, VOICE_TRANSCRIPT_QUEUE_POLICY.maxEntryChars);
+    return this.assignOrders();
   }
 
   publish(entry: RealtimeTalkTranscript): RealtimeTalkTranscript | undefined {
@@ -86,7 +83,7 @@ export class ClientVoiceTranscriptQueue {
       if (reservation.role !== entry.role) {
         throw new Error("Realtime transcript item changed roles");
       }
-      if (!reservation.complete) {
+      if (reservation.settled) {
         return undefined;
       }
       if (entry.final) {
@@ -107,37 +104,117 @@ export class ClientVoiceTranscriptQueue {
   }
 
   close(): string[] {
-    const missing: string[] = [];
+    const missing = new Set<string>();
     for (const [itemId, reservation] of this.items) {
-      if (reservation?.complete) {
-        missing.push(itemId);
+      if (reservation.order === undefined) {
+        missing.add(itemId);
+      }
+      if (!reservation.settled) {
+        missing.add(itemId);
         this.settle(reservation);
       }
+      if (reservation.previousItemId && !this.items.has(reservation.previousItemId)) {
+        missing.add(reservation.previousItemId);
+      }
     }
-    this.items.clear();
-    return missing;
+    // On teardown there can be no more ancestry. Preserve known finals while
+    // reporting the missing links; normal operation never guesses their order.
+    this.assignOrders(true);
+    return [...missing];
+  }
+
+  private assignOrders(closing = false): Array<{ itemId: string; order: number }> {
+    const orders: Array<{ itemId: string; order: number }> = [];
+    while (true) {
+      const pending = [...this.items].filter(([, item]) => item.order === undefined);
+      const next =
+        pending.find(([, item]) =>
+          item.previousItemId == null
+            ? this.lastItemId === undefined
+            : item.previousItemId === this.lastItemId,
+        ) ??
+        (closing
+          ? (pending.find(
+              ([, item]) =>
+                item.previousItemId == null ||
+                !this.items.has(item.previousItemId) ||
+                this.items.get(item.previousItemId)?.order !== undefined,
+            ) ?? pending[0])
+          : undefined);
+      if (!next) {
+        break;
+      }
+      const [itemId, item] = next;
+      item.order = item.role === null ? this.sequence : ++this.sequence;
+      this.lastItemId = itemId;
+      if (item.role !== null) {
+        orders.push({ itemId, order: item.order });
+      }
+    }
+    this.notify();
+    return orders;
+  }
+
+  private async writeThrough(target: ReservedTranscript): Promise<void> {
+    let failure: { error: unknown } | undefined;
+    while (!target.written) {
+      const next = [...this.items.values()].find(
+        (item) => item.role !== null && item.order === this.nextWriteOrder,
+      );
+      if (!next?.settled) {
+        await this.changed.promise;
+        continue;
+      }
+      next.written = true;
+      this.nextWriteOrder += 1;
+      const text = next.text;
+      next.text = undefined;
+      if (text && next.role !== null) {
+        try {
+          await this.write(String(next.order), next.role, text);
+        } catch (error) {
+          // A failed predecessor must not discard this accepted successor.
+          failure ??= { error };
+          this.onFailure(error);
+        }
+      }
+    }
+    if (failure) {
+      throw failure.error;
+    }
   }
 
   private settle(reservation: ReservedTranscript, text?: string): void {
-    const complete = reservation.complete;
-    reservation.complete = undefined;
-    complete?.(text);
+    if (!reservation.settled) {
+      reservation.settled = true;
+      reservation.text = text;
+      this.notify();
+    }
+  }
+
+  private notify(): void {
+    this.changed.resolve();
+    this.changed = createDeferredCore();
   }
 
   private requireItem(itemId: string): ReservedTranscript {
     const reservation = this.items.get(itemId);
-    if (!reservation) {
+    if (!reservation || reservation.role === null) {
       throw new Error("Realtime transcript refers to an unknown speech item");
     }
     return reservation;
   }
 
-  private enqueue(run: () => Promise<void>, weight: number): void {
+  private enqueue(
+    run: () => Promise<void>,
+    weight: number,
+    onFailure: (error: unknown) => void = this.onFailure,
+  ): void {
     const admission = this.queue.enqueue(run, { weight });
     if (!admission.accepted) {
       throw new Error(VOICE_TRANSCRIPT_QUEUE_POLICY.overflowMessage);
     }
-    void admission.completion.catch(this.onFailure);
+    void admission.completion.catch(onFailure);
   }
 }
 

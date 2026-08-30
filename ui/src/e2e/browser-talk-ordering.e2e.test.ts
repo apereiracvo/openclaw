@@ -84,6 +84,18 @@ suite.define(() => {
             item_id: id,
             transcript,
           });
+        await item("answer-2", "assistant", "question-2");
+        await emit({
+          type: "response.output_audio_transcript.delta",
+          item_id: "answer-2",
+          delta: "Lantern.",
+        });
+        await expect.poll(() => rows.allTextContents()).toEqual(["Lantern."]);
+        await page.screenshot({
+          path: path.join(artifactDir, "unresolved-order.png"),
+          fullPage: true,
+        });
+        await final("answer-2", "assistant", "Lantern.");
         await emit({
           type: "input_audio_buffer.committed",
           item_id: "question-1",
@@ -91,16 +103,14 @@ suite.define(() => {
         });
         await item("question-1", "user", null);
         await item("answer-1", "assistant", "question-1");
-        await item("question-2", "user", "answer-1");
-        await item("answer-2", "assistant", "question-2");
         await emit({
           type: "response.output_audio_transcript.delta",
           item_id: "answer-1",
           delta: "Glacier.",
         });
-        await expect.poll(() => rows.allTextContents()).toEqual(["Glacier."]);
+        await expect.poll(() => rows.allTextContents()).toEqual(["Glacier.", "Lantern."]);
         await page.screenshot({ path: path.join(artifactDir, "streaming.png"), fullPage: true });
-        await final("answer-2", "assistant", "Lantern.");
+        await item("question-2", "user", "answer-1");
         await final("question-2", "user", "Please say lantern.");
         await final("answer-1", "assistant", "Glacier.");
         expect(await gateway.getRequests("talk.client.transcript")).toEqual([]);

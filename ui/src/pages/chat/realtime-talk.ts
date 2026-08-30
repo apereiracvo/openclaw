@@ -508,10 +508,15 @@ export class RealtimeTalkSession {
         if (!isCurrent()) {
           return;
         }
+        let orders;
         try {
-          transcripts.observe(item);
+          orders = transcripts.observe(item);
         } catch (error) {
           this.failTranscriptPersistence(owningGeneration, formatUiError(error));
+          return;
+        }
+        if (orders.length > 0) {
+          this.callbacks.onTranscriptOrder?.(orders);
         }
       },
       onTranscript: (entry) => {
