@@ -1,7 +1,7 @@
 // Runs grouped batches through the repository's installed Vitest entrypoint.
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { resolveVitestCliEntry } from "../run-vitest.mts";
+import { resolveVitestCliEntry, resolveVitestNodeArgs } from "../run-vitest.mts";
 import { installVitestProcessGroupCleanup } from "../vitest-process-group.mts";
 import { spawnOwnedVitestProcess } from "./vitest-process.mts";
 import type { VitestReportOutcome } from "./vitest-report-owner.mts";
@@ -28,6 +28,7 @@ export async function runVitestBatch(params: VitestBatchRunParams): Promise<numb
     const { child, completion } = spawnOwnedVitestProcess({
       command: process.execPath,
       args: [
+        ...resolveVitestNodeArgs(params.env),
         resolveVitestCliEntry({ env: params.env }),
         "run",
         "--config",

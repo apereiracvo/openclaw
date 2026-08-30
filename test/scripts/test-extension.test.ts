@@ -687,83 +687,90 @@ describe("scripts/test-extension.mts", () => {
     });
   });
 
-  it("runs installed Vitest without a package manager and preserves native selection", () => {
-    const root = realpathSync(mkdtempSync(path.join(tmpdir(), "openclaw-test-extension-native-")));
-    const home = path.join(root, "home");
-    const report = path.join(root, "report.json");
-    const config = path.join(root, "vitest.config.mjs");
-    const entry = path.join(root, "batch.mts");
-    mkdirSync(home);
-    symlinkSync(
-      path.join(process.cwd(), "node_modules"),
-      path.join(root, "node_modules"),
-      "junction",
-    );
-    writeFileSync(
-      config,
-      `export default {root:${JSON.stringify(root)},cacheDir:${JSON.stringify(path.join(root, "cache"))},test:{include:['*.test.mjs'],pool:'forks',maxWorkers:1,fileParallelism:false,cache:false,experimental:{fsModuleCache:false}}};`,
-    );
-    writeFileSync(
-      path.join(root, "selected.test.mjs"),
-      `import {test,expect} from 'vitest';test('selected native case',()=>expect(process.env.HOME).toBe(${JSON.stringify(home)}));`,
-    );
-    for (const name of ["excluded", "unrelated"]) {
+  it.each([false, true])(
+    "runs installed Vitest without pnpm (Maglev opt-in: %s)",
+    (enableMaglev) => {
+      const root = realpathSync(
+        mkdtempSync(path.join(tmpdir(), "openclaw-test-extension-native-")),
+      );
+      const home = path.join(root, "home");
+      const report = path.join(root, "report.json");
+      const config = path.join(root, "vitest.config.mjs");
+      const entry = path.join(root, "batch.mts");
+      mkdirSync(home);
+      symlinkSync(
+        path.join(process.cwd(), "node_modules"),
+        path.join(root, "node_modules"),
+        "junction",
+      );
       writeFileSync(
-        path.join(root, `${name}.test.mjs`),
-        "import {test,expect} from 'vitest';test('must not execute',()=>expect.fail('selection lost'));",
+        config,
+        `import assert from 'node:assert/strict';
+assert.equal(process.execArgv.includes('--no-maglev'), ${!enableMaglev}, 'batch Node defaults');
+export default {root:${JSON.stringify(root)},cacheDir:${JSON.stringify(path.join(root, "cache"))},test:{include:['*.test.mjs'],pool:'forks',maxWorkers:1,fileParallelism:false,cache:false,experimental:{fsModuleCache:false}}};`,
       );
-    }
-    const params = {
-      config,
-      args: [
-        "--configLoader=native",
-        "--reporter=verbose",
-        "--reporter=json",
-        `--outputFile=${report}`,
-        "--exclude",
-        "**/excluded.test.mjs",
-      ],
-      targets: [path.join(root, "selected.test.mjs"), path.join(root, "excluded.test.mjs")],
-    };
-    writeFileSync(
-      entry,
-      `import {runVitestBatch} from ${JSON.stringify(path.join(process.cwd(), "scripts/lib/vitest-batch-runner.mts"))};process.exitCode=await runVitestBatch(${JSON.stringify(params)});`,
-    );
-    try {
-      const result = spawnSync(
-        process.execPath,
-        ["--import", path.join(process.cwd(), "scripts/tsx.mjs"), entry],
-        {
-          cwd: root,
-          encoding: "utf8",
-          env: {
-            PATH: "",
-            HOME: home,
-            USERPROFILE: home,
-            TMPDIR: root,
-            TMP: root,
-            TEMP: root,
-            SystemRoot: process.env.SystemRoot,
-            COREPACK_ENABLE_NETWORK: "0",
-            NODE_DISABLE_COMPILE_CACHE: "1",
-            CI: "1",
+      writeFileSync(
+        path.join(root, "selected.test.mjs"),
+        `import {test,expect} from 'vitest';test('selected native case',()=>expect(process.env.HOME).toBe(${JSON.stringify(home)}));`,
+      );
+      for (const name of ["excluded", "unrelated"]) {
+        writeFileSync(
+          path.join(root, `${name}.test.mjs`),
+          "import {test,expect} from 'vitest';test('must not execute',()=>expect.fail('selection lost'));",
+        );
+      }
+      const params = {
+        config,
+        args: [
+          "--configLoader=native",
+          "--reporter=verbose",
+          "--reporter=json",
+          `--outputFile=${report}`,
+          "--exclude",
+          "**/excluded.test.mjs",
+        ],
+        targets: [path.join(root, "selected.test.mjs"), path.join(root, "excluded.test.mjs")],
+      };
+      writeFileSync(
+        entry,
+        `import {runVitestBatch} from ${JSON.stringify(path.join(process.cwd(), "scripts/lib/vitest-batch-runner.mts"))};process.exitCode=await runVitestBatch({...${JSON.stringify(params)},env:{...process.env,OPENCLAW_VITEST_ENABLE_MAGLEV:${JSON.stringify(enableMaglev ? "1" : "")}}});`,
+      );
+      try {
+        const result = spawnSync(
+          process.execPath,
+          ["--import", path.join(process.cwd(), "scripts/tsx.mjs"), entry],
+          {
+            cwd: root,
+            encoding: "utf8",
+            env: {
+              PATH: "",
+              HOME: home,
+              USERPROFILE: home,
+              TMPDIR: root,
+              TMP: root,
+              TEMP: root,
+              SystemRoot: process.env.SystemRoot,
+              COREPACK_ENABLE_NETWORK: "0",
+              NODE_DISABLE_COMPILE_CACHE: "1",
+              CI: "1",
+            },
           },
-        },
-      );
-      expect(result.status, result.stdout + result.stderr).toBe(0);
-      expect(result.signal).toBeNull();
-      const native = JSON.parse(readFileSync(report, "utf8"));
-      expect(native.success).toBe(true);
-      expect(
-        native.testResults.flatMap(
-          (file: { assertionResults: { title: string; status: string }[] }) =>
-            file.assertionResults.map(({ title, status }) => [title, status]),
-        ),
-      ).toEqual([["selected native case", "passed"]]);
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
-  });
+        );
+        expect(result.status, result.stdout + result.stderr).toBe(0);
+        expect(result.signal).toBeNull();
+        const native = JSON.parse(readFileSync(report, "utf8"));
+        expect(native.success).toBe(true);
+        expect(
+          native.testResults.flatMap(
+            (file: { assertionResults: { title: string; status: string }[] }) =>
+              file.assertionResults.map(({ title, status }) => [title, status]),
+          ),
+        ).toEqual([["selected native case", "passed"]]);
+      } finally {
+        rmSync(root, { force: true, recursive: true });
+      }
+    },
+  );
 
   it("relativizes extension Vitest path args to the scoped extensions dir", () => {
     expect(
