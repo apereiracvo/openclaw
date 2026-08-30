@@ -96,6 +96,13 @@ type WorkerPlacementFailedReclaimBarrier = (
 ) => Promise<WorkerReclaimPlacement>;
 
 export type WorkerPlacementReclaimBarriers = {
+  runReclaimPreparation: (
+    params: WorkerPlacementReclaimRequest & {
+      authorize?: WorkerPlacementAuthorization;
+      beforeDrain?: WorkerPlacementAuthorization;
+      run: (authorize?: WorkerPlacementAuthorization) => Promise<WorkerReclaimPlacement>;
+    },
+  ) => Promise<WorkerReclaimPlacement>;
   runReclaimBarrier: WorkerPlacementReclaimBarrier;
   runFailedReclaimBarrier: WorkerPlacementFailedReclaimBarrier;
 };
@@ -629,18 +636,22 @@ export function createWorkerPlacementDispatchService(options: WorkerPlacementDis
       },
     });
 
-  const reclaim = async (
+  const reclaimCurrent = async (
     request: WorkerPlacementReclaimRequest,
     authorize?: WorkerPlacementAuthorization,
     beforeDrain?: WorkerPlacementAuthorization,
+    initial?: WorkerDispatchPlacement,
   ): Promise<WorkerReclaimPlacement> => {
+    authorize?.();
     beforeDrain?.();
     const current = placements.get(request.sessionId);
     if (current?.state === "reclaimed") {
       return current;
     }
     try {
-      const owned = placements.get(request.sessionId);
+      // The preparation/placement wait can span another completed failed cleanup.
+      // Its old generation classifies an idempotent result, never authorizes new teardown.
+      const owned = current?.state === "local" && initial?.state === "failed" ? initial : current;
       if (owned?.state === "failed") {
         return await options.runFailedReclaimBarrier({
           ...request,
@@ -695,6 +706,24 @@ export function createWorkerPlacementDispatchService(options: WorkerPlacementDis
       }
       throw error;
     }
+  };
+
+  const reclaim = async (
+    request: WorkerPlacementReclaimRequest,
+    authorize?: WorkerPlacementAuthorization,
+    beforeDrain?: WorkerPlacementAuthorization,
+    serialize: (
+      run: () => Promise<WorkerReclaimPlacement>,
+    ) => Promise<WorkerReclaimPlacement> = async (run) => await run(),
+  ): Promise<WorkerReclaimPlacement> => {
+    const initial = placements.get(request.sessionId);
+    return await options.runReclaimPreparation({
+      ...request,
+      authorize,
+      beforeDrain,
+      run: (reauthorize) =>
+        serialize(() => reclaimCurrent(request, reauthorize, beforeDrain, initial)),
+    });
   };
 
   const abandonment = createWorkerPlacementMoveAbandonment(options);
