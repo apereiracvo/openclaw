@@ -4,7 +4,7 @@ import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { crabboxCommandError } from "./crabbox-worker-command-error.js";
 import { runCrabboxCommand, type CrabboxCommandRunner } from "./crabbox-worker-command.js";
 import {
-  buildCrabboxWarmupArgs,
+  buildCrabboxAllocationArgs,
   nonEmptyString,
   type parseCrabboxProfile,
   type resolveCrabboxProvisionProfile,
@@ -376,14 +376,7 @@ export function createCrabboxWarmImageManager(dependencies: {
             "checkpoint",
             "fork",
             record.checkpointId,
-            "--provider",
-            context.provider,
-            "--lease-id",
-            context.id,
-            "--class",
-            profile.class,
-            "--slug",
-            context.slug,
+            ...buildCrabboxAllocationArgs(profile, context.id, context.slug),
             "--json",
           ],
           context.timeoutMs(),
@@ -574,7 +567,7 @@ export function createCrabboxWarmImageManager(dependencies: {
       // provisioning surfaces the conflict and provider cleanup stops the partial lease.
       const result = await runCrabboxCommand({
         action: "warmup",
-        args: buildCrabboxWarmupArgs(context.profile, context.id, context.slug),
+        args: ["warmup", ...buildCrabboxAllocationArgs(context.profile, context.id, context.slug)],
         binary: context.binary,
         runCommand: dependencies.runCommand,
         timeoutMs: context.timeoutMs(),

@@ -124,7 +124,9 @@ Scrubbing has a three-minute timeout. Checkpoint creation has a separate three-m
 
 Image reuse is keyed by the backend, setup command, sorted `setupEnv` variable names (not their values), desktop setting, and exact effective machine class. A placement override does not reuse another class's image, and only successful node enrollment records the class used for later capture, including after a Gateway restart.
 
-A warm start provisions a fresh lease with fresh node enrollment. It reuses machine-level caches, not a per-session snapshot or a suspended process.
+A warm start provisions a fresh lease with fresh node enrollment. Cold allocations and snapshot forks use the same configured lease lifetime, idle timeout, desktop setting, and public networking without Tailscale. A warm start reuses machine-level caches, not a per-session snapshot or a suspended process.
+
+Workspace synchronization tries an eligible Git seed or origin checkout before downloading a Git pack from the Gateway. The Gateway builds that pack only when the worker requests it, so a successful seed or origin sync avoids packing the repository locally. Fallback downloads share one pack of the transfer's original base commit; later local commits cannot change that base.
 
 #### Recover a paused capture
 

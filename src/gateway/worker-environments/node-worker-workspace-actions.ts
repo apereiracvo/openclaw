@@ -167,16 +167,11 @@ export function createNodeWorkerWorkspaceActions(params: {
         if (accepted.manifestRef === expectedRemoteRef) {
           return;
         }
-        const baseSnapshot = params.workspaceTransfer.getSnapshot(
-          params.environmentId,
-          request.baseManifestRef,
-        );
         const token = params.workspaceTransfer.publishSnapshot(params.environmentId, {
           manifest: accepted.manifest,
           manifestRef: accepted.manifestRef,
           rawManifest: serializeWorkerWorkspaceManifest(accepted.manifest),
           root: await fsp.realpath(request.localPath),
-          ...(baseSnapshot?.packPath ? { packPath: baseSnapshot.packPath } : {}),
         });
         try {
           const published = await exec({
