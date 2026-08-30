@@ -19,6 +19,7 @@ import {
   stopBrowserControlService,
 } from "../../control-service.js";
 import { buildBrowserExtensionPairing } from "../extension-pairing.js";
+import { runExtensionRelayDaemon } from "../relay-daemon.js";
 import { getFreePort } from "../test-port.js";
 import { createRelayProof, randomRelayNonce, relayKeyIdFromHex } from "./auth-v2-crypto.js";
 import { BROWSER_RELAY_EXTENSION_SUBPROTOCOL } from "./auth-v2.js";
@@ -80,9 +81,13 @@ describe.sequential("local Gateway extension relay wakeup", () => {
     });
   });
 
-  it.each([false, true])(
-    "authenticates the extension while a browser request is already waiting: %s",
-    async (browserRequestAlreadyWaiting) => {
+  it.each([
+    { browserRequestAlreadyWaiting: false, standaloneFirst: false },
+    { browserRequestAlreadyWaiting: true, standaloneFirst: false },
+    { browserRequestAlreadyWaiting: true, standaloneFirst: true },
+  ])(
+    "authenticates Gateway ingress: waiting=$browserRequestAlreadyWaiting standalone=$standaloneFirst",
+    async ({ browserRequestAlreadyWaiting, standaloneFirst }) => {
       const stateDir = await fs.realpath(
         await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-gateway-relay-wakeup-")),
       );
@@ -127,6 +132,7 @@ describe.sequential("local Gateway extension relay wakeup", () => {
               void handleGatewayExtensionUpgrade(req, socket, head);
             });
             let extension: WebSocket | undefined;
+            let daemon: Awaited<ReturnType<typeof runExtensionRelayDaemon>> | undefined;
             const requestController = new AbortController();
             let browserAvailable: Promise<void> | undefined;
             try {
@@ -134,6 +140,9 @@ describe.sequential("local Gateway extension relay wakeup", () => {
                 gatewayServer.listen(gatewayPort, "127.0.0.1", resolve);
               });
               expect(getBrowserControlState()).toBeNull();
+              if (standaloneFirst) {
+                daemon = await runExtensionRelayDaemon({ port: relayPort });
+              }
 
               const pairing = await buildBrowserExtensionPairing({
                 cfg: config,
@@ -192,17 +201,37 @@ describe.sequential("local Gateway extension relay wakeup", () => {
               );
 
               await expect
-                .poll(
-                  () =>
-                    getBrowserControlState()?.extensionRelays?.get("chrome")?.bridge
-                      .extensionConnected,
-                )
+                .poll(async () => {
+                  const currentRelay = getBrowserControlState()?.extensionRelays?.get("chrome");
+                  return currentRelay?.ownership === "borrowed"
+                    ? (await currentRelay.client.status()).ready
+                    : currentRelay?.bridge.extensionConnected;
+                })
                 .toBe(true);
               await expect(browserAvailable ?? Promise.resolve()).resolves.toBeUndefined();
               const relay = getBrowserControlState()?.extensionRelays?.get("chrome");
               expect(relay?.port).toBe(pairing.relayPort);
               if (!relay) {
                 throw new Error("extension relay did not start");
+              }
+              if (standaloneFirst) {
+                expect(relay.ownership).toBe("borrowed");
+                if (relay.ownership !== "borrowed") {
+                  throw new Error("Expected borrowed relay");
+                }
+                await expect(relay.client.status()).resolves.toMatchObject({
+                  ready: true,
+                  identity: { extensionVersion: "2", browserVersion: "Chrome/test" },
+                });
+                const profile = createBrowserControlContext().forProfile("chrome").profile;
+                expect(new URL(profile.cdpUrl).username).toBe("");
+                await stopBrowserControlService();
+                const contender = await runExtensionRelayDaemon({ port: relayPort });
+                await expect(contender.done).resolves.toBe("port-in-use");
+                return;
+              }
+              if (relay.ownership !== "owned") {
+                throw new Error("Expected owned relay");
               }
 
               for (let request = 0; request < 3; request += 1) {
@@ -230,6 +259,8 @@ describe.sequential("local Gateway extension relay wakeup", () => {
               await browserAvailable?.catch(() => {});
               extension?.terminate();
               await stopBrowserControlService();
+              daemon?.stop();
+              await daemon?.done;
               await closeServer(gatewayServer);
             }
           },

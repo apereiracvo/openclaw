@@ -1,5 +1,7 @@
+import { getRuntimeConfig } from "../config/config.js";
 import { extractErrorCode } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { resolveBrowserConfig, resolveProfile } from "./config.js";
 import { readExtensionRelayToken } from "./extension-relay/relay-auth.js";
 import {
   type ExtensionRelayHandle,
@@ -49,8 +51,10 @@ export async function runExtensionRelayDaemon(params: {
   const idleExitMs = params.idleExitMs ?? RELAY_DAEMON_IDLE_EXIT_MS;
   const pollMs = params.pollMs ?? IDLE_POLL_MS;
   let resolveDone: (reason: RelayDaemonExitReason) => void = () => {};
-  const done = new Promise<RelayDaemonExitReason>((resolve) => {
+  let rejectDone: (error: unknown) => void = () => {};
+  const done = new Promise<RelayDaemonExitReason>((resolve, reject) => {
     resolveDone = resolve;
+    rejectDone = reject;
   });
 
   const token = readToken();
@@ -62,7 +66,20 @@ export async function runExtensionRelayDaemon(params: {
 
   let handle: ExtensionRelayHandle;
   try {
-    handle = await startExtensionRelayServer({ port: params.port, token, allowLegacyAuth });
+    const config = getRuntimeConfig();
+    const resolved = resolveBrowserConfig(config.browser, config);
+    const profiles = Object.keys(resolved.profiles).filter((name) => {
+      const profile = resolveProfile(resolved, name);
+      return profile?.driver === "extension" && profile.cdpPort === params.port;
+    });
+    // The listener owns this fact. Ambiguous/unconfigured ports never advertise owner access.
+    const profileName = profiles.length === 1 ? profiles[0] : undefined;
+    handle = await startExtensionRelayServer({
+      port: params.port,
+      token,
+      allowLegacyAuth,
+      profileName,
+    });
   } catch (error) {
     if (extractErrorCode(error) === "EADDRINUSE") {
       log.info(`relay port ${params.port} is already served; standalone daemon not needed`);
@@ -81,7 +98,7 @@ export async function runExtensionRelayDaemon(params: {
     }
     stopped = true;
     clearInterval(idleTimer);
-    void handle.close().finally(() => resolveDone(reason));
+    void handle.close().then(() => resolveDone(reason), rejectDone);
   };
   const idleTimer = setInterval(() => {
     if (handle.bridge.extensionConnected || handle.bridge.cdpClientCount > 0) {

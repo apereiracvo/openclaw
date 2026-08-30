@@ -689,8 +689,10 @@ describe("browser control server", () => {
       ["openclaw", { bridge: { captureOperationTarget: () => () => "replacement-target" } }],
     ]) as unknown as NonNullable<typeof runtime.extensionRelays>;
     requirePwMock("navigateViaPlaywright").mockImplementationOnce(async (options) => {
-      const targetId = (
-        options as { resolveOperationTarget?: () => string | undefined }
+      const targetId = await (
+        options as {
+          resolveOperationTarget?: () => string | undefined | Promise<string | undefined>;
+        }
       ).resolveOperationTarget?.();
       if (!targetId) {
         throw new Error("captured relay target was not forwarded to navigation");

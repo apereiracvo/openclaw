@@ -14,6 +14,8 @@ import { ACT_MAX_VIEWPORT_DIMENSION, resolveBrowserNavigationTimeoutMs } from ".
 import { type AriaSnapshotNode, formatAriaSnapshot, type RawAXNode } from "./cdp.js";
 import type { BrowserDownloadResult } from "./download-types.js";
 import { BrowserTabNotFoundError } from "./errors.js";
+import type { RelayOperationReference } from "./extension-relay/owner-client.js";
+import { closeRelayOperationConnection } from "./extension-relay/owner-playwright.js";
 import {
   assertBrowserNavigationAllowed,
   assertBrowserNavigationResultAllowed,
@@ -474,7 +476,8 @@ export async function snapshotRoleViaPlaywright(opts: {
 export async function navigateViaPlaywright(opts: {
   cdpUrl: string;
   targetId?: string;
-  resolveOperationTarget?: () => string | undefined;
+  resolveOperationTarget?: () => string | undefined | Promise<string | undefined>;
+  relayReference?: RelayOperationReference;
   url: string;
   timeoutMs?: number;
   ssrfPolicy?: SsrFPolicy;
@@ -519,8 +522,8 @@ export async function navigateViaPlaywright(opts: {
       targetId: currentTargetId,
       ...(opts.resolveOperationTarget
         ? {
-            assertPageCurrent: () => {
-              if (opts.resolveOperationTarget?.() !== currentTargetId) {
+            assertPageCurrent: async () => {
+              if ((await opts.resolveOperationTarget?.()) !== currentTargetId) {
                 throw new BrowserTabNotFoundError({ input: currentTargetId });
               }
             },
@@ -581,21 +584,25 @@ export async function navigateViaPlaywright(opts: {
     }
     // Extension relays can briefly drop CDP during renderer swaps/navigation.
     // Force a clean reconnect, then retry once on the refreshed page handle.
-    await forceDisconnectPlaywrightForTarget({
-      cdpUrl: opts.cdpUrl,
-      targetId: opts.targetId,
-      ssrfPolicy: opts.ssrfPolicy,
-      reason: "retry navigate after detached frame",
-    }).catch(() => {});
+    if (opts.relayReference) {
+      await closeRelayOperationConnection(opts.relayReference);
+    } else {
+      await forceDisconnectPlaywrightForTarget({
+        cdpUrl: opts.cdpUrl,
+        targetId: opts.targetId,
+        ssrfPolicy: opts.ssrfPolicy,
+        reason: "retry navigate after detached frame",
+      }).catch(() => {});
+    }
     if (opts.resolveOperationTarget) {
       // Auto-attach completes during reconnect; only then can the same tab owner prove its new ID.
-      await connectBrowser(opts.cdpUrl, opts.ssrfPolicy);
-      const replacementTargetId = opts.resolveOperationTarget();
+      await connectBrowser(opts.cdpUrl, opts.ssrfPolicy, opts.relayReference);
+      const replacementTargetId = await opts.resolveOperationTarget();
       if (!replacementTargetId) {
         throw new BrowserTabNotFoundError({ input: currentTargetId });
       }
       page = await getPageForTargetId({ ...opts, targetId: replacementTargetId });
-      if (opts.resolveOperationTarget() !== replacementTargetId) {
+      if ((await opts.resolveOperationTarget()) !== replacementTargetId) {
         throw new BrowserTabNotFoundError({ input: currentTargetId });
       }
       currentTargetId = replacementTargetId;

@@ -45,8 +45,11 @@ development IDs. After pre-registration succeeds, add
 
 The extension pairs on its first native call; you do not need to open its
 popup, reload it, or restart Chrome during a normal first-time setup. The
-installer then reads the profile's `Secure Preferences` and verifies the exact
-Store ID independently from any extension path.
+installer then inspects the profile's `Preferences` and `Secure Preferences`
+backing files and verifies the exact Store ID independently from any extension
+path. Chromium selects the backing file by settings-enforcement policy; Linux
+normally uses `Preferences`. Both files receive the same ownership, path, file
+type, permission, and size checks.
 
 For extension development, the command also copies the bundled extension to a
 stable OpenClaw-owned directory. Use that unpacked copy only as a development
@@ -155,6 +158,18 @@ the Gateway relay's legacy default. Only an explicit
 `browser.extensionRelay.allowLegacyAuth=true` enables legacy authentication;
 an unset value, `false`, or a config-read failure never enables it. Prefer v2
 clients so the persistent key is not disclosed to a process occupying the port.
+
+Gateway browser control can join a standalone relay that already owns the
+configured profile and port. It authenticates that exact owner with v2 and uses
+its existing bridge; it does not start a second listener. Stopping Gateway
+releases only Gateway's connections, leaving the daemon, its direct extension
+connection, and other CDP clients running. Gateway-first automatic setup through
+`/browser/extension` remains supported.
+
+Both processes need an OpenClaw build that supports this owner-access protocol. A
+mismatched profile, port, key, or stricter authentication policy produces an
+error; Gateway never takes over the listener or falls back to legacy credentials.
+The daemon's stricter v2-only default is compatible with Gateway's default.
 
 ### Choose tab access
 

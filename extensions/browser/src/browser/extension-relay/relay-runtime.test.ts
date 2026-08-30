@@ -246,7 +246,7 @@ describe("relay logical Runtime subscriptions", () => {
       await first.request("Runtime.enable", root);
       await second.request("Runtime.enable", secondRoot);
       if (operation === "socket close") {
-        first.handlers.onClose();
+        await first.handlers.onClose();
       } else if (operation === "Runtime.disable") {
         await first.request(operation, root);
       } else {
@@ -420,7 +420,7 @@ describe("relay logical Runtime subscriptions", () => {
     );
     const attach = extension.frames().find((frame) => frame.type === "attach");
     expect(attach).toBeDefined();
-    client.onClose();
+    const closing = client.onClose();
     ext.onMessage(
       JSON.stringify({ type: "result", seq: attach!.seq, result: { targetId: "target-1" } }),
     );
@@ -431,6 +431,9 @@ describe("relay logical Runtime subscriptions", () => {
     await flush();
     expect(socket.frames()).toEqual([]);
     expect(extension.frames().filter((frame) => frame.type === "detach")).toHaveLength(1);
+    const detach = extension.frames().find((frame) => frame.type === "detach");
+    ext.onMessage(JSON.stringify({ type: "result", seq: detach?.seq, result: {} }));
+    await closing;
   });
 
   it("rejects unannounced and foreign root, alias, browser and child sessions without forwarding", async () => {
@@ -475,11 +478,12 @@ describe("relay logical Runtime subscriptions", () => {
     closed.send("Runtime.enable", root);
     const pending = live.send("Runtime.enable", liveRoot);
     await flush();
-    closed.handlers.onClose();
+    const closing = closed.handlers.onClose();
     await live.request("Runtime.disable", liveRoot);
     const before = closed.socket.frames().length;
     closed.send("Runtime.evaluate", root);
     f.release();
+    await closing;
     await flush();
     expect(closed.socket.frames()).toHaveLength(before);
     expect(f.commands("Runtime.evaluate")).toEqual([]);
@@ -786,7 +790,7 @@ describe("relay logical Runtime subscriptions", () => {
       await observer.request("Runtime.removeBinding", observerRoot, { name });
       expect(f.commands("Runtime.removeBinding")).toHaveLength(0);
       if (operation === "socket close") {
-        first.handlers.onClose();
+        await first.handlers.onClose();
         await flush();
       } else if (operation === "Target.detachFromTarget") {
         await first.request(operation, undefined, { sessionId: firstRoot });
@@ -829,8 +833,9 @@ describe("relay logical Runtime subscriptions", () => {
       f.hold("Runtime.addBinding");
       const pending = first.send("Runtime.addBinding", firstRoot, { name });
       await flush();
-      first.handlers.onClose();
+      const closing = first.handlers.onClose();
       f.release();
+      await closing;
       await flush();
       expect(first.socket.frames().find((frame) => frame.id === pending)).toBeUndefined();
       expect(f.commands("Runtime.removeBinding")).toHaveLength(sameName ? 0 : 1);

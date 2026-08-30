@@ -377,25 +377,34 @@ export function registerBrowserAgentSnapshotRoutes(
         if (!pw) {
           return;
         }
-        const resolveRelayTarget = captureBrowserOperationTarget({
+        const resolveRelayTarget = await captureBrowserOperationTarget({
           ctx,
           profileName: profileCtx.profile.name,
           targetId: tab.targetId,
         });
-        const result = await pw.navigateViaPlaywright({
-          cdpUrl,
-          targetId: tab.targetId,
-          url,
-          timeoutMs,
-          ...(resolveRelayTarget ? { resolveOperationTarget: resolveRelayTarget } : {}),
-          ...browserNavigationPolicyForProfile(ctx, profileCtx),
-        });
-        const currentTargetId = resolveOperationTargetOutcome({
-          actedOnTargetId: tab.targetId,
-          operationTargetId: result.targetId,
-          resolveRelayTarget,
-        });
-        res.json({ ok: true, ...result, targetId: currentTargetId });
+        try {
+          const result = await pw.navigateViaPlaywright({
+            cdpUrl,
+            targetId: tab.targetId,
+            url,
+            timeoutMs,
+            ...(resolveRelayTarget
+              ? {
+                  resolveOperationTarget: resolveRelayTarget,
+                  relayReference: resolveRelayTarget.reference,
+                }
+              : {}),
+            ...browserNavigationPolicyForProfile(ctx, profileCtx),
+          });
+          const currentTargetId = await resolveOperationTargetOutcome({
+            actedOnTargetId: tab.targetId,
+            operationTargetId: result.targetId,
+            resolveRelayTarget,
+          });
+          res.json({ ok: true, ...result, targetId: currentTargetId });
+        } finally {
+          await resolveRelayTarget?.release();
+        }
       },
     });
   });

@@ -55,6 +55,33 @@ describe("native extension bootstrap", () => {
     expect(harness.storageValues).not.toHaveProperty("relayUrl");
   });
 
+  it("recovers after a repaired manifest only when automatic setup is explicitly enabled again", async () => {
+    let repaired = false;
+    const harness = await loadBackground({
+      storedConfig: {},
+      nativeMessage: async (request) =>
+        repaired ? nativeSuccess(request) : { v: 1, ok: false, code: "manifest_invalid" },
+    });
+    await vi.waitFor(() =>
+      expect(harness.storageValues).toMatchObject({
+        nativeBootstrapState: "manual_required",
+        nativeBootstrapFailureCode: "manifest_invalid",
+      }),
+    );
+    repaired = true;
+    harness.alarmListener({ name: "openclaw-relay-watchdog" });
+    await sendRuntimeMessage(harness, { type: "getStatus" });
+    expect(harness.sendNativeMessage).toHaveBeenCalledOnce();
+    expect(harness.relaySockets).toHaveLength(0);
+    await expect(
+      sendRuntimeMessage(harness, { type: "setNativeBootstrapEnabled", enabled: true }),
+    ).resolves.toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(harness.relaySockets).toHaveLength(1));
+    expect(harness.storageValues.nativeBootstrapState).toBe("ready");
+    expect(harness.storageValues).not.toHaveProperty("nativeBootstrapFailureCode");
+    expect(harness.sendNativeMessage).toHaveBeenCalledTimes(2);
+  });
+
   it("coalesces startup, watchdog, and popup attempts", async () => {
     let resolveNative = (_value: unknown) => {};
     const pending = new Promise((resolve) => {
