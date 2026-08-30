@@ -331,7 +331,8 @@ export function readPluginSdkSurfaceBudgets(env: NodeJS.ProcessEnv = process.env
       // +2: strict session-agent resolution aliases preserve shipped Plugin SDK behavior.
       // +1: manifest-owned plugin capability secret availability guard.
       // +1: canonical diagnostic flag checker through its focused subpath.
-      4355,
+      // +1: built-in tool media provenance for the bundled Codex harness.
+      4356,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
@@ -438,7 +439,8 @@ export function readPluginSdkSurfaceBudgets(env: NodeJS.ProcessEnv = process.env
       // +2: strict session-agent resolution aliases preserve shipped Plugin SDK behavior.
       // +1: manifest-owned plugin capability secret availability guard.
       // +1: canonical diagnostic flag checker through its focused subpath.
-      2592,
+      // +1: built-in tool media provenance for the bundled Codex harness.
+      2593,
       env,
     ),
     publicDeprecatedExports: readPluginSdkSurfaceBudgetEnv(
