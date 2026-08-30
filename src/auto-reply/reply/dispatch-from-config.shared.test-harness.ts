@@ -7,6 +7,7 @@ import type { SessionWorkerPlacementContext } from "../../gateway/worker-environ
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
 import type {
   PluginHookBeforeDispatchResult,
+  PluginHookReplyDispatchContext,
   PluginHookReplyDispatchEvent,
   PluginHookReplyDispatchResult,
 } from "../../plugins/hook-types.js";
@@ -107,7 +108,7 @@ const hookMocks = vi.hoisted(() => ({
     runReplyDispatch: vi.fn<
       (
         eventValue: PluginHookReplyDispatchEvent,
-        _ctx: unknown,
+        _ctx: PluginHookReplyDispatchContext,
       ) => Promise<PluginHookReplyDispatchResult | undefined>
     >(async () => undefined),
     runReplyPayloadSending: vi.fn(async () => undefined),
