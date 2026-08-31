@@ -256,7 +256,7 @@ export async function runManagerTurn(params: {
   // (after the ready-meta check, so a pre-loop throw cannot leak it) and clear on every
   // runTurn exit, including unexpected retry/cleanup failures before terminal task writes.
   if (taskContext) {
-    markAcpTurnActive(params);
+    markAcpTurnActive(params, input.requestId);
     acpTurnMarkedActive = true;
   }
   const releaseTerminalTurnState = (activeTurn?: ActiveTurnState) => {
