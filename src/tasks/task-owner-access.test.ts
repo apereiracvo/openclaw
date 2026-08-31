@@ -6,6 +6,7 @@ import {
   findLatestTaskForRelatedSessionKeyForOwner,
   findTaskByRunIdForOwner,
   getTaskByIdForOwner,
+  isAcpChildSessionOwnedBy,
   resolveTaskForLookupTokenForOwner,
 } from "./task-owner-access.js";
 import { createTaskRecord as createTaskRecordOrNull } from "./task-registry.js";
@@ -102,6 +103,46 @@ describe("task owner access", () => {
           callerOwnerKey: "agent:main:subagent:other-parent",
         }),
       ).toBeUndefined();
+    });
+  });
+
+  it("classifies only an exact owner-scoped ACP child task", async () => {
+    await withTaskRegistryTempDir(() => {
+      createTaskRecord({
+        runtime: "acp",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:acp-child",
+        task: "ACP child",
+        status: "succeeded",
+      });
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:native-child",
+        task: "Native child",
+        status: "succeeded",
+      });
+
+      expect(
+        isAcpChildSessionOwnedBy({
+          childSessionKey: "agent:main:subagent:acp-child",
+          callerOwnerKey: "agent:main:main",
+        }),
+      ).toBe(true);
+      expect(
+        isAcpChildSessionOwnedBy({
+          childSessionKey: "agent:main:subagent:native-child",
+          callerOwnerKey: "agent:main:main",
+        }),
+      ).toBe(false);
+      expect(
+        isAcpChildSessionOwnedBy({
+          childSessionKey: "agent:main:subagent:acp-child",
+          callerOwnerKey: "agent:main:subagent:unrelated",
+        }),
+      ).toBe(false);
     });
   });
 
