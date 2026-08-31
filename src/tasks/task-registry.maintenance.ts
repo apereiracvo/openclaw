@@ -825,6 +825,14 @@ export async function runTaskRegistryMaintenance(): Promise<TaskRegistryMaintena
     listAcpSessionEntries,
     readAcpSessionEntry,
     hasActiveTaskForChildSessionKey,
+    hasActiveAcpTurn: (sessionKey, agentId) =>
+      isAcpTurnActive(
+        resolveAcpSessionTarget({
+          cfg: getRuntimeConfig(),
+          sessionKey,
+          agentId,
+        }),
+      ),
     listSessionBindingsBySession: (sessionKey) =>
       getSessionBindingService().listBySession(sessionKey),
     unbindSessionBindings: (input) => getSessionBindingService().unbind(input),

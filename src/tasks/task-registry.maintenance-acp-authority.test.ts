@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { listAcpSessionEntries, readAcpSessionEntry } from "../acp/runtime/session-meta.js";
+import type { SessionAcpMeta } from "../config/sessions/types.js";
 import { getSessionBindingService } from "../infra/outbound/session-binding-service.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createInMemoryTaskRegistryStore } from "../test-utils/task-registry-store.js";
-import { loadTaskAcpSessionCloser, type CloseAcpSession } from "./task-registry-acp-cleanup.js";
+import {
+  loadTaskAcpSessionCloser,
+  type CloseAcpSession,
+} from "./task-registry-acp-cleanup.js";
 import { captureTaskDeliveryWork } from "./task-registry-delivery.test-support.js";
 import {
   configureTaskRegistryMaintenance,
@@ -32,6 +36,20 @@ function createCleanupEffects() {
   vi.mocked(listAcpSessionEntries).mockReset().mockResolvedValue([]);
   vi.mocked(readAcpSessionEntry).mockReset().mockReturnValue(null);
   return { close, unbind };
+}
+
+function durableOneShotAcpOverrides(): Partial<SessionAcpMeta> {
+  return {
+    identity: {
+      state: "resolved",
+      source: "status",
+      acpxRecordId: "record-1",
+      acpxSessionId: "session-1",
+      sessionResumeSupported: true,
+      sessionResumeReady: true,
+      lastUpdatedAt: Date.now(),
+    },
+  };
 }
 
 async function withAcpCleanupState(
@@ -146,6 +164,118 @@ describe("task maintenance ACP cleanup authority", () => {
         sessionKey: entry.sessionKey,
         reason: "terminal-task-cleanup",
       });
+      expect(unbind).not.toHaveBeenCalled();
+    });
+  });
+
+  it("retains verified terminal parent-owned one-shot sessions during maintenance", async () => {
+    await withAcpCleanupState(async ({ close, unbind }) => {
+      const entry = createAcpSessionStoreEntry({
+        sessionKey: "agent:main:acp:terminal-verified",
+        parentSessionKey,
+        mode: "oneshot",
+        acpOverrides: { state: "running", ...durableOneShotAcpOverrides() },
+      });
+      vi.mocked(readAcpSessionEntry).mockReturnValue(entry);
+      using deliveries = captureTaskDeliveryWork();
+      createTaskFixture("acp", {
+        ownerKey: parentSessionKey,
+        requesterSessionKey: parentSessionKey,
+        childSessionKey: entry.sessionKey,
+        runId: "terminal-acp-verified-retained",
+        task: "Completed parent-owned ACP task",
+        status: "succeeded",
+        cleanupAfter: Date.now() + 86_400_000,
+        notifyPolicy: "silent",
+      });
+      await deliveries.settle();
+
+      await runTaskRegistryMaintenance();
+
+      expect(close).not.toHaveBeenCalled();
+      expect(unbind).not.toHaveBeenCalled();
+      expect(entry.acp?.identity?.acpxSessionId).toBe("session-1");
+      expect(entry.acp?.identity?.sessionResumeReady).toBe(true);
+    });
+  });
+
+  it("retains only verified orphaned parent-owned one-shot sessions", async () => {
+    await withAcpCleanupState(async ({ close, unbind }) => {
+      const negative = createAcpSessionStoreEntry({
+        sessionKey: "agent:main:acp:orphan-negative",
+        parentSessionKey,
+        mode: "oneshot",
+      });
+      const retained = createAcpSessionStoreEntry({
+        sessionKey: "agent:main:acp:orphan-verified",
+        parentSessionKey,
+        mode: "oneshot",
+        acpOverrides: { state: "running", ...durableOneShotAcpOverrides() },
+      });
+      const unrelated = createAcpSessionStoreEntry({
+        sessionKey: "agent:main:acp:orphan-unrelated",
+        parentSessionKey: "",
+        mode: "oneshot",
+      });
+      vi.mocked(listAcpSessionEntries).mockResolvedValue([negative, retained, unrelated]);
+      vi.mocked(readAcpSessionEntry).mockReturnValue(retained);
+
+      await runTaskRegistryMaintenance();
+
+      expect(close.mock.calls.map(([input]) => input.sessionKey)).toEqual([negative.sessionKey]);
+      expect(unbind.mock.calls.map(([input]) => input.targetSessionKey)).toEqual([
+        negative.sessionKey,
+      ]);
+    });
+  });
+
+  it("skips unbinding a terminal one-shot whose resume metadata is verified before the serialized close", async () => {
+    await withAcpCleanupState(async ({ unbind }) => {
+      const unverified = createAcpSessionStoreEntry({
+        sessionKey: "agent:main:acp:terminal-becomes-verified",
+        parentSessionKey,
+        mode: "oneshot",
+      });
+      const verified = createAcpSessionStoreEntry({
+        sessionKey: unverified.sessionKey,
+        parentSessionKey,
+        mode: "oneshot",
+        acpOverrides: { state: "running", ...durableOneShotAcpOverrides() },
+      });
+      let reads = 0;
+      vi.mocked(readAcpSessionEntry).mockImplementation(() => {
+        reads += 1;
+        return reads === 1 ? unverified : verified;
+      });
+      const close = vi.fn<CloseAcpSession>().mockImplementation(async (_params, revalidate) => {
+        await Promise.resolve();
+        revalidate?.();
+      });
+      vi.mocked(loadTaskAcpSessionCloser).mockReset().mockResolvedValue(close);
+      using deliveries = captureTaskDeliveryWork();
+      createTaskFixture("acp", {
+        ownerKey: parentSessionKey,
+        requesterSessionKey: parentSessionKey,
+        childSessionKey: unverified.sessionKey,
+        runId: "terminal-acp-verified-before-close",
+        task: "Completed parent-owned ACP task",
+        status: "succeeded",
+        cleanupAfter: Date.now() + 86_400_000,
+        notifyPolicy: "silent",
+      });
+      await deliveries.settle();
+
+      await runTaskRegistryMaintenance();
+
+      expect(close).toHaveBeenCalledExactlyOnceWith(
+        {
+          cfg: unverified.cfg,
+          agentId: unverified.agentId,
+          sessionKey: unverified.sessionKey,
+          reason: "terminal-task-cleanup",
+        },
+        expect.any(Function),
+      );
       expect(unbind).not.toHaveBeenCalled();
     });
   });

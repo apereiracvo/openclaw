@@ -6,6 +6,7 @@ import type {
   AcpSessionStoreEntry,
 } from "../acp/runtime/session-meta.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveDurableAcpOneShotResume } from "../acp/session-resume.js";
 import type { getSessionBindingService } from "../infra/outbound/session-binding-service.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import type { hasActiveTaskForChildSessionKey } from "./task-registry-query.js";
@@ -13,12 +14,15 @@ import type { TaskRecord } from "./task-registry.types.js";
 
 const log = createSubsystemLogger("tasks/task-registry-maintenance");
 
-export type CloseAcpSession = (params: {
-  cfg: OpenClawConfig;
-  sessionKey: string;
-  agentId?: string;
-  reason: string;
-}) => Promise<void>;
+export type CloseAcpSession = (
+  params: {
+    cfg: OpenClawConfig;
+    sessionKey: string;
+    agentId?: string;
+    reason: string;
+  },
+  revalidate?: () => boolean,
+) => Promise<void>;
 
 export type TaskRegistryAcpMaintenanceRuntime = {
   listAcpSessionEntries: typeof listAcpSessionEntries;
@@ -27,21 +31,25 @@ export type TaskRegistryAcpMaintenanceRuntime = {
   listSessionBindingsBySession?: ReturnType<typeof getSessionBindingService>["listBySession"];
   unbindSessionBindings?: ReturnType<typeof getSessionBindingService>["unbind"];
   hasActiveTaskForChildSessionKey: typeof hasActiveTaskForChildSessionKey;
+  hasActiveAcpTurn?: (sessionKey: string, agentId?: string) => boolean;
 };
 
 export async function loadTaskAcpSessionCloser(): Promise<CloseAcpSession> {
   const { getAcpSessionManager } = await import("../acp/control-plane/manager.js");
-  return async ({ cfg, sessionKey, agentId, reason }) => {
-    await getAcpSessionManager().closeSession({
-      cfg,
-      sessionKey,
-      agentId,
-      reason,
-      discardPersistentState: true,
-      clearMeta: true,
-      allowBackendUnavailable: true,
-      requireAcpSession: false,
-    });
+  return async ({ cfg, sessionKey, agentId, reason }, revalidate) => {
+    await getAcpSessionManager().closeSession(
+      {
+        cfg,
+        sessionKey,
+        agentId,
+        reason,
+        discardPersistentState: true,
+        clearMeta: true,
+        allowBackendUnavailable: true,
+        requireAcpSession: false,
+      },
+      revalidate,
+    );
   };
 }
 
@@ -99,6 +107,7 @@ function shouldCloseTerminalAcpSession(
   const sessionKey = getNormalizedTaskChildSessionKey(task);
   if (
     !sessionKey ||
+    runtime.hasActiveAcpTurn?.(sessionKey, task.agentId) ||
     runtime.hasActiveTaskForChildSessionKey({
       sessionKey,
       agentId: task.agentId,
@@ -119,7 +128,10 @@ function shouldCloseTerminalAcpSession(
     return false;
   }
   if (acpEntry.acp.mode === "oneshot") {
-    return true;
+    return !resolveDurableAcpOneShotResume({
+      meta: acpEntry.acp,
+      backend: acpEntry.acp.backend,
+    });
   }
   return !hasActiveSessionBinding(runtime, sessionKey);
 }
@@ -134,6 +146,7 @@ function shouldCloseOrphanedParentOwnedAcpSession(
   const sessionKey = normalizeOptionalString(acpEntry.sessionKey);
   if (
     !sessionKey ||
+    runtime.hasActiveAcpTurn?.(sessionKey, acpEntry.agentId) ||
     runtime.hasActiveTaskForChildSessionKey({
       sessionKey,
       agentId: acpEntry.agentId,
@@ -142,7 +155,10 @@ function shouldCloseOrphanedParentOwnedAcpSession(
     return false;
   }
   if (acpEntry.acp.mode === "oneshot") {
-    return true;
+    return !resolveDurableAcpOneShotResume({
+      meta: acpEntry.acp,
+      backend: acpEntry.acp.backend,
+    });
   }
   return !hasActiveSessionBinding(runtime, sessionKey);
 }
@@ -170,13 +186,19 @@ export async function cleanupTerminalAcpSession(
     return;
   }
   assertOwnerCurrent();
+  // The close may block on the session actor queue; a resumed turn could start
+  // while waiting. Recheck cleanup eligibility immediately before the close.
+  let cleanupEligible = false;
   try {
-    await closeAcpSession({
-      cfg: acpEntry.cfg,
-      agentId: acpEntry.agentId,
-      sessionKey,
-      reason: "terminal-task-cleanup",
-    });
+    await closeAcpSession(
+      {
+        cfg: acpEntry.cfg,
+        agentId: acpEntry.agentId,
+        sessionKey,
+        reason: "terminal-task-cleanup",
+      },
+      () => (cleanupEligible = shouldCloseTerminalAcpSession(runtime, task)),
+    );
   } catch (error) {
     assertOwnerCurrent();
     log.warn("Failed to close terminal ACP session during task maintenance", {
@@ -184,6 +206,9 @@ export async function cleanupTerminalAcpSession(
       taskId: task.taskId,
       error,
     });
+    return;
+  }
+  if (!cleanupEligible) {
     return;
   }
   assertOwnerCurrent();
@@ -239,19 +264,38 @@ export async function cleanupOrphanedParentOwnedAcpSessions(
       continue;
     }
     assertOwnerCurrent();
+    // A resumed turn may start while waiting on the session actor queue, or a
+    // concurrent maintenance sweep may already own the session. Revalidate the
+    // current entry immediately before the close and skip unbind otherwise.
+    let cleanupEligible = false;
     try {
-      await closeAcpSession({
-        cfg: acpEntry.cfg,
-        agentId: acpEntry.agentId,
-        sessionKey,
-        reason: "orphaned-parent-task-cleanup",
-      });
+      await closeAcpSession(
+        {
+          cfg: acpEntry.cfg,
+          agentId: acpEntry.agentId,
+          sessionKey,
+          reason: "orphaned-parent-task-cleanup",
+        },
+        () => {
+          const current = runtime.readAcpSessionEntry({
+            sessionKey,
+            agentId: acpEntry.agentId,
+            clone: false,
+          });
+          return (cleanupEligible = current
+            ? shouldCloseOrphanedParentOwnedAcpSession(runtime, current)
+            : false);
+        },
+      );
     } catch (error) {
       assertOwnerCurrent();
       log.warn("Failed to close orphaned parent-owned ACP session during task maintenance", {
         sessionKey,
         error,
       });
+      continue;
+    }
+    if (!cleanupEligible) {
       continue;
     }
     assertOwnerCurrent();

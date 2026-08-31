@@ -3,6 +3,7 @@ import * as acpTurns from "../acp/control-plane/active-turns.js";
 import type { AcpSessionStoreEntry } from "../acp/runtime/session-meta.js";
 import * as backgroundExec from "../agents/bash-process-control.js";
 import * as subagents from "../agents/subagents/registry/subagent-registry-read.js";
+import type { SessionAcpMeta } from "../config/sessions/types.js";
 import type { SessionEntry } from "../config/sessions.js";
 import * as cronJobs from "../cron/active-jobs.js";
 import * as agentRuns from "../infra/agent-run-registry.js";
@@ -209,6 +210,7 @@ export function createAcpSessionStoreEntry(params: {
   sessionKey: string;
   parentSessionKey: string;
   mode: "persistent" | "oneshot";
+  acpOverrides?: Partial<SessionAcpMeta>;
 }): AcpSessionStoreEntry {
   const acp = {
     backend: "acpx",
@@ -217,6 +219,7 @@ export function createAcpSessionStoreEntry(params: {
     mode: params.mode,
     state: "idle",
     lastActivityAt: Date.now(),
+    ...params.acpOverrides,
   } as const;
   return {
     cfg: {},

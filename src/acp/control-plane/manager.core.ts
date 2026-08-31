@@ -395,7 +395,7 @@ export class AcpSessionManager {
     });
   }
 
-  /** Evicts only the captured runtime generation; old handles close in the background. */
+/** Evicts only the captured runtime generation; old handles close in the background. */
   async #forceDiscardSessionRuntime(params: {
     cfg: OpenClawConfig;
     sessionKey: string;
@@ -453,12 +453,23 @@ export class AcpSessionManager {
     });
   }
 
-  async closeSession(input: AcpCloseSessionInput): Promise<AcpCloseSessionResult> {
+  async closeSession(
+    input: AcpCloseSessionInput,
+    revalidate?: () => boolean,
+  ): Promise<AcpCloseSessionResult> {
     const target = resolveAcpSessionTarget(input);
     return await this.withSessionActor(
       target,
-      async (isCurrentActor) =>
-        await runManagerCloseSession({
+      async (isCurrentActor) => {
+        // The actor wait may admit queued work. Recheck cleanup authority only
+        // after that wait, immediately before the destructive close boundary.
+        if (revalidate && !revalidate()) {
+          return {
+            runtimeClosed: false,
+            metaCleared: false,
+          };
+        }
+        return await runManagerCloseSession({
           input,
           ...target,
           deps: this.deps,
@@ -467,7 +478,8 @@ export class AcpSessionManager {
           ensureRuntimeHandle: this.ensureRuntimeHandle.bind(this),
           writeSessionMeta: this.writeSessionMeta.bind(this),
           isCurrentActor,
-        }),
+        });
+      },
     );
   }
 
