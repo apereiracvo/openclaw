@@ -8,6 +8,7 @@ import {
   readAcpSessionEntry,
   type AcpSessionStoreEntry,
 } from "../acp/runtime/session-meta.js";
+import { resolveDurableAcpOneShotResume } from "../acp/session-resume.js";
 import { isBackgroundExecSessionActive } from "../agents/bash-process-control.js";
 import {
   formatSubagentRecoveryWedgedReason,
@@ -97,12 +98,15 @@ let configuredRuntimeAuthoritative = false;
 type TaskRegistryMaintenanceRuntime = {
   listAcpSessionEntries: typeof listAcpSessionEntries;
   readAcpSessionEntry: typeof readAcpSessionEntry;
-  closeAcpSession?: (params: {
-    cfg: OpenClawConfig;
-    sessionKey: string;
-    agentId?: string;
-    reason: string;
-  }) => Promise<void>;
+  closeAcpSession?: (
+    params: {
+      cfg: OpenClawConfig;
+      sessionKey: string;
+      agentId?: string;
+      reason: string;
+    },
+    revalidate: () => boolean,
+  ) => Promise<void>;
   listSessionBindingsBySession?: ReturnType<typeof getSessionBindingService>["listBySession"];
   unbindSessionBindings?: ReturnType<typeof getSessionBindingService>["unbind"];
   listSessionEntries: typeof listSessionEntriesReadOnly;
@@ -131,17 +135,20 @@ type TaskRegistryMaintenanceRuntime = {
 const defaultTaskRegistryMaintenanceRuntime: TaskRegistryMaintenanceRuntime = {
   listAcpSessionEntries,
   readAcpSessionEntry,
-  closeAcpSession: async ({ cfg, sessionKey, agentId, reason }) => {
-    await getAcpSessionManager().closeSession({
-      cfg,
-      sessionKey,
-      agentId,
-      reason,
-      discardPersistentState: true,
-      clearMeta: true,
-      allowBackendUnavailable: true,
-      requireAcpSession: false,
-    });
+  closeAcpSession: async ({ cfg, sessionKey, agentId, reason }, revalidate) => {
+    await getAcpSessionManager().closeSession(
+      {
+        cfg,
+        sessionKey,
+        agentId,
+        reason,
+        discardPersistentState: true,
+        clearMeta: true,
+        allowBackendUnavailable: true,
+        requireAcpSession: false,
+      },
+      revalidate,
+    );
   },
   listSessionBindingsBySession: (sessionKey) =>
     getSessionBindingService().listBySession(sessionKey),
@@ -568,6 +575,7 @@ function shouldCloseTerminalAcpSession(task: TaskRecord): boolean {
   const sessionKey = getNormalizedTaskChildSessionKey(task);
   if (
     !sessionKey ||
+    taskRegistryMaintenanceRuntime.hasActiveAcpTurn(sessionKey) ||
     taskRegistryMaintenanceRuntime.hasActiveTaskForChildSessionKey({
       sessionKey,
       agentId: task.agentId,
@@ -588,7 +596,10 @@ function shouldCloseTerminalAcpSession(task: TaskRecord): boolean {
     return false;
   }
   if (acpEntry.acp.mode === "oneshot") {
-    return true;
+    return !resolveDurableAcpOneShotResume({
+      meta: acpEntry.acp,
+      backend: acpEntry.acp.backend,
+    });
   }
   return !hasActiveSessionBinding(sessionKey);
 }
@@ -600,6 +611,7 @@ function shouldCloseOrphanedParentOwnedAcpSession(acpEntry: AcpSessionStoreEntry
   const sessionKey = normalizeOptionalString(acpEntry.sessionKey);
   if (
     !sessionKey ||
+    taskRegistryMaintenanceRuntime.hasActiveAcpTurn(sessionKey) ||
     taskRegistryMaintenanceRuntime.hasActiveTaskForChildSessionKey({
       sessionKey,
       agentId: acpEntry.agentId,
@@ -608,7 +620,10 @@ function shouldCloseOrphanedParentOwnedAcpSession(acpEntry: AcpSessionStoreEntry
     return false;
   }
   if (acpEntry.acp.mode === "oneshot") {
-    return true;
+    return !resolveDurableAcpOneShotResume({
+      meta: acpEntry.acp,
+      backend: acpEntry.acp.backend,
+    });
   }
   return !hasActiveSessionBinding(sessionKey);
 }
@@ -630,19 +645,26 @@ async function cleanupTerminalAcpSession(task: TaskRecord): Promise<void> {
   if (!acpEntry || !closeAcpSession) {
     return;
   }
+  let cleanupEligible = false;
   try {
-    await closeAcpSession({
-      cfg: acpEntry.cfg,
-      agentId: acpEntry.agentId,
-      sessionKey,
-      reason: "terminal-task-cleanup",
-    });
+    await closeAcpSession(
+      {
+        cfg: acpEntry.cfg,
+        agentId: acpEntry.agentId,
+        sessionKey,
+        reason: "terminal-task-cleanup",
+      },
+      () => (cleanupEligible = shouldCloseTerminalAcpSession(task)),
+    );
   } catch (error) {
     log.warn("Failed to close terminal ACP session during task maintenance", {
       sessionKey,
       taskId: task.taskId,
       error,
     });
+    return;
+  }
+  if (!cleanupEligible) {
     return;
   }
   try {
@@ -687,18 +709,34 @@ async function cleanupOrphanedParentOwnedAcpSessions(): Promise<void> {
     if (!closeAcpSession) {
       continue;
     }
+    let cleanupEligible = false;
     try {
-      await closeAcpSession({
-        cfg: acpEntry.cfg,
-        agentId: acpEntry.agentId,
-        sessionKey,
-        reason: "orphaned-parent-task-cleanup",
-      });
+      await closeAcpSession(
+        {
+          cfg: acpEntry.cfg,
+          agentId: acpEntry.agentId,
+          sessionKey,
+          reason: "orphaned-parent-task-cleanup",
+        },
+        () => {
+          const current = taskRegistryMaintenanceRuntime.readAcpSessionEntry({
+            sessionKey,
+            agentId: acpEntry.agentId,
+            clone: false,
+          });
+          return (cleanupEligible = current
+            ? shouldCloseOrphanedParentOwnedAcpSession(current)
+            : false);
+        },
+      );
     } catch (error) {
       log.warn("Failed to close orphaned parent-owned ACP session during task maintenance", {
         sessionKey,
         error,
       });
+      continue;
+    }
+    if (!cleanupEligible) {
       continue;
     }
     try {
