@@ -52,6 +52,36 @@ job. Open the page that matches your task.
 | [ACP agents controls](/tools/acp-agents/controls)               | You need the `/acp` command reference and runtime option mapping.          |
 | [ACP agents troubleshooting](/tools/acp-agents/troubleshooting) | You hit an ACP error message and need the likely cause and fix.            |
 
+### Verified resumable one-shot lifecycle
+
+This branch ships a verified resumable one-shot lifecycle for parent-owned ACP
+sessions, governed by these rules:
+
+- Spawn creates or resumes an ACP runtime session, records ACP metadata in the
+  OpenClaw session store, and creates a background task when the run is
+  parent-owned.
+- Parent-owned ACP sessions are treated as background work even when the
+  runtime session is persistent; completion and cross-surface delivery go
+  through the parent task notifier rather than acting like a normal
+  user-facing chat session.
+- Task maintenance retains a completed parent-owned one-shot only when its
+  persisted identity proves that the exact backend session supports resume and
+  the completed turn committed resume readiness. The owning parent can then
+  continue the same child with `sessions_send`; completion remains task-owned,
+  so each follow-up produces one parent-visible completion.
+- Legacy or otherwise unverified one-shots fail closed and are cleaned up.
+  OpenClaw does not create a fresh session, retry without the resume id, or
+  switch backends when an explicit continuation cannot resume its exact target.
+- Verified resume metadata survives runtime-handle cache loss and reconstructs
+  from persisted state after a new manager starts, preserving the child key,
+  ACP session id, backend, and working directory. This restart path is covered
+  by isolated automated state tests; production restart verification remains an
+  operator-controlled post-promotion check.
+- Stale persistent ACP sessions without an active conversation binding are
+  closed so they cannot be silently resumed after the owning task is done or
+  its task record is gone. See
+  [the runbook lifecycle details](/tools/acp-agents/runbook#lifecycle-details).
+
 ## ACP versus sub-agents
 
 Use ACP when you want an external harness runtime. Use **native Codex

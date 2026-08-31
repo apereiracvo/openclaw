@@ -57,6 +57,7 @@ import { SESSION_LABEL_MAX_LENGTH } from "../../sessions/session-label.js";
 import { recordSessionParticipantBestEffort } from "../../sessions/session-participant-recording.js";
 import { registerSessionStateWatch } from "../../sessions/session-state-events.js";
 import { stripFormattedReasoningMessage } from "../../shared/text/formatted-reasoning-message.js";
+import { isAcpChildSessionOwnedBy } from "../../tasks/task-owner-access.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
 import { listAgentIds, resolveSessionAgentId } from "../agent-scope.js";
 import { resolveNestedAgentLaneForSession } from "../lanes.js";
@@ -331,6 +332,8 @@ export function createSessionsSendTool(opts?: {
   reserveAcpTurnAdmission?: typeof reserveAcpTurnAdmission;
   releaseAcpTurnAdmission?: typeof releaseAcpTurnAdmission;
   readAcpSessionMeta?: typeof readAcpSessionMeta;
+  /** Test seam for authoritative task-registry ACP child ownership. */
+  isAcpChildSessionOwnedBy?: typeof isAcpChildSessionOwnedBy;
 }): AnyAgentTool {
   return {
     label: "Session Send",
@@ -961,7 +964,7 @@ export function createSessionsSendTool(opts?: {
           const sendParams = {
             message: annotateInterSessionPromptText(message, inputProvenance),
             agentId: targetAgentId,
-            sessionKey: resolvedKey,
+sessionKey: resolvedKey,
             idempotencyKey,
             deliver: false,
             sourceReplyDeliveryMode: "message_tool_only" as const,
@@ -1000,10 +1003,29 @@ export function createSessionsSendTool(opts?: {
           const targetSessionEntryWithAcp = targetSessionEntry
             ? { ...targetSessionEntry, acp: targetAcpMeta }
             : targetSessionEntry;
-          const skipTaskReplyFlow = isRequesterParentOfBackgroundAcpSession(
-            targetSessionEntryWithAcp,
-            effectiveRequesterKey,
-          );
+          const taskRegistryOwnsAcpChild = (
+            opts?.isAcpChildSessionOwnedBy ?? isAcpChildSessionOwnedBy
+          )({
+            childSessionKey: resolvedKey,
+            callerOwnerKey: effectiveRequesterKey,
+            callerAgentId: requesterAgentId,
+            config: cfg,
+          });
+          if (taskRegistryOwnsAcpChild && !targetAcpMeta) {
+            return jsonResult({
+              runId,
+              status: "error",
+              error:
+                "Cannot continue this parent-owned ACP session because its authoritative durable ACP metadata is missing. This unverified or legacy session must be replaced with a new ACP run.",
+              sessionKey: displayKey,
+            });
+          }
+          const skipTaskReplyFlow =
+            taskRegistryOwnsAcpChild ||
+            isRequesterParentOfBackgroundAcpSession(
+              targetSessionEntryWithAcp,
+              effectiveRequesterKey,
+            );
           // Child reports, registered tasks, and exact-incarnation grants own their completion.
           const replyMode =
             requesterIsSubagent || skipTaskReplyFlow || expectedSessionId
