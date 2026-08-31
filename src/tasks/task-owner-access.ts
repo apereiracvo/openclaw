@@ -127,6 +127,28 @@ export function listTasksForRelatedSessionKeyForOwner(params: {
   );
 }
 
+/** True when the task registry authoritatively binds an ACP child to this session owner. */
+export function isAcpChildSessionOwnedBy(params: {
+  childSessionKey: string;
+  callerOwnerKey: string;
+  callerAgentId?: string;
+  config?: OpenClawConfig;
+}): boolean {
+  const childSessionKey = normalizeOptionalString(params.childSessionKey);
+  if (!childSessionKey) {
+    return false;
+  }
+  return listTasksForRelatedSessionKeyForOwner({
+    relatedSessionKey: childSessionKey,
+    callerOwnerKey: params.callerOwnerKey,
+    callerAgentId: params.callerAgentId,
+    config: params.config,
+  }).some(
+    (task) =>
+      task.runtime === "acp" && normalizeOptionalString(task.childSessionKey) === childSessionKey,
+  );
+}
+
 export function buildTaskStatusSnapshotForRelatedSessionKeyForOwner(params: {
   relatedSessionKey: string;
   callerOwnerKey: string;
