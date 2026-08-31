@@ -1,4 +1,5 @@
 /** Runs ACP turns, failover, timeout cleanup, and detached-task progress mirroring. */
+import { resolveSessionIdentityFromMeta } from "@openclaw/acp-core/runtime/session-identity";
 import type { AcpRuntime, AcpRuntimeHandle } from "@openclaw/acp-core/runtime/types";
 import { parseModelCatalogRef } from "@openclaw/model-catalog-core/model-catalog-refs";
 import { expectDefined } from "@openclaw/normalization-core";
@@ -16,6 +17,11 @@ import {
   recordSubagentTerminalState,
 } from "../../sessions/session-state-events.js";
 import { AcpRuntimeError, formatAcpErrorChain, toAcpRuntimeError } from "../runtime/errors.js";
+import {
+  isSameAcpSessionIdentityGeneration,
+  resolveAcpOneShotReadinessTarget,
+  resolveDurableAcpOneShotResume,
+} from "../session-resume.js";
 import { markAcpTurnActive } from "./active-turns.js";
 import type { AcceptedTurnState } from "./manager.accepted-turns.js";
 import {
@@ -40,7 +46,7 @@ import type { ManagerRuntimeHandleCache } from "./manager.runtime-handle-cache.j
 import { createSupersededActorError } from "./manager.runtime-handle-ensure.js";
 import { isAcpOwnerRepairRequired } from "./manager.runtime-owner.js";
 import { prepareFreshManagerRuntimeHandleRetry } from "./manager.runtime-resume-state.js";
-import { consumeAcpTurnStream } from "./manager.turn-stream.js";
+import { consumeAcpTurnStream, readAcpTurnStreamFailure } from "./manager.turn-stream.js";
 import {
   awaitTurnWithTimeout,
   cleanupTimedOutTurn,
@@ -61,6 +67,81 @@ import { acpSessionActorKey, requireReadySessionMeta } from "./manager.utils.js"
 
 const ACP_TURN_TIMEOUT_GRACE_MS = 1_000;
 const ACP_COMPLETION_EVIDENCE_MAX_BYTES = 100 * 1024;
+
+async function commitManagerOneShotResumeReadiness(params: {
+  cfg: AcpRunTurnInput["cfg"];
+  sessionKey: string;
+  agentId: string;
+  backend: string | undefined;
+  meta: SessionAcpMeta;
+  writeSessionMeta: WriteManagerSessionMeta;
+}): Promise<SessionAcpMeta> {
+  const target = resolveAcpOneShotReadinessTarget({
+    meta: params.meta,
+    backend: params.backend,
+    terminal: { status: "completed", cancelled: false },
+  });
+  if (!target) {
+    return params.meta;
+  }
+  const readyAt = Date.now();
+  let readinessApplied = false;
+  const persisted = await params.writeSessionMeta({
+    cfg: params.cfg,
+    sessionKey: params.sessionKey,
+    agentId: params.agentId,
+    failOnError: true,
+    skipMaintenance: true,
+    takeCacheOwnership: true,
+    mutate: (current, entry) => {
+      const currentIdentity = resolveSessionIdentityFromMeta(current);
+      const currentTarget = current
+        ? resolveAcpOneShotReadinessTarget({
+            meta: current,
+            backend: target.backend,
+            terminal: { status: "completed", cancelled: false },
+          })
+        : undefined;
+      if (
+        !entry ||
+        !current ||
+        !currentIdentity ||
+        !isSameAcpSessionIdentityGeneration({ expected: params.meta, current }) ||
+        currentTarget?.resumeSessionId !== target.resumeSessionId
+      ) {
+        return undefined;
+      }
+      readinessApplied = true;
+      return {
+        ...current,
+        identity: {
+          ...currentIdentity,
+          sessionResumeReady: true,
+          lastUpdatedAt: readyAt,
+        },
+        lastActivityAt: readyAt,
+      };
+    },
+  });
+  const persistedMeta = persisted?.acp;
+  const persistedTarget = persistedMeta
+    ? resolveDurableAcpOneShotResume({
+        meta: persistedMeta,
+        backend: target.backend,
+      })
+    : undefined;
+  if (
+    !readinessApplied ||
+    persistedTarget?.resumeSessionId !== target.resumeSessionId ||
+    !persistedMeta
+  ) {
+    throw new AcpRuntimeError(
+      "ACP_TURN_FAILED",
+      "Could not persist ACP one-shot resume readiness after the completed turn.",
+    );
+  }
+  return persistedMeta;
+}
 
 /** Executes one ACP prompt turn against the selected backend and records terminal state. */
 export async function runManagerTurn(params: {
@@ -156,10 +237,15 @@ export async function runManagerTurn(params: {
     initialResolution.kind === "ready"
       ? (initialResolution.entry?.spawnedBy ?? initialResolution.entry?.parentSessionKey)
       : undefined;
+  const oneShotResumeTarget = resolveDurableAcpOneShotResume({
+    meta: initialMeta,
+    backend: initialMeta.backend,
+  });
   const { candidateBackends, describeBackendCandidate } = resolveBackendCandidatePlan({
     configuredPrimaryBackend: input.cfg.acp?.backend,
     resolvedPrimaryBackend: initialMeta.backend,
     fallbackBackends: input.cfg.acp?.fallbacks,
+    pinnedBackend: oneShotResumeTarget?.backend,
   });
   const backendAttempts: BackendAttempt[] = [];
   const recordBackendFailure = async (error: AcpRuntimeError) => {
@@ -214,9 +300,16 @@ export async function runManagerTurn(params: {
     throw errorToRecord;
   };
 
-  // Liveness spans the whole task, not one backend attempt. The release belongs to
-  // this turn so a retired actor cannot erase a successor after reset overlap.
   const releaseActiveTurn = taskContext ? markAcpTurnActive(params) : undefined;
+  // Liveness spans the whole task, not one attempt: mark once before the backend loop
+  // (after the ready-meta check, so a pre-loop throw cannot leak it) and clear on every
+  // runTurn exit, including unexpected retry/cleanup failures before terminal task writes.
+  const releaseTerminalTurnState = (activeTurn?: ActiveTurnState) => {
+    if (activeTurn && params.activeTurnBySession.get(actorKey) === activeTurn) {
+      params.activeTurnBySession.delete(actorKey);
+    }
+    releaseActiveTurn?.();
+  };
 
   try {
     for (const [backendIdx, currentBackend] of candidateBackends.entries()) {
@@ -256,6 +349,9 @@ export async function runManagerTurn(params: {
         let sawTurnOutput = false;
         let retryFreshHandle = false;
         let skipPostTurnCleanup = false;
+        let completedTerminalResult = false;
+        let terminalStatusObserved: "completed" | "cancelled" | undefined;
+        let finalReconciliationAttempted = false;
         let completionEvidenceText = "";
         let completionEvidenceBytes = 0;
         let completionEvidenceOverflowed = false;
@@ -268,6 +364,7 @@ export async function runManagerTurn(params: {
             sessionKey,
             agentId,
             meta: resolvedMeta,
+            intent: "turn-continuation",
             selectedBackend: currentBackend,
             isCurrentActor: params.isCurrentActor,
           });
@@ -484,6 +581,33 @@ export async function runManagerTurn(params: {
               "ACP turn ended without a terminal done event.",
             );
           }
+          terminalStatusObserved = turnOutcome.terminalStatus;
+          completedTerminalResult = terminalStatusObserved === "completed";
+          if (completedTerminalResult && meta.mode === "oneshot") {
+            // A completed one-shot is already externally effective. Reconcile and commit the
+            // durable continuation fence before exposing liveness release, success, or idle state.
+            finalReconciliationAttempted = true;
+            ({ handle, meta } = await params.reconcileRuntimeSessionIdentifiers({
+              cfg: input.cfg,
+              sessionKey,
+              agentId,
+              runtime,
+              handle,
+              meta,
+              failOnStatusError: true,
+            }));
+            meta = await commitManagerOneShotResumeReadiness({
+              cfg: input.cfg,
+              sessionKey,
+              agentId,
+              backend: handle.backend || meta.backend,
+              meta,
+              writeSessionMeta: params.writeSessionMeta,
+            });
+          }
+          if (completedTerminalResult) {
+            releaseTerminalTurnState(activeTurn);
+          }
           params.recordTurnCompletion({
             startedAt: turnStartedAt,
           });
@@ -528,8 +652,48 @@ export async function runManagerTurn(params: {
           });
           return;
         } catch (error) {
+          const streamFailure = readAcpTurnStreamFailure(error);
+          let terminalFailure = streamFailure?.error ?? error;
+          if (streamFailure) {
+            terminalStatusObserved = streamFailure.outcome.terminalStatus;
+            completedTerminalResult = terminalStatusObserved === "completed";
+            sawTurnOutput ||= streamFailure.outcome.sawOutput;
+          }
+          if (
+            completedTerminalResult &&
+            !finalReconciliationAttempted &&
+            runtime &&
+            handle &&
+            meta?.mode === "oneshot"
+          ) {
+            // The backend completed even though a later observer/drain failed. Preserve that
+            // generation durably before reporting the local processing failure, without releasing
+            // failure liveness early or permitting any replay path.
+            finalReconciliationAttempted = true;
+            try {
+              ({ handle, meta } = await params.reconcileRuntimeSessionIdentifiers({
+                cfg: input.cfg,
+                sessionKey,
+                agentId,
+                runtime,
+                handle,
+                meta,
+                failOnStatusError: true,
+              }));
+              meta = await commitManagerOneShotResumeReadiness({
+                cfg: input.cfg,
+                sessionKey,
+                agentId,
+                backend: handle.backend || meta.backend,
+                meta,
+                writeSessionMeta: params.writeSessionMeta,
+              });
+            } catch (reconciliationError) {
+              terminalFailure = reconciliationError;
+            }
+          }
           const acpError = toAcpRuntimeError({
-            error,
+            error: terminalFailure,
             fallbackCode: activeTurnStarted ? "ACP_TURN_FAILED" : "ACP_SESSION_INIT_FAILED",
             fallbackMessage: activeTurnStarted
               ? "ACP turn failed before completion."
@@ -538,20 +702,23 @@ export async function runManagerTurn(params: {
           if (!params.isCurrentActor()) {
             throw createSupersededActorError(sessionKey);
           }
-          retryFreshHandle = await prepareFreshManagerRuntimeHandleRetry({
-            attempt,
-            cfg: input.cfg,
-            sessionKey,
-            agentId,
-            error: acpError,
-            promptStarted,
-            sawTurnOutput,
-            runtime,
-            meta,
-            runtimeHandles: params.runtimeHandles,
-            writeSessionMeta: params.writeSessionMeta,
-            isCurrentActor: params.isCurrentActor,
-          });
+          retryFreshHandle =
+            !terminalStatusObserved && !oneShotResumeTarget
+              ? await prepareFreshManagerRuntimeHandleRetry({
+                  attempt,
+                  cfg: input.cfg,
+                  sessionKey,
+                  agentId,
+                  error: acpError,
+                  promptStarted,
+                  sawTurnOutput,
+                  runtime,
+                  meta,
+                  runtimeHandles: params.runtimeHandles,
+                  writeSessionMeta: params.writeSessionMeta,
+                  isCurrentActor: params.isCurrentActor,
+                })
+              : false;
           if (!params.isCurrentActor()) {
             throw createSupersededActorError(sessionKey);
           }
@@ -563,8 +730,8 @@ export async function runManagerTurn(params: {
             backend: describeBackendCandidate(currentBackend),
             error: acpError.message,
             code: acpError.code,
-            promptStarted,
-            sawOutput: sawTurnOutput,
+            promptStarted: promptStarted || Boolean(terminalStatusObserved),
+            sawOutput: sawTurnOutput || Boolean(terminalStatusObserved),
           };
           backendAttempts.push(backendAttempt);
           if (
@@ -590,6 +757,7 @@ export async function runManagerTurn(params: {
           if (
             !retryFreshHandle &&
             !skipPostTurnCleanup &&
+            !finalReconciliationAttempted &&
             runtime &&
             handle &&
             meta &&
@@ -629,6 +797,9 @@ export async function runManagerTurn(params: {
                 params.runtimeHandles.clearIfHandleMatches({ ...params, handle });
               }
             }
+          }
+          if (activeTurn && params.activeTurnBySession.get(actorKey) === activeTurn) {
+            params.activeTurnBySession.delete(actorKey);
           }
         }
         if (retryFreshHandle) {

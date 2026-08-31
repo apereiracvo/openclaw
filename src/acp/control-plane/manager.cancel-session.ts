@@ -103,6 +103,7 @@ export async function runManagerCancelSession(params: {
       agentId: params.agentId,
       meta: resolvedMeta,
       isCurrentActor,
+      intent: "runtime-control",
     });
     params.assertActive?.();
     try {

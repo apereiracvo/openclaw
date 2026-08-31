@@ -58,6 +58,7 @@ export async function runSetManagerSessionRuntimeMode(
     agentId: params.agentId,
     meta: resolvedMeta,
     isCurrentActor: params.isCurrentActor,
+    intent: "runtime-control",
   });
   params.assertActive?.();
   const capabilities = await resolveManagerRuntimeCapabilities({ runtime, handle });
@@ -121,6 +122,7 @@ export async function runSetManagerSessionConfigOption(
     agentId: params.agentId,
     meta: resolvedMeta,
     isCurrentActor: params.isCurrentActor,
+    intent: "runtime-control",
   });
   params.assertActive?.();
   const inferredPatch = inferRuntimeOptionPatchFromConfigOption(params.key, params.value);
@@ -217,27 +219,26 @@ export async function runResetManagerSessionRuntimeOptions(
     sessionKey: params.sessionKey,
     agentId: params.agentId,
   });
-  requireReadySessionMeta(resolution);
-  const cached = params.runtimeHandles.get(params);
-  if (cached) {
-    await withAcpRuntimeErrorBoundary({
-      run: async () =>
-        await cached.runtime.close({
-          handle: cached.handle,
-          reason: "reset-runtime-options",
-        }),
-      fallbackCode: "ACP_TURN_FAILED",
-      fallbackMessage: "Could not reset ACP runtime options.",
-    });
-    if (!params.isCurrentActor()) {
-      throw createSupersededActorError(params.sessionKey);
-    }
-    params.runtimeHandles.clearIfHandleMatches({ ...params, handle: cached.handle });
-  }
+  const resolvedMeta = requireReadySessionMeta(resolution);
+  const { runtime, handle } = await params.ensureRuntimeHandle({
+    cfg: params.cfg,
+    sessionKey: params.sessionKey,
+    agentId: params.agentId,
+    meta: resolvedMeta,
+    intent: "runtime-control",
+  });
+  await withAcpRuntimeErrorBoundary({
+    run: async () =>
+      await runtime.close({
+        handle,
+        reason: "reset-runtime-options",
+      }),
+    fallbackCode: "ACP_TURN_FAILED",
+    fallbackMessage: "Could not reset ACP runtime options.",
+  });
+  params.runtimeHandles.clear(params);
   await persistManagerRuntimeOptions({
     ...params,
-    // Closing an admitted handle owns its settlement; a metadata-only reset still needs authority.
-    assertCommitAllowed: cached ? undefined : params.assertActive,
     options: {},
   });
   return {};

@@ -86,6 +86,7 @@ export async function runManagerCloseSession(params: {
         agentId,
         meta,
         isCurrentActor: params.isCurrentActor,
+        intent: "runtime-close",
       });
       if (!params.isCurrentActor()) {
         throw createSupersededActorError(sessionKey);

@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 /** SQLite-backed ACP session metadata storage keyed through session-store entries. */
 import type { DatabaseSync } from "node:sqlite";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { Insertable } from "kysely";
 import { getRuntimeConfig } from "../../config/config.js";
 import { patchSessionEntryWithKey } from "../../config/sessions/session-accessor.js";
@@ -45,6 +44,11 @@ import {
   resolveSessionStorePathForAcp,
   resolveStoreEntryForSessionKey,
 } from "./session-meta-store.js";
+import {
+  resolveAcpSessionStoreUpdateOptions,
+  type UpsertAcpSessionMetaParams,
+  withAcpSessionMetaWriteLock,
+} from "./session-meta-write-lock.js";
 
 /** ACP metadata joined with its legacy session-store row and config context. */
 export { resolveSessionStorePathForAcp } from "./session-meta-store.js";
@@ -245,7 +249,14 @@ export function writeAcpSessionMetaForMigration(params: {
         }
       }
     },
-    { database: params.database, env: params.env, path: params.databasePath },
+    { env: params.env, path: params.databasePath },
+  );
+}
+
+function deleteAcpSessionMetaRow(db: DatabaseSync, sessionKey: string): void {
+  executeSqliteQuerySync(
+    db,
+    getAcpSessionKysely(db).deleteFrom("acp_sessions").where("session_key", "=", sessionKey),
   );
 }
 
@@ -345,22 +356,6 @@ export async function listAcpSessionEntries(params: {
   return entries;
 }
 
-function mergeAcpForReturn(entry: SessionEntry | undefined, acp: SessionAcpMeta): SessionEntry {
-  return mergeSessionEntry(entry, { acp });
-}
-
-function sessionStoreUpdateOptions(params: {
-  sessionKey: string;
-  skipMaintenance?: boolean;
-  takeCacheOwnership?: boolean;
-}) {
-  return {
-    activeSessionKey: normalizeLowercaseStringOrEmpty(params.sessionKey),
-    ...(params.skipMaintenance === true ? { skipMaintenance: true } : {}),
-    ...(params.takeCacheOwnership === true ? { takeCacheOwnership: true } : {}),
-  };
-}
-
 function consumeLegacyAcpMigrationSources(params: {
   database: DatabaseSync;
   agentId?: string;
@@ -390,25 +385,10 @@ function consumeLegacyAcpMigrationSources(params: {
   }
 }
 
-export async function upsertAcpSessionMeta(params: {
-  assertCommitAllowed?: () => void;
-  sessionKey: string;
-  agentId?: string;
-  cfg?: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-  databasePath?: string;
-  now?: () => number;
-  skipMaintenance?: boolean;
-  takeCacheOwnership?: boolean;
-  mutate: (
-    current: SessionAcpMeta | undefined,
-    entry: SessionEntry | undefined,
-  ) => SessionAcpMeta | null | undefined;
-}): Promise<SessionEntry | null> {
+async function upsertAcpSessionMetaExclusive(
+  params: UpsertAcpSessionMetaParams,
+): Promise<SessionEntry | null> {
   const sessionKey = params.sessionKey.trim();
-  if (!sessionKey) {
-    return null;
-  }
   const storeEntry = readSessionEntryFromStore({
     sessionKey,
     agentId: params.agentId,
@@ -445,14 +425,14 @@ export async function upsertAcpSessionMeta(params: {
       });
       nextMeta = params.mutate(
         current,
-        current ? mergeAcpForReturn(preparedEntry, current) : entry,
+        current ? mergeSessionEntry(preparedEntry, { acp: current }) : entry,
       );
     },
     { env: params.env, path: params.databasePath },
   );
   const metaToPersist = nextMeta;
   if (metaToPersist === undefined) {
-    return current ? mergeAcpForReturn(entry, current) : (entry ?? null);
+    return current ? mergeSessionEntry(entry, { acp: current }) : (entry ?? null);
   }
   if (metaToPersist === null) {
     const patched = entry
@@ -468,7 +448,10 @@ export async function upsertAcpSessionMeta(params: {
             return next;
           },
           {
-            ...sessionStoreUpdateOptions({ ...params, sessionKey: storageSessionKey }),
+            ...resolveAcpSessionStoreUpdateOptions({
+              ...params,
+              sessionKey: storageSessionKey,
+            }),
             replaceEntry: true,
             assertCommitAllowed: params.assertCommitAllowed,
           },
@@ -508,12 +491,7 @@ export async function upsertAcpSessionMeta(params: {
           }
         }
         for (const key of sessionKeysToDelete) {
-          executeSqliteQuerySync(
-            database.db,
-            getAcpSessionKysely(database.db)
-              .deleteFrom("acp_sessions")
-              .where("session_key", "=", key),
-          );
+          deleteAcpSessionMetaRow(database.db, key);
         }
         sessionChanges.emit(
           { agentId: storeEntry.agentId, sessionKey: patched?.sessionKey ?? storageSessionKey },
@@ -544,7 +522,7 @@ export async function upsertAcpSessionMeta(params: {
       return next;
     },
     {
-      ...sessionStoreUpdateOptions({ ...params, sessionKey: storageSessionKey }),
+      ...resolveAcpSessionStoreUpdateOptions({ ...params, sessionKey: storageSessionKey }),
       fallbackEntry: preparedEntry,
       replaceEntry: true,
       assertCommitAllowed: params.assertCommitAllowed,
@@ -587,24 +565,14 @@ export async function upsertAcpSessionMeta(params: {
         }),
       );
       if (persistedDatabaseSessionKey !== databaseSessionKey) {
-        executeSqliteQuerySync(
-          database.db,
-          getAcpSessionKysely(database.db)
-            .deleteFrom("acp_sessions")
-            .where("session_key", "=", databaseSessionKey),
-        );
+        deleteAcpSessionMetaRow(database.db, databaseSessionKey);
       }
       if (
         currentRowKey &&
         currentRowKey !== persistedDatabaseSessionKey &&
         !resolveLegacyFreeAcpSessionKey(currentRowKey)
       ) {
-        executeSqliteQuerySync(
-          database.db,
-          getAcpSessionKysely(database.db)
-            .deleteFrom("acp_sessions")
-            .where("session_key", "=", currentRowKey),
-        );
+        deleteAcpSessionMetaRow(database.db, currentRowKey);
       }
       if (
         persistedDatabaseSessionKey !== persisted.sessionKey &&
@@ -612,12 +580,7 @@ export async function upsertAcpSessionMeta(params: {
       ) {
         const legacyRow = selectAcpSessionRow(database.db, persisted.sessionKey);
         if (legacyRow && acpSessionRowMatchesEntry(legacyRow, persisted.entry)) {
-          executeSqliteQuerySync(
-            database.db,
-            getAcpSessionKysely(database.db)
-              .deleteFrom("acp_sessions")
-              .where("session_key", "=", persisted.sessionKey),
-          );
+          deleteAcpSessionMetaRow(database.db, persisted.sessionKey);
         }
       }
       for (const aliases of selectLegacyFreeAcpSessionRows(database.db, [
@@ -642,5 +605,11 @@ export async function upsertAcpSessionMeta(params: {
     },
     { env: params.env, path: params.databasePath },
   );
-  return mergeAcpForReturn(persisted.entry, metaToPersist);
+  return mergeSessionEntry(persisted.entry, { acp: metaToPersist });
+}
+
+export async function upsertAcpSessionMeta(
+  params: UpsertAcpSessionMetaParams,
+): Promise<SessionEntry | null> {
+  return await withAcpSessionMetaWriteLock(params, upsertAcpSessionMetaExclusive);
 }

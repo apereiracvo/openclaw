@@ -16,6 +16,10 @@ import {
   toAcpRuntimeError,
   withAcpRuntimeErrorBoundary,
 } from "../runtime/errors.js";
+import {
+  isSameAcpSessionIdentityGeneration,
+  resolveDurableAcpOneShotResume,
+} from "../session-resume.js";
 import type { ManagerRuntimeHandleCache } from "./manager.runtime-handle-cache.js";
 import {
   assertAcpRuntimeOwnerSupport,
@@ -24,6 +28,7 @@ import {
 } from "./manager.runtime-owner.js";
 import type {
   AcpSessionManagerDeps,
+  EnsureManagerRuntimeHandleIntent,
   SessionAcpMeta,
   WriteManagerSessionMeta,
 } from "./manager.types.js";
@@ -42,6 +47,7 @@ export async function ensureManagerRuntimeHandle(params: {
   sessionKey: string;
   agentId: string;
   meta: SessionAcpMeta;
+  intent: EnsureManagerRuntimeHandleIntent;
   selectedBackend?: string;
   deps: Pick<AcpSessionManagerDeps, "requireRuntimeBackend">;
   runtimeHandles: ManagerRuntimeHandleCache;
@@ -66,6 +72,18 @@ export async function ensureManagerRuntimeHandle(params: {
     params.cfg.acp?.backend ||
     ""
   ).trim();
+  const durableOneShotResume = resolveDurableAcpOneShotResume({
+    meta: params.meta,
+    backend: params.meta.backend,
+  });
+  if (durableOneShotResume && params.intent !== "turn-continuation") {
+    // Observing or controlling a completed one-shot must never recreate its process. Only an
+    // admitted continuation may consume the durable resume target.
+    throw new AcpRuntimeError(
+      "ACP_SESSION_INIT_FAILED",
+      "Completed ACP one-shot sessions can only recreate a runtime for an explicit turn continuation.",
+    );
+  }
   const backend = params.deps.requireRuntimeBackend(configuredBackend || undefined);
   const runtime = backend.runtime;
   assertAcpRuntimeOwnerSupport(runtime, params);
@@ -127,8 +145,18 @@ export async function ensureManagerRuntimeHandle(params: {
     ? persistedAcpRuntimeHandle(params, previousMeta)
     : undefined;
   let identityForEnsure = previousIdentity;
+  const oneShotResumeTarget = resolveDurableAcpOneShotResume({
+    meta: previousMeta,
+    backend: backend.id,
+  });
   const persistedResumeSessionId =
-    mode === "persistent" ? resolveRuntimeResumeSessionId(previousIdentity) : undefined;
+    oneShotResumeTarget?.resumeSessionId ??
+    (mode === "persistent" ? resolveRuntimeResumeSessionId(previousIdentity) : undefined);
+  if (mode === "oneshot" && !oneShotResumeTarget) {
+    // A non-resumable one-shot starts a new identity generation. Carrying stale ids or capability
+    // evidence into its handle could make the fresh backend conversation look like the old one.
+    identityForEnsure = undefined;
+  }
   const shouldPrepareFreshPersistentSession =
     mode === "persistent" &&
     previousIdentity != null &&
@@ -191,7 +219,12 @@ export async function ensureManagerRuntimeHandle(params: {
         throw acpError;
       }
       params.assertActive?.();
-      if (isAcpOwnerRepairRequired(acpError) || acpError.code !== "ACP_SESSION_INIT_FAILED") {
+      // Explicit one-shot continuation is exact: never strip the requested id and retry fresh.
+      if (
+        oneShotResumeTarget ||
+        isAcpOwnerRepairRequired(acpError) ||
+        acpError.code !== "ACP_SESSION_INIT_FAILED"
+      ) {
         throw acpError;
       }
       logVerbose(
@@ -270,25 +303,67 @@ export async function ensureManagerRuntimeHandle(params: {
     previousMeta.cwd !== nextMeta.cwd ||
     !runtimeOptionsEqual(previousMeta.runtimeOptions, nextMeta.runtimeOptions) ||
     hasLegacyAcpIdentityProjection(previousMeta);
-  if (shouldPersistMeta) {
+  const mustFenceOneShotContinuation = oneShotResumeTarget !== undefined;
+  let persistedMeta = nextMeta;
+  if (shouldPersistMeta || mustFenceOneShotContinuation) {
+    let continuationGenerationAccepted = false;
     try {
-      await params.writeSessionMeta({
+      const persisted = await params.writeSessionMeta({
         cfg: params.cfg,
         sessionKey: params.sessionKey,
         agentId: params.agentId,
         isCurrentActor,
-        mutate: (_current, entry) => {
+        mutate: (current, entry) => {
           if (!isCurrentActor()) {
             return undefined;
           }
           if (!entry) {
             return null;
           }
+          if (
+            mustFenceOneShotContinuation &&
+            (!backendOwnsPreviousIdentity ||
+              !current ||
+              current.backend !== backend.id ||
+              nextMeta.backend !== backend.id ||
+              !isSameAcpSessionIdentityGeneration({ expected: previousMeta, current }))
+          ) {
+            return undefined;
+          }
+          continuationGenerationAccepted = mustFenceOneShotContinuation;
           return nextMeta;
         },
+        failOnError: mustFenceOneShotContinuation,
       });
+      if (mustFenceOneShotContinuation) {
+        const current = persisted?.acp;
+        if (
+          !continuationGenerationAccepted ||
+          !current ||
+          current.backend !== backend.id ||
+          !isSameAcpSessionIdentityGeneration({ expected: nextMeta, current })
+        ) {
+          throw new AcpRuntimeError(
+            "ACP_SESSION_INIT_FAILED",
+            "ACP one-shot continuation identity changed while its runtime was being resumed.",
+          );
+        }
+        persistedMeta = current;
+      }
     } catch (error) {
       // This handle has not entered the cache, so reset cleanup cannot capture it.
+      if (mustFenceOneShotContinuation) {
+        await runtime
+          .close({
+            handle: nextHandle,
+            reason: "oneshot-continuation-persistence-rejected",
+          })
+          .catch((closeError: unknown) => {
+            logVerbose(
+              `acp-manager: cleanup close failed after one-shot continuation persistence rejection for ${params.sessionKey}: ${String(closeError)}`,
+            );
+          });
+      }
       if (!isCurrentActor()) {
         await closeSupersededRuntimeHandle({
           runtime,
@@ -319,7 +394,7 @@ export async function ensureManagerRuntimeHandle(params: {
   return {
     runtime,
     handle: nextHandle,
-    meta: nextMeta,
+    meta: persistedMeta,
   };
 }
 
