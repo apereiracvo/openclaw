@@ -18,6 +18,7 @@ describe("AcpSessionManager backend failover", () => {
   function setupFailoverBackends(
     params: {
       initialBackend?: "primary-backend" | "fallback-backend";
+      mode?: "persistent" | "oneshot";
       primaryUnavailableError?: Error;
     } = {},
   ) {
@@ -29,6 +30,7 @@ describe("AcpSessionManager backend failover", () => {
       backend: initialBackend,
       runtimeSessionName:
         initialBackend === "fallback-backend" ? "fallback-runtime" : "primary-runtime",
+      mode: params.mode ?? "persistent",
     });
     primaryRuntime.ensureSession.mockImplementation(async (input) => ({
       sessionKey: input.sessionKey,
@@ -209,6 +211,31 @@ describe("AcpSessionManager backend failover", () => {
     expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledWith("primary-backend");
     expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledWith("fallback-backend");
     expect(harness.fallbackRuntime.runTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves failover for a fresh one-shot without durable resume readiness", async () => {
+    const harness = setupFailoverBackends({ mode: "oneshot" });
+    harness.primaryRuntime.runTurn.mockImplementation(async function* () {
+      if (Date.now() < 0) {
+        yield { type: "done" as const };
+      }
+      throw new AcpRuntimeError("ACP_TURN_FAILED", "backend temporarily unavailable");
+    });
+
+    await expect(
+      new AcpSessionManager().runTurn({
+        provenance: "system",
+        cfg: harness.cfg,
+        sessionKey: harness.sessionKey,
+        text: "fresh one-shot fallback",
+        mode: "prompt",
+        requestId: "r-fresh-oneshot-fallback",
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(harness.primaryRuntime.runTurn).toHaveBeenCalledOnce();
+    expect(harness.fallbackRuntime.runTurn).toHaveBeenCalledOnce();
+    expect(harness.primaryRuntime.ensureSession.mock.calls[0]?.[0].resumeSessionId).toBeUndefined();
   });
 
   it("fails over for common rate limit wording before output", async () => {

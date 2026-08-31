@@ -49,6 +49,7 @@ export async function runSetManagerSessionRuntimeMode(
     sessionKey: params.sessionKey,
     agentId: params.agentId,
     meta: resolvedMeta,
+    intent: "runtime-control",
   });
   const capabilities = await resolveManagerRuntimeCapabilities({ runtime, handle });
   if (!capabilities.controls.includes("session/set_mode") || !runtime.setMode) {
@@ -94,6 +95,7 @@ export async function runSetManagerSessionConfigOption(
     sessionKey: params.sessionKey,
     agentId: params.agentId,
     meta: resolvedMeta,
+    intent: "runtime-control",
   });
   const inferredPatch = inferRuntimeOptionPatchFromConfigOption(params.key, params.value);
   const capabilities = await resolveManagerRuntimeCapabilities({
@@ -173,20 +175,24 @@ export async function runResetManagerSessionRuntimeOptions(
     sessionKey: params.sessionKey,
     agentId: params.agentId,
   });
-  requireReadySessionMeta(resolution);
-  const cached = params.runtimeHandles.get(params);
-  if (cached) {
-    await withAcpRuntimeErrorBoundary({
-      run: async () =>
-        await cached.runtime.close({
-          handle: cached.handle,
-          reason: "reset-runtime-options",
-        }),
-      fallbackCode: "ACP_TURN_FAILED",
-      fallbackMessage: "Could not reset ACP runtime options.",
-    });
-    params.runtimeHandles.clear(params);
-  }
+  const resolvedMeta = requireReadySessionMeta(resolution);
+  const { runtime, handle } = await params.ensureRuntimeHandle({
+    cfg: params.cfg,
+    sessionKey: params.sessionKey,
+    agentId: params.agentId,
+    meta: resolvedMeta,
+    intent: "runtime-control",
+  });
+  await withAcpRuntimeErrorBoundary({
+    run: async () =>
+      await runtime.close({
+        handle,
+        reason: "reset-runtime-options",
+      }),
+    fallbackCode: "ACP_TURN_FAILED",
+    fallbackMessage: "Could not reset ACP runtime options.",
+  });
+  params.runtimeHandles.clear(params);
   await persistManagerRuntimeOptions({
     ...params,
     options: {},

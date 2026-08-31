@@ -4,6 +4,7 @@ import type { AcpRuntimeStatus } from "@openclaw/acp-core/runtime/types";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { withAcpRuntimeErrorBoundary } from "../runtime/errors.js";
 import { resolveManagerRuntimeCapabilities } from "./manager.runtime-controls.js";
+import { resolveDurableAcpOneShotResume } from "../session-resume.js";
 import type {
   AcpSessionStatus,
   EnsureManagerRuntimeHandle,
@@ -31,6 +32,26 @@ export async function runManagerGetSessionStatus(params: {
     agentId: params.agentId,
   });
   const resolvedMeta = requireReadySessionMeta(resolution);
+  if (
+    resolveDurableAcpOneShotResume({
+      meta: resolvedMeta,
+      backend: resolvedMeta.backend,
+    })
+  ) {
+    const identity = resolveSessionIdentityFromMeta(resolvedMeta);
+    return {
+      sessionKey: params.sessionKey,
+      backend: resolvedMeta.backend,
+      agent: resolvedMeta.agent,
+      ...(identity ? { identity } : {}),
+      state: resolvedMeta.state,
+      mode: resolvedMeta.mode,
+      runtimeOptions: resolveRuntimeOptionsFromMeta(resolvedMeta),
+      capabilities: { controls: [] },
+      lastActivityAt: resolvedMeta.lastActivityAt,
+      lastError: resolvedMeta.lastError,
+    };
+  }
   const {
     runtime,
     handle: ensuredHandle,
@@ -40,6 +61,7 @@ export async function runManagerGetSessionStatus(params: {
     sessionKey: params.sessionKey,
     agentId: params.agentId,
     meta: resolvedMeta,
+    intent: "observation",
   });
   let handle = ensuredHandle;
   const capabilities = await resolveManagerRuntimeCapabilities({ runtime, handle });
