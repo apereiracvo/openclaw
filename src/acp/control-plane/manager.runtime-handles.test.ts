@@ -701,7 +701,7 @@ describe("AcpSessionManager runtime handles", () => {
     expect(persisted.currentMeta.identity).toEqual(sourceIdentity);
   });
 
-  it("prefers the persisted agent session id when reopening an ACP runtime after restart", async () => {
+  it("prefers the persisted ACP protocol session id when reopening after restart", async () => {
     const runtimeState = createRuntime();
     hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
       id: "acpx",
@@ -741,7 +741,7 @@ describe("AcpSessionManager runtime handles", () => {
     expectRecordFields(mockCallArg(runtimeState.ensureSession), {
       sessionKey,
       agent: "gemini",
-      resumeSessionId: "gemini-sid-1",
+      resumeSessionId: "acpx-sid-1",
     });
   });
 
@@ -986,7 +986,7 @@ describe("AcpSessionManager runtime handles", () => {
     expectRecordFields(mockCallArg(runtimeState.ensureSession), {
       sessionKey,
       agent: "codex",
-      resumeSessionId: "agent-sid-stale",
+      resumeSessionId: "acpx-sid-stale",
     });
     const retryInput = mockCallArg(runtimeState.ensureSession, 1);
     expect(retryInput.resumeSessionId).toBeUndefined();

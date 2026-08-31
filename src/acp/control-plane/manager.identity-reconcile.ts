@@ -14,10 +14,82 @@ import type {
 } from "@openclaw/acp-core/runtime/types";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
-import { withAcpRuntimeErrorBoundary } from "../runtime/errors.js";
+import { AcpRuntimeError, withAcpRuntimeErrorBoundary } from "../runtime/errors.js";
+import {
+  isSameAcpSessionIdentityGeneration,
+  resolveAcpOneShotReadinessTarget,
+} from "../session-resume.js";
 import { isAcpOwnerRepairRequired } from "./manager.runtime-owner.js";
 import type { AcpSessionTarget, SessionAcpMeta, SessionEntry } from "./manager.types.js";
 import { hasLegacyAcpIdentityProjection } from "./manager.utils.js";
+
+const ACP_FINAL_STATUS_TIMEOUT_MS = 5_000;
+const ACP_FINAL_STATUS_TIMEOUT_DETAIL_CODE = "FINAL_STATUS_TIMEOUT";
+
+function applyIdentityToRuntimeHandle(
+  handle: AcpRuntimeHandle,
+  identity: ReturnType<typeof resolveSessionIdentityFromMeta>,
+): AcpRuntimeHandle {
+  const identifiers = resolveRuntimeHandleIdentifiersFromIdentity(identity);
+  if (
+    identifiers.backendSessionId === handle.backendSessionId &&
+    identifiers.agentSessionId === handle.agentSessionId
+  ) {
+    return handle;
+  }
+  return {
+    ...handle,
+    ...(identifiers.backendSessionId ? { backendSessionId: identifiers.backendSessionId } : {}),
+    ...(identifiers.agentSessionId ? { agentSessionId: identifiers.agentSessionId } : {}),
+  };
+}
+
+async function readBoundedManagerRuntimeStatus(params: {
+  sessionKey: string;
+  runtime: AcpRuntime;
+  handle: AcpRuntimeHandle;
+}): Promise<AcpRuntimeStatus> {
+  const controller = new AbortController();
+  const statusPromise = params.runtime.getStatus!({
+    handle: params.handle,
+    signal: controller.signal,
+  }).then(
+    (status) => ({ kind: "value" as const, status }),
+    (error: unknown) => ({ kind: "error" as const, error }),
+  );
+  const timeoutToken = Symbol("acp-final-status-timeout");
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<typeof timeoutToken>((resolve) => {
+    timer = setTimeout(() => resolve(timeoutToken), ACP_FINAL_STATUS_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  try {
+    const outcome = await Promise.race([statusPromise, timeoutPromise]);
+    if (outcome === timeoutToken) {
+      controller.abort();
+      void statusPromise.then((lateOutcome) => {
+        if (lateOutcome.kind === "error") {
+          logVerbose(
+            `acp-manager: detached late final status error for ${params.sessionKey}: ${String(lateOutcome.error)}`,
+          );
+        }
+      });
+      throw new AcpRuntimeError(
+        "ACP_TURN_FAILED",
+        "ACP final runtime status reconciliation timed out.",
+        { detailCode: ACP_FINAL_STATUS_TIMEOUT_DETAIL_CODE },
+      );
+    }
+    if (outcome.kind === "error") {
+      throw outcome.error;
+    }
+    return outcome.status;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
 
 /** Reconciles runtime-reported session identifiers into persisted ACP session metadata. */
 export async function reconcileManagerRuntimeSessionIdentifiers(params: {
@@ -50,9 +122,15 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
     try {
       runtimeStatus = await withAcpRuntimeErrorBoundary({
         run: async () =>
-          await params.runtime.getStatus!({
-            handle: params.handle,
-          }),
+          params.failOnStatusError
+            ? await readBoundedManagerRuntimeStatus({
+                sessionKey: params.sessionKey,
+                runtime: params.runtime,
+                handle: params.handle,
+              })
+            : await params.runtime.getStatus!({
+                handle: params.handle,
+              }),
         fallbackCode: "ACP_TURN_FAILED",
         fallbackMessage: "Could not read ACP runtime status.",
       });
@@ -72,109 +150,130 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
   }
 
   const now = Date.now();
-  const currentIdentity = resolveSessionIdentityFromMeta(params.meta);
+  const expectedIdentity = resolveSessionIdentityFromMeta(params.meta);
   const eventIdentity = createIdentityFromHandleEvent({
     handle: params.handle,
     now,
   });
-  const identityAfterEvent =
+  const statusIdentity = createIdentityFromStatus({
+    status: runtimeStatus,
+    now,
+  });
+  const identityAfterExpectedEvent =
     mergeSessionIdentity({
-      current: currentIdentity,
+      current: expectedIdentity,
       incoming: eventIdentity,
       now,
-    }) ?? currentIdentity;
-  const nextIdentity =
+    }) ?? expectedIdentity;
+  const observedIdentity =
     mergeSessionIdentity({
-      current: identityAfterEvent,
-      incoming: createIdentityFromStatus({
-        status: runtimeStatus,
-        now,
-      }),
+      current: identityAfterExpectedEvent,
+      incoming: statusIdentity,
       now,
-    }) ?? identityAfterEvent;
-  const handleIdentifiers = resolveRuntimeHandleIdentifiersFromIdentity(nextIdentity);
-  const handleChanged =
-    handleIdentifiers.backendSessionId !== params.handle.backendSessionId ||
-    handleIdentifiers.agentSessionId !== params.handle.agentSessionId;
-  const nextHandle: AcpRuntimeHandle = handleChanged
-    ? {
-        ...params.handle,
-        ...(handleIdentifiers.backendSessionId
-          ? { backendSessionId: handleIdentifiers.backendSessionId }
-          : {}),
-        ...(handleIdentifiers.agentSessionId
-          ? { agentSessionId: handleIdentifiers.agentSessionId }
-          : {}),
-      }
-    : params.handle;
-  if (handleChanged) {
-    params.setCachedHandle(params, nextHandle);
-  }
-
-  const metaChanged =
-    !identityEquals(currentIdentity, nextIdentity) || hasLegacyAcpIdentityProjection(params.meta);
-  if (!metaChanged) {
+    }) ?? identityAfterExpectedEvent;
+  const observationChanged =
+    !identityEquals(expectedIdentity, observedIdentity) ||
+    hasLegacyAcpIdentityProjection(params.meta);
+  const mustFenceReadinessGeneration =
+    params.failOnStatusError &&
+    resolveAcpOneShotReadinessTarget({
+      meta: params.meta,
+      backend: params.handle.backend || params.meta.backend,
+      terminal: { status: "completed", cancelled: false },
+    }) !== undefined;
+  if (!observationChanged && !mustFenceReadinessGeneration) {
+    const nextHandle = applyIdentityToRuntimeHandle(params.handle, expectedIdentity);
+    if (nextHandle !== params.handle) {
+      params.setCachedHandle(params, nextHandle);
+    }
     return {
       handle: nextHandle,
       meta: params.meta,
       runtimeStatus,
     };
   }
-  const nextMeta: SessionAcpMeta = {
-    backend: params.meta.backend,
-    agent: params.meta.agent,
-    runtimeSessionName: params.meta.runtimeSessionName,
-    ...(nextIdentity ? { identity: nextIdentity } : {}),
-    mode: params.meta.mode,
-    ...(params.meta.runtimeOptions ? { runtimeOptions: params.meta.runtimeOptions } : {}),
-    ...(params.meta.cwd ? { cwd: params.meta.cwd } : {}),
-    lastActivityAt: now,
-    state: params.meta.state,
-    ...(params.meta.lastError ? { lastError: params.meta.lastError } : {}),
-  };
-  if (!identityEquals(currentIdentity, nextIdentity)) {
-    const currentAgentSessionId = currentIdentity?.agentSessionId ?? "<none>";
-    const nextAgentSessionId = nextIdentity?.agentSessionId ?? "<none>";
-    const currentAcpxSessionId = currentIdentity?.acpxSessionId ?? "<none>";
-    const nextAcpxSessionId = nextIdentity?.acpxSessionId ?? "<none>";
-    const currentAcpxRecordId = currentIdentity?.acpxRecordId ?? "<none>";
-    const nextAcpxRecordId = nextIdentity?.acpxRecordId ?? "<none>";
-    logVerbose(
-      `acp-manager: session identity updated for ${params.sessionKey} ` +
-        `(agentSessionId ${currentAgentSessionId} -> ${nextAgentSessionId}, ` +
-        `acpxSessionId ${currentAcpxSessionId} -> ${nextAcpxSessionId}, ` +
-        `acpxRecordId ${currentAcpxRecordId} -> ${nextAcpxRecordId})`,
-    );
-  }
-  await params.writeSessionMeta({
+  let generationRejected = false;
+  const persisted = await params.writeSessionMeta({
     cfg: params.cfg,
     sessionKey: params.sessionKey,
     agentId: params.agentId,
     mutate: (current, entry) => {
-      if (!entry) {
+      if (!entry || !current) {
         return null;
       }
-      const base = current;
-      if (!base) {
-        return null;
+      const sameGeneration = isSameAcpSessionIdentityGeneration({
+        expected: params.meta,
+        current,
+      });
+      const currentIdentity = resolveSessionIdentityFromMeta(current);
+      const generationChanged = expectedIdentity
+        ? !sameGeneration
+        : current.backend !== params.meta.backend || currentIdentity !== undefined;
+      if (generationChanged) {
+        if (params.failOnStatusError && params.meta.mode === "oneshot") {
+          generationRejected = true;
+          return undefined;
+        }
+        return current;
+      }
+      const identityAfterEvent =
+        mergeSessionIdentity({
+          current: currentIdentity,
+          incoming: eventIdentity,
+          now,
+        }) ?? currentIdentity;
+      const nextIdentity =
+        mergeSessionIdentity({
+          current: identityAfterEvent,
+          incoming: statusIdentity,
+          now,
+        }) ?? identityAfterEvent;
+      if (
+        identityEquals(currentIdentity, nextIdentity) &&
+        !hasLegacyAcpIdentityProjection(current)
+      ) {
+        return current;
       }
       return {
-        backend: base.backend,
-        agent: base.agent,
-        runtimeSessionName: base.runtimeSessionName,
+        backend: current.backend,
+        agent: current.agent,
+        runtimeSessionName: current.runtimeSessionName,
         ...(nextIdentity ? { identity: nextIdentity } : {}),
-        mode: base.mode,
-        ...(base.runtimeOptions ? { runtimeOptions: base.runtimeOptions } : {}),
-        ...(base.cwd ? { cwd: base.cwd } : {}),
-        state: base.state,
+        mode: current.mode,
+        ...(current.runtimeOptions ? { runtimeOptions: current.runtimeOptions } : {}),
+        ...(current.cwd ? { cwd: current.cwd } : {}),
+        state: current.state,
         lastActivityAt: now,
-        ...(base.lastError ? { lastError: base.lastError } : {}),
+        ...(current.lastError ? { lastError: current.lastError } : {}),
       };
     },
+    failOnError: params.failOnStatusError,
   });
+  const persistedMeta = persisted?.acp;
+  if (
+    params.failOnStatusError &&
+    params.meta.mode === "oneshot" &&
+    (!persistedMeta || generationRejected)
+  ) {
+    throw new AcpRuntimeError(
+      "ACP_TURN_FAILED",
+      generationRejected
+        ? "ACP session identity changed before completed-turn reconciliation could be persisted."
+        : "Could not persist reconciled ACP runtime identity after the completed turn.",
+    );
+  }
+  const actualMeta = persistedMeta ?? params.meta;
+  const actualIdentity = resolveSessionIdentityFromMeta(actualMeta);
+  const nextHandle = applyIdentityToRuntimeHandle(params.handle, actualIdentity);
+  if (nextHandle !== params.handle) {
+    params.setCachedHandle(params, nextHandle);
+  }
+  if (!identityEquals(expectedIdentity, actualIdentity)) {
+    logVerbose(`acp-manager: session identity updated for ${params.sessionKey}`);
+  }
   return {
     handle: nextHandle,
-    meta: nextMeta,
+    meta: actualMeta,
     runtimeStatus,
   };
 }

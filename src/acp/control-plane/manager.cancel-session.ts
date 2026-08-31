@@ -84,6 +84,7 @@ export async function runManagerCancelSession(params: {
       sessionKey: params.sessionKey,
       agentId: params.agentId,
       meta: resolvedMeta,
+      intent: "runtime-control",
     });
     try {
       await cancelRuntimeHandle({

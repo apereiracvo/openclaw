@@ -43,6 +43,7 @@ import {
   type AcpStartupIdentityReconcileResult,
   type ActiveTurnState,
   DEFAULT_DEPS,
+  type EnsureManagerRuntimeHandleIntent,
   type SessionAcpMeta,
   type SessionEntry,
   type TurnLatencyStats,
@@ -351,6 +352,7 @@ export class AcpSessionManager {
     sessionKey: string;
     agentId: string;
     meta: SessionAcpMeta;
+    intent: EnsureManagerRuntimeHandleIntent;
     selectedBackend?: string;
   }): Promise<{ runtime: AcpRuntime; handle: AcpRuntimeHandle; meta: SessionAcpMeta }> {
     return await ensureManagerRuntimeHandle({
