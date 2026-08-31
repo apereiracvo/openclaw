@@ -181,6 +181,12 @@ function createOpenClawTools(options?: {
     agentId?: string;
     cfg?: OpenClawConfig;
   }) => SessionAcpMeta | undefined;
+  isAcpChildSessionOwnedBy?: (params: {
+    childSessionKey: string;
+    callerOwnerKey: string;
+    callerAgentId?: string;
+    config?: OpenClawConfig;
+  }) => boolean;
 }) {
   // Sessions tests exercise the related tools as a small local bundle.
   const config = options?.config ?? TEST_CONFIG;
@@ -212,6 +218,7 @@ function createOpenClawTools(options?: {
       callGateway: gatewayCall,
       isAcpTurnActive: options?.isAcpTurnActive,
       readAcpSessionMeta: options?.readAcpSessionMeta,
+      isAcpChildSessionOwnedBy: options?.isAcpChildSessionOwnedBy,
     }),
   ];
 }
@@ -2444,6 +2451,7 @@ describe("sessions tools", () => {
     const tool = getSessionTool("sessions_send", {
       agentSessionKey: requesterKey,
       agentChannel: "discord",
+      isAcpChildSessionOwnedBy: () => false,
     });
 
     const waited = await tool.execute("call-parent-owned-native-subagent", {
@@ -2682,6 +2690,56 @@ describe("sessions tools", () => {
     expect(callGatewayMock.mock.calls.some(([call]) => call.method === "agent")).toBe(false);
   });
 
+  it("sessions_send fails closed for its task-owned ACP child after production persistence removes embedded and durable metadata", async () => {
+    const requesterKey = "agent:main:discord:direct:task-owner";
+    const targetKey = "agent:main:subagent:task-owned-acp-child";
+    loadSessionEntryByKeyMock.mockReturnValue({
+      sessionId: "task-owned-child-session",
+      updatedAt: 1,
+      spawnedBy: requesterKey,
+      parentSessionKey: requesterKey,
+    });
+    const ownershipLookups: Array<{
+      childSessionKey: string;
+      callerOwnerKey: string;
+      callerAgentId?: string;
+      config?: OpenClawConfig;
+    }> = [];
+    const tool = getSessionTool("sessions_send", {
+      agentSessionKey: requesterKey,
+      agentChannel: "discord",
+      readAcpSessionMeta: () => undefined,
+      isAcpChildSessionOwnedBy: (params) => {
+        ownershipLookups.push(params);
+        return params.childSessionKey === targetKey && params.callerOwnerKey === requesterKey;
+      },
+    });
+
+    const result = await tool.execute("call-task-owned-missing-meta", {
+      sessionKey: targetKey,
+      message: "continue",
+      timeoutSeconds: 15,
+    });
+
+    expect(sessionsSendDetails(result.details)).toMatchObject({
+      status: "error",
+      sessionKey: targetKey,
+    });
+    expect(sessionsSendDetails(result.details).error).toContain(
+      "authoritative durable ACP metadata is missing",
+    );
+    expect(ownershipLookups).toEqual([
+      {
+        childSessionKey: targetKey,
+        callerOwnerKey: requesterKey,
+        callerAgentId: "main",
+        config: TEST_CONFIG,
+      },
+    ]);
+    expect(callGatewayMock.mock.calls.some(([call]) => call.method === "chat.history")).toBe(false);
+    expect(callGatewayMock.mock.calls.some(([call]) => call.method === "agent")).toBe(false);
+  });
+
   it.each([
     { name: "missing durable metadata", meta: undefined },
     {
@@ -2767,17 +2825,15 @@ describe("sessions tools", () => {
     expect(callGatewayMock.mock.calls.some(([call]) => call.method === "agent")).toBe(false);
   });
 
-  it("sessions_send leaves unrelated authorized ACP senders on the existing A2A path", async () => {
+  it("sessions_send leaves an unrelated authorized sender on A2A when an ACP task belongs to another owner and metadata is absent", async () => {
     const ownerKey = "agent:main:discord:direct:owner";
     const requesterKey = "agent:main:discord:direct:peer";
     const targetKey = "agent:main:subagent:acp-child";
-    const unsupportedAcp = durableOneShotAcpMeta({}, { sessionResumeSupported: false });
     loadSessionEntryByKeyMock.mockReturnValue({
       sessionId: "child-session",
       updatedAt: 1,
       spawnedBy: ownerKey,
       parentSessionKey: ownerKey,
-      acp: unsupportedAcp,
     });
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string };
@@ -2790,7 +2846,9 @@ describe("sessions tools", () => {
       agentSessionKey: requesterKey,
       agentChannel: "discord",
       isAcpTurnActive: () => true,
-      readAcpSessionMeta: () => unsupportedAcp,
+      readAcpSessionMeta: () => undefined,
+      // Persisted ACP task ownership is caller-scoped, so the peer cannot see the owner's row.
+      isAcpChildSessionOwnedBy: ({ callerOwnerKey }) => callerOwnerKey === ownerKey,
     });
 
     const result = await tool.execute("call-unrelated-acp", {
