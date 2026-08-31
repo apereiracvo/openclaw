@@ -1,7 +1,7 @@
 /** Process-local active-turn registry for ACP maintenance and recovery decisions. */
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { AcpSessionTarget } from "./manager.types.js";
-import { acpSessionActorKey } from "./manager.utils.js";
+import { acpSessionActorKey, resolveAcpAgentFromSessionKey } from "./manager.utils.js";
 
 // Process-local liveness signal for in-flight ACP prompt turns, kept off the
 // SDK-exported AcpSessionManager so plugins cannot read this maintenance-only
@@ -12,24 +12,102 @@ import { acpSessionActorKey } from "./manager.utils.js";
 
 type AcpActiveTurnState = {
   activeTurnKeys: Map<string, symbol>;
+  admissionsBySession: Map<string, { ownerKey: string; admissionId: string; expiresAt: number }>;
 };
+
+const ACP_TURN_ADMISSION_LEASE_MS = 60_000;
 
 const ACP_ACTIVE_TURN_STATE_KEY = Symbol.for("openclaw.acp.activeTurns");
 
 function getAcpActiveTurnState(): AcpActiveTurnState {
-  return resolveGlobalSingleton<AcpActiveTurnState>(ACP_ACTIVE_TURN_STATE_KEY, () => ({
+  const state = resolveGlobalSingleton<AcpActiveTurnState>(ACP_ACTIVE_TURN_STATE_KEY, () => ({
     activeTurnKeys: new Map<string, symbol>(),
+    admissionsBySession: new Map(),
   }));
+  state.admissionsBySession ??= new Map();
+  return state;
+}
+
+function resolveAcpTurnKey(target: AcpSessionTarget | string): string {
+  if (typeof target === "string") {
+    if (!target) {
+      return "";
+    }
+    return acpSessionActorKey({
+      sessionKey: target,
+      agentId: resolveAcpAgentFromSessionKey(target),
+    });
+  }
+  return target.sessionKey ? acpSessionActorKey(target) : "";
+}
+
+/** Atomically reserves one owner-bound ACP turn admission before Gateway dispatch. */
+export function reserveAcpTurnAdmission(params: {
+  sessionKey: string;
+  ownerKey: string;
+  admissionId: string;
+  now?: number;
+}): boolean {
+  if (!params.sessionKey || !params.ownerKey || !params.admissionId) {
+    return false;
+  }
+  const state = getAcpActiveTurnState();
+  const actorKey = resolveAcpTurnKey(params.sessionKey);
+  const now = params.now ?? Date.now();
+  const existing = state.admissionsBySession.get(actorKey);
+  if (existing && existing.expiresAt <= now) {
+    state.admissionsBySession.delete(actorKey);
+  }
+  if (state.activeTurnKeys.has(actorKey) || state.admissionsBySession.has(actorKey)) {
+    return false;
+  }
+  state.admissionsBySession.set(actorKey, {
+    ownerKey: params.ownerKey,
+    admissionId: params.admissionId,
+    expiresAt: now + ACP_TURN_ADMISSION_LEASE_MS,
+  });
+  return true;
+}
+
+/** Releases an exact owner-bound admission after dispatch fails or is abandoned. */
+export function releaseAcpTurnAdmission(params: {
+  sessionKey: string;
+  ownerKey: string;
+  admissionId: string;
+}): void {
+  if (!params.sessionKey || !params.ownerKey || !params.admissionId) {
+    return;
+  }
+  const state = getAcpActiveTurnState();
+  const actorKey = resolveAcpTurnKey(params.sessionKey);
+  const existing = state.admissionsBySession.get(actorKey);
+  if (existing?.ownerKey === params.ownerKey && existing.admissionId === params.admissionId) {
+    state.admissionsBySession.delete(actorKey);
+  }
 }
 
 /** Registers the current turn and returns its ownership-checked release callback. */
-export function markAcpTurnActive(target: AcpSessionTarget): (() => void) | undefined {
-  if (!target.sessionKey) {
+export function markAcpTurnActive(
+  target: AcpSessionTarget,
+  admissionId?: string,
+): (() => void) | undefined;
+export function markAcpTurnActive(
+  sessionKey: string,
+  admissionId?: string,
+): (() => void) | undefined;
+export function markAcpTurnActive(
+  target: AcpSessionTarget | string,
+  admissionId?: string,
+): (() => void) | undefined {
+  const actorKey = resolveAcpTurnKey(target);
+  if (!actorKey) {
     return undefined;
   }
-  const actorKey = acpSessionActorKey(target);
-  const owner = Symbol("acp-active-turn");
   const state = getAcpActiveTurnState();
+  if (admissionId && state.admissionsBySession.get(actorKey)?.admissionId === admissionId) {
+    state.admissionsBySession.delete(actorKey);
+  }
+  const owner = Symbol("acp-active-turn");
   state.activeTurnKeys.set(actorKey, owner);
   return () => {
     if (state.activeTurnKeys.get(actorKey) === owner) {
@@ -38,10 +116,20 @@ export function markAcpTurnActive(target: AcpSessionTarget): (() => void) | unde
   };
 }
 
-/** Returns whether the process currently owns an in-flight ACP turn for a session. */
-export function isAcpTurnActive(target: AcpSessionTarget): boolean {
-  if (!target.sessionKey) {
-    return false;
+/** Clears the active-turn marker for a session. */
+export function clearAcpTurnActive(target: AcpSessionTarget): void;
+export function clearAcpTurnActive(sessionKey: string): void;
+export function clearAcpTurnActive(target: AcpSessionTarget | string): void {
+  const actorKey = resolveAcpTurnKey(target);
+  if (actorKey) {
+    getAcpActiveTurnState().activeTurnKeys.delete(actorKey);
   }
-  return getAcpActiveTurnState().activeTurnKeys.has(acpSessionActorKey(target));
+}
+
+/** Returns whether the process currently owns an in-flight ACP turn for a session. */
+export function isAcpTurnActive(target: AcpSessionTarget): boolean;
+export function isAcpTurnActive(sessionKey: string): boolean;
+export function isAcpTurnActive(target: AcpSessionTarget | string): boolean {
+  const actorKey = resolveAcpTurnKey(target);
+  return Boolean(actorKey) && getAcpActiveTurnState().activeTurnKeys.has(actorKey);
 }

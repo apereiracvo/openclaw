@@ -300,7 +300,7 @@ export async function runManagerTurn(params: {
     throw errorToRecord;
   };
 
-  const releaseActiveTurn = taskContext ? markAcpTurnActive(params) : undefined;
+  const releaseActiveTurn = taskContext ? markAcpTurnActive(params, input.requestId) : undefined;
   // Liveness spans the whole task, not one attempt: mark once before the backend loop
   // (after the ready-meta check, so a pre-loop throw cannot leak it) and clear on every
   // runTurn exit, including unexpected retry/cleanup failures before terminal task writes.

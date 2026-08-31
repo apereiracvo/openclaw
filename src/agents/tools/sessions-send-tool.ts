@@ -8,7 +8,14 @@ import { isRequesterParentOfBackgroundAcpSession } from "@openclaw/acp-core/sess
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { Type } from "typebox";
+import {
+  isAcpTurnActive,
+  releaseAcpTurnAdmission,
+  reserveAcpTurnAdmission,
+} from "../../acp/control-plane/active-turns.js";
 import { readAcpSessionMetaForEntry } from "../../acp/runtime/session-meta-readonly.js";
+import type { readAcpSessionMeta } from "../../acp/runtime/session-meta.js";
+import { resolveDurableAcpOneShotResume } from "../../acp/session-resume.js";
 import { tryResolveLegacyCompatibilityAgentId } from "../../config/legacy.default-agent-owner.js";
 import { resolvePersistedSessionStoreOwnerForKey } from "../../config/sessions/session-store-owner.js";
 import { parseSessionThreadInfo } from "../../config/sessions/thread-info.js";
@@ -319,6 +326,11 @@ export function createSessionsSendTool(opts?: {
   /** Backend-owned downstream operation id; never sourced from model arguments. */
   idempotencyKey?: string;
   signal?: AbortSignal;
+  /** Test seams for process-local ACP one-shot follow-up admission. */
+  isAcpTurnActive?: typeof isAcpTurnActive;
+  reserveAcpTurnAdmission?: typeof reserveAcpTurnAdmission;
+  releaseAcpTurnAdmission?: typeof releaseAcpTurnAdmission;
+  readAcpSessionMeta?: typeof readAcpSessionMeta;
 }): AnyAgentTool {
   return {
     label: "Session Send",
@@ -872,12 +884,18 @@ export function createSessionsSendTool(opts?: {
             projection: "full",
           });
           const targetSessionEntry = targetSession.store[targetSession.canonicalKey];
-          const targetAcpMeta = readAcpSessionMetaForEntry({
-            sessionKey: targetSession.canonicalKey,
-            agentId: targetSession.agentId,
-            cfg,
-            entry: targetSessionEntry,
-          });
+          const targetAcpMeta = opts?.readAcpSessionMeta
+            ? opts.readAcpSessionMeta({
+                sessionKey: targetSession.canonicalKey,
+                agentId: targetSession.agentId,
+                cfg,
+              })
+            : readAcpSessionMetaForEntry({
+                sessionKey: targetSession.canonicalKey,
+                agentId: targetSession.agentId,
+                cfg,
+                entry: targetSessionEntry,
+              });
           const targetIsSubagent = isSubagentSessionFromEntry(
             targetSession.canonicalKey,
             targetSessionEntry,
@@ -994,6 +1012,69 @@ export function createSessionsSendTool(opts?: {
                 ? "one-way"
                 : "peer";
 
+          // A verified completed ACP one-shot is owned by its parent. Continuing it
+          // must be serialized against the active turn and the process-local
+          // follow-up admission; the ACP manager consumes the lease on dispatch.
+          const isParentOwnedOneShot =
+            skipTaskReplyFlow &&
+            (targetAcpMeta?.mode === "oneshot" || targetSessionEntry?.acp?.mode === "oneshot");
+          let taskOwnsAcpFollowupDelivery = false;
+          let acpFollowupAdmissionHeld = false;
+          const acpFollowupAdmission = {
+            sessionKey: resolvedKey,
+            ownerKey: effectiveRequesterKey,
+            admissionId: idempotencyKey,
+          };
+          if (isParentOwnedOneShot) {
+            if ((opts?.isAcpTurnActive ?? isAcpTurnActive)(resolvedKey)) {
+              return jsonResult({
+                runId,
+                status: "error",
+                error:
+                  "Cannot continue this ACP one-shot while its current turn is active. Wait for task completion, then retry sessions_send.",
+                sessionKey: displayKey,
+              });
+            }
+            if (
+              !targetAcpMeta ||
+              (targetSessionEntry?.acp?.backend &&
+                targetSessionEntry.acp.backend !== targetAcpMeta.backend) ||
+              !resolveDurableAcpOneShotResume({
+                meta: targetAcpMeta,
+                backend: targetAcpMeta.backend,
+              })
+            ) {
+              return jsonResult({
+                runId,
+                status: "error",
+                error:
+                  "Cannot continue this ACP one-shot because it is not a verified completed resumable session. Legacy, unsupported, unresolved, and not-ready sessions must be replaced with a new ACP run.",
+                sessionKey: displayKey,
+              });
+            }
+            acpFollowupAdmissionHeld = (opts?.reserveAcpTurnAdmission ?? reserveAcpTurnAdmission)(
+              acpFollowupAdmission,
+            );
+            if (!acpFollowupAdmissionHeld) {
+              return jsonResult({
+                runId,
+                status: "error",
+                error:
+                  "Cannot continue this ACP one-shot while its current turn is active or another follow-up is being admitted. Wait for task completion, then retry sessions_send.",
+                sessionKey: displayKey,
+              });
+            }
+            taskOwnsAcpFollowupDelivery = true;
+          }
+
+          const releaseAcpFollowupAdmissionIfHeld = () => {
+            if (!acpFollowupAdmissionHeld) {
+              return;
+            }
+            (opts?.releaseAcpTurnAdmission ?? releaseAcpTurnAdmission)(acpFollowupAdmission);
+            acpFollowupAdmissionHeld = false;
+          };
+
           const start = await startSessionsSendAgentRun({
             cfg,
             callGateway: gatewayCall,
@@ -1015,8 +1096,13 @@ export function createSessionsSendTool(opts?: {
               : {}),
           });
           if (!start.ok) {
+            releaseAcpFollowupAdmissionIfHeld();
             return start.result;
           }
+          // A successful Gateway admission hands the lease to the ACP manager. It
+          // consumes the matching backend-owned request id when marking the turn
+          // active, so there is no inactive/unreserved gap after dispatch.
+          acpFollowupAdmissionHeld = false;
           const acceptedTargetSessionKey = start.a2aSessionKey ?? resolvedKey;
           // Steering keeps its active owner; an inline child reply is already delivered.
           const delayedDelivery = {
@@ -1064,6 +1150,15 @@ export function createSessionsSendTool(opts?: {
           }
           runId = start.runId;
           const watchField = registerWatchIfRequested(acceptedTargetSessionKey);
+          if (taskOwnsAcpFollowupDelivery) {
+            return jsonResult({
+              runId,
+              status: "accepted",
+              sessionKey: displayKey,
+              delivery,
+              ...watchField,
+            });
+          }
           const startReplyFlow = ({
             reply,
             notifyRequesterOnWaitFailure = false,
