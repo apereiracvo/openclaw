@@ -8,7 +8,13 @@ import { isRequesterParentOfBackgroundAcpSession } from "@openclaw/acp-core/sess
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { Type } from "typebox";
+import {
+  isAcpTurnActive,
+  releaseAcpTurnAdmission,
+  reserveAcpTurnAdmission,
+} from "../../acp/control-plane/active-turns.js";
 import { readAcpSessionMeta } from "../../acp/runtime/session-meta.js";
+import { resolveDurableAcpOneShotResume } from "../../acp/session-resume.js";
 import { tryResolveLegacyCompatibilityAgentId } from "../../config/legacy.default-agent-owner.js";
 import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { resolvePersistedSessionStoreOwnerForKey } from "../../config/sessions/session-store-owner.js";
@@ -508,6 +514,13 @@ export function createSessionsSendTool(opts?: {
   /** Backend-owned downstream operation id; never sourced from model arguments. */
   idempotencyKey?: string;
   signal?: AbortSignal;
+  /** Test seam for process-local ACP liveness. */
+  isAcpTurnActive?: typeof isAcpTurnActive;
+  /** Test seams for process-local ACP follow-up admission. */
+  reserveAcpTurnAdmission?: typeof reserveAcpTurnAdmission;
+  releaseAcpTurnAdmission?: typeof releaseAcpTurnAdmission;
+  /** Test seam for durable ACP metadata. */
+  readAcpSessionMeta?: typeof readAcpSessionMeta;
 }): AnyAgentTool {
   return {
     label: "Session Send",
@@ -998,6 +1011,80 @@ export function createSessionsSendTool(opts?: {
               ? resolveCronRunScopedFallbackSessionKey(displayKey)
               : undefined;
 
+          const targetSessionEntry = loadSessionEntryByKey(resolvedKey, targetAgentId);
+          const targetAcpMeta = (opts?.readAcpSessionMeta ?? readAcpSessionMeta)({
+            sessionKey: resolvedKey,
+            agentId: targetAgentId,
+            cfg,
+          });
+          const targetSessionEntryWithAcp =
+            targetAcpMeta && targetSessionEntry
+              ? { ...targetSessionEntry, acp: targetAcpMeta }
+              : targetSessionEntry;
+          const skipAcpA2AFlow = isRequesterParentOfBackgroundAcpSession(
+            targetSessionEntryWithAcp,
+            effectiveRequesterKey,
+          );
+          const isParentOwnedOneShot =
+            skipAcpA2AFlow &&
+            (targetAcpMeta?.mode === "oneshot" || targetSessionEntry?.acp?.mode === "oneshot");
+          let taskOwnsAcpFollowupDelivery = false;
+          let acpFollowupAdmissionHeld = false;
+          const acpFollowupAdmission = {
+            sessionKey: resolvedKey,
+            ownerKey: effectiveRequesterKey,
+            admissionId: idempotencyKey,
+          };
+          if (isParentOwnedOneShot) {
+            if ((opts?.isAcpTurnActive ?? isAcpTurnActive)(resolvedKey)) {
+              return jsonResult({
+                runId,
+                status: "error",
+                error:
+                  "Cannot continue this ACP one-shot while its current turn is active. Wait for task completion, then retry sessions_send.",
+                sessionKey: displayKey,
+              });
+            }
+            if (
+              !targetAcpMeta ||
+              (targetSessionEntry?.acp?.backend &&
+                targetSessionEntry.acp.backend !== targetAcpMeta.backend) ||
+              !resolveDurableAcpOneShotResume({
+                meta: targetAcpMeta,
+                backend: targetAcpMeta.backend,
+              })
+            ) {
+              return jsonResult({
+                runId,
+                status: "error",
+                error:
+                  "Cannot continue this ACP one-shot because it is not a verified completed resumable session. Legacy, unsupported, unresolved, and not-ready sessions must be replaced with a new ACP run.",
+                sessionKey: displayKey,
+              });
+            }
+            acpFollowupAdmissionHeld = (opts?.reserveAcpTurnAdmission ?? reserveAcpTurnAdmission)(
+              acpFollowupAdmission,
+            );
+            if (!acpFollowupAdmissionHeld) {
+              return jsonResult({
+                runId,
+                status: "error",
+                error:
+                  "Cannot continue this ACP one-shot while its current turn is active or another follow-up is being admitted. Wait for task completion, then retry sessions_send.",
+                sessionKey: displayKey,
+              });
+            }
+            taskOwnsAcpFollowupDelivery = true;
+          }
+
+          const releaseAcpFollowupAdmissionIfHeld = () => {
+            if (!acpFollowupAdmissionHeld) {
+              return;
+            }
+            (opts?.releaseAcpTurnAdmission ?? releaseAcpTurnAdmission)(acpFollowupAdmission);
+            acpFollowupAdmissionHeld = false;
+          };
+
           // Capture the pre-run assistant snapshot before starting the nested run.
           // Fast in-process test doubles and short-circuit agent paths can finish
           // before we reach the post-run read, which would otherwise make the new
@@ -1006,7 +1093,7 @@ export function createSessionsSendTool(opts?: {
           // A2A follow-up may deliver directly to the source channel. Isolated cron
           // requesters also need it to avoid attributing a stale target reply.
           const baselineReply =
-            timeoutSeconds !== 0
+            timeoutSeconds !== 0 && !taskOwnsAcpFollowupDelivery
               ? await readLatestAssistantReplySnapshot({
                   sessionKey: resolvedKey,
                   agentId: targetAgentId,
@@ -1074,20 +1161,6 @@ export function createSessionsSendTool(opts?: {
           // unrelated sender that can see the same target (e.g. under
           // `tools.sessions.visibility=all`) must still go through the normal A2A
           // path so it actually receives a follow-up delivery.
-          const targetSessionEntry = loadSessionEntryByKey(resolvedKey, targetAgentId);
-          const targetAcpMeta = readAcpSessionMeta({
-            sessionKey: resolvedKey,
-            agentId: targetAgentId,
-            cfg,
-          });
-          const targetSessionEntryWithAcp =
-            targetAcpMeta && targetSessionEntry
-              ? { ...targetSessionEntry, acp: targetAcpMeta }
-              : targetSessionEntry;
-          const skipAcpA2AFlow = isRequesterParentOfBackgroundAcpSession(
-            targetSessionEntryWithAcp,
-            effectiveRequesterKey,
-          );
           const skipNativeParentA2AFlow =
             timeoutSeconds !== 0 &&
             isRequesterParentOfNativeSubagentSession({
@@ -1166,8 +1239,13 @@ export function createSessionsSendTool(opts?: {
               : {}),
           });
           if (!start.ok) {
+            releaseAcpFollowupAdmissionIfHeld();
             return start.result;
           }
+          // A successful Gateway admission hands the lease to the ACP manager. It
+          // consumes the matching backend-owned request id when marking the turn
+          // active, so there is no inactive/unreserved gap after dispatch.
+          acpFollowupAdmissionHeld = false;
           const acceptedTargetSessionKey = start.a2aSessionKey ?? resolvedKey;
           // Active-run steering is consumed by the current turn and does not
           // launch the detached A2A flow. Report that boundary directly so the
@@ -1192,6 +1270,15 @@ export function createSessionsSendTool(opts?: {
           });
           runId = start.runId;
           const watchField = registerWatchIfRequested(acceptedTargetSessionKey);
+          if (taskOwnsAcpFollowupDelivery) {
+            return jsonResult({
+              runId,
+              status: "accepted",
+              sessionKey: displayKey,
+              delivery,
+              ...watchField,
+            });
+          }
           if (timeoutSeconds === 0) {
             if (start.targetDisposition !== "steered") {
               startA2AFlow(undefined, runId, start.a2aSessionKey, start.a2aDisplayKey, true);
