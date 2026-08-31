@@ -350,7 +350,10 @@ export class AcpSessionManager {
     });
   }
 
-  async closeSession(input: AcpCloseSessionInput): Promise<AcpCloseSessionResult> {
+  async closeSession(
+    input: AcpCloseSessionInput,
+    revalidate?: () => boolean,
+  ): Promise<AcpCloseSessionResult> {
     const sessionKey = canonicalizeAcpSessionKey({
       cfg: input.cfg,
       sessionKey: input.sessionKey,
@@ -358,19 +361,25 @@ export class AcpSessionManager {
     if (!sessionKey) {
       throw new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP session key is required.");
     }
-    return await this.withSessionActor(
-      sessionKey,
-      async () =>
-        await runManagerCloseSession({
-          input,
-          sessionKey,
-          deps: this.deps,
-          runtimeHandles: this.runtimeHandles,
-          resolveSession: this.resolveSession.bind(this),
-          ensureRuntimeHandle: this.ensureRuntimeHandle.bind(this),
-          writeSessionMeta: this.writeSessionMeta.bind(this),
-        }),
-    );
+    return await this.withSessionActor(sessionKey, async () => {
+      // The actor wait may admit queued work. Recheck cleanup authority only
+      // after that wait, immediately before the destructive close boundary.
+      if (revalidate && !revalidate()) {
+        return {
+          runtimeClosed: false,
+          metaCleared: false,
+        };
+      }
+      return await runManagerCloseSession({
+        input,
+        sessionKey,
+        deps: this.deps,
+        runtimeHandles: this.runtimeHandles,
+        resolveSession: this.resolveSession.bind(this),
+        ensureRuntimeHandle: this.ensureRuntimeHandle.bind(this),
+        writeSessionMeta: this.writeSessionMeta.bind(this),
+      });
+    });
   }
 
   private async ensureRuntimeHandle(params: {
