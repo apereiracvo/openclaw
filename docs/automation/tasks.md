@@ -384,7 +384,7 @@ A sweeper runs every **60 seconds** (first pass about 5 seconds after gateway st
     Checks whether active tasks still have authoritative runtime backing. ACP tasks require a live in-process turn, subagent tasks use child-session state, automation tasks use active-job ownership plus durable run history, and CLI tasks with run identity use the owning run context. If backing state is gone for more than 5 minutes (30 minutes for childless native subagent tasks), the task is marked `lost`.
   </Step>
   <Step title="ACP session repair">
-    Closes terminal or orphaned parent-owned one-shot ACP sessions, and closes stale terminal or orphaned persistent ACP sessions only when no active conversation binding remains.
+    Retains terminal or orphaned parent-owned one-shot ACP metadata only when the persisted identity proves exact-session resume support and completed-turn readiness. Legacy, active, or otherwise unverified one-shots fail closed and are cleaned up. Stale terminal or orphaned persistent ACP sessions are closed only when no active conversation binding remains.
   </Step>
   <Step title="Cleanup stamping">
     Sets a `cleanupAfter` timestamp on terminal tasks (terminal time + retention window). During retention, lost tasks still appear in audit as warnings; after `cleanupAfter` expires or when cleanup metadata is missing, they become errors.
@@ -396,6 +396,8 @@ A sweeper runs every **60 seconds** (first pass about 5 seconds after gateway st
     Deletes terminal Task Flow records after 7 days. A `blocked` flow is terminal only when it has `endedAt`; resumable managed `blocked` flows remain registered.
   </Step>
 </Steps>
+
+For a retained verified one-shot, only its owning parent can continue the same child through `sessions_send`. The follow-up keeps task-owned completion delivery, including after runtime-handle cache loss or reconstruction by a new manager from isolated persisted state. An explicit continuation failure does not create a fresh ACP session, retry without the resume id, or fall back to another backend. Production restart verification remains an operator-controlled post-promotion check.
 
 <Note>
 **Retention:** terminal task records are kept for **7 days** (`lost` records for **24 hours**), then automatically pruned. No configuration needed.

@@ -62,6 +62,7 @@ import {
   createUserTurnTranscriptRecorder,
 } from "../../sessions/user-turn-transcript.js";
 import { stripFormattedReasoningMessage } from "../../shared/text/formatted-reasoning-message.js";
+import { isAcpChildSessionOwnedBy } from "../../tasks/task-owner-access.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
 import { listAgentIds, resolveSessionAgentId } from "../agent-scope.js";
 import { resolveActiveEmbeddedRunSessionId } from "../embedded-agent-runner/active-run-projections.js";
@@ -521,6 +522,8 @@ export function createSessionsSendTool(opts?: {
   releaseAcpTurnAdmission?: typeof releaseAcpTurnAdmission;
   /** Test seam for durable ACP metadata. */
   readAcpSessionMeta?: typeof readAcpSessionMeta;
+  /** Test seam for authoritative task-registry ACP child ownership. */
+  isAcpChildSessionOwnedBy?: typeof isAcpChildSessionOwnedBy;
 }): AnyAgentTool {
   return {
     label: "Session Send",
@@ -1021,10 +1024,29 @@ export function createSessionsSendTool(opts?: {
             targetAcpMeta && targetSessionEntry
               ? { ...targetSessionEntry, acp: targetAcpMeta }
               : targetSessionEntry;
-          const skipAcpA2AFlow = isRequesterParentOfBackgroundAcpSession(
-            targetSessionEntryWithAcp,
-            effectiveRequesterKey,
-          );
+          const taskRegistryOwnsAcpChild = (
+            opts?.isAcpChildSessionOwnedBy ?? isAcpChildSessionOwnedBy
+          )({
+            childSessionKey: resolvedKey,
+            callerOwnerKey: effectiveRequesterKey,
+            callerAgentId: requesterAgentId,
+            config: cfg,
+          });
+          const skipAcpA2AFlow =
+            taskRegistryOwnsAcpChild ||
+            isRequesterParentOfBackgroundAcpSession(
+              targetSessionEntryWithAcp,
+              effectiveRequesterKey,
+            );
+          if (taskRegistryOwnsAcpChild && !targetAcpMeta) {
+            return jsonResult({
+              runId,
+              status: "error",
+              error:
+                "Cannot continue this parent-owned ACP session because its authoritative durable ACP metadata is missing. This unverified or legacy session must be replaced with a new ACP run.",
+              sessionKey: displayKey,
+            });
+          }
           const isParentOwnedOneShot =
             skipAcpA2AFlow &&
             (targetAcpMeta?.mode === "oneshot" || targetSessionEntry?.acp?.mode === "oneshot");
