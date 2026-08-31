@@ -6,6 +6,8 @@ import { createAssistantMessageEventStream, type Model } from "openclaw/plugin-s
 import { Value } from "typebox/value";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { clearAcpTurnActive, markAcpTurnActive } from "../acp/control-plane/active-turns.js";
+import { resetAcpActiveTurnsForTests } from "../acp/control-plane/active-turns.test-support.js";
 import {
   configureExecutionDecisionWorkSink,
   type ExecutionDecisionWork,
@@ -18,6 +20,7 @@ import {
   listSessionParticipantsReadOnly,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
+import type { SessionAcpMeta } from "../config/sessions/types.js";
 import { createSessionVisibilityChecker } from "../plugin-sdk/session-visibility.js";
 import {
   GatewayDrainingError,
@@ -172,6 +175,12 @@ function createOpenClawTools(options?: {
   agentChannel?: string;
   sandboxed?: boolean;
   config?: OpenClawConfig;
+  isAcpTurnActive?: (sessionKey: string) => boolean;
+  readAcpSessionMeta?: (params: {
+    sessionKey: string;
+    agentId?: string;
+    cfg?: OpenClawConfig;
+  }) => SessionAcpMeta | undefined;
 }) {
   // Sessions tests exercise the related tools as a small local bundle.
   const config = options?.config ?? TEST_CONFIG;
@@ -201,6 +210,8 @@ function createOpenClawTools(options?: {
       sandboxed: options?.sandboxed,
       config,
       callGateway: gatewayCall,
+      isAcpTurnActive: options?.isAcpTurnActive,
+      readAcpSessionMeta: options?.readAcpSessionMeta,
     }),
   ];
 }
@@ -286,6 +297,31 @@ function expectInterSessionAgentCall(call: { params?: unknown }): void {
 
 function sessionsSendDetails(details: unknown): SessionsSendDetails {
   return details as SessionsSendDetails;
+}
+
+function durableOneShotAcpMeta(
+  overrides: Partial<SessionAcpMeta> = {},
+  identityOverrides: Partial<NonNullable<SessionAcpMeta["identity"]>> = {},
+): SessionAcpMeta {
+  return {
+    backend: "acpx",
+    agent: "opencode",
+    runtimeSessionName: "agent:main:subagent:acp-child:runtime",
+    mode: "oneshot",
+    state: "idle",
+    lastActivityAt: 1,
+    identity: {
+      state: "resolved",
+      source: "status",
+      acpxRecordId: "record-1",
+      acpxSessionId: "acp-session-1",
+      sessionResumeSupported: true,
+      sessionResumeReady: true,
+      lastUpdatedAt: 1,
+      ...identityOverrides,
+    },
+    ...overrides,
+  };
 }
 
 registerAgentSessionLoopTestLifecycle();
@@ -2432,6 +2468,342 @@ describe("sessions tools", () => {
     );
     expect(replyPromptAgentCalls).toStrictEqual([]);
     expect(calls.some((call) => call.method === "send")).toBe(false);
+  });
+
+  it("sessions_send dispatches a verified completed parent-owned ACP one-shot and defers delivery to task completion", async () => {
+    resetAcpActiveTurnsForTests();
+    const calls: Array<{ method?: string; params?: unknown }> = [];
+    const requesterKey = "agent:main:discord:direct:parent";
+    const targetKey = "agent:main:subagent:acp-child";
+    const acp = durableOneShotAcpMeta({ state: "running" });
+    loadSessionEntryByKeyMock.mockReturnValue({
+      sessionId: "child-session",
+      updatedAt: 1,
+      spawnedBy: requesterKey,
+      parentSessionKey: requesterKey,
+      acp,
+      deliveryContext: { channel: "discord", to: "direct:parent" },
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: unknown };
+      calls.push(request);
+      if (request.method === "agent") {
+        const admissionId = (request.params as { idempotencyKey?: string } | undefined)
+          ?.idempotencyKey;
+        markAcpTurnActive(targetKey, admissionId);
+        return { runId: "run-acp-followup", status: "accepted", acceptedAt: 2_000 };
+      }
+      return {};
+    });
+
+    const tool = getSessionTool("sessions_send", {
+      agentSessionKey: requesterKey,
+      agentChannel: "discord",
+      isAcpTurnActive: () => false,
+      readAcpSessionMeta: () => acp,
+    });
+    const result = await tool.execute("call-acp-followup", {
+      sessionKey: targetKey,
+      message: "continue the same conversation",
+      timeoutSeconds: 15,
+    });
+
+    const details = sessionsSendDetails(result.details);
+    expect(details).toMatchObject({
+      runId: "run-acp-followup",
+      status: "accepted",
+      sessionKey: targetKey,
+      delivery: { status: "skipped", mode: "announce" },
+    });
+    const dispatches = calls.filter((call) => call.method === "agent");
+    expect(dispatches).toHaveLength(1);
+    expect(agentParams(dispatches[0]!)).toMatchObject({
+      sessionKey: targetKey,
+      inputProvenance: {
+        kind: "inter_session",
+        sourceSessionKey: "agent:main:main",
+        sourceChannel: "discord",
+        sourceTool: "sessions_send",
+      },
+    });
+    expect(calls.some((call) => call.method === "chat.history")).toBe(false);
+    expect(calls.some((call) => call.method === "agent.wait")).toBe(false);
+    expect(calls.some((call) => call.method === "send")).toBe(false);
+    clearAcpTurnActive(targetKey);
+    resetAcpActiveTurnsForTests();
+  });
+
+  it("sessions_send atomically rejects a concurrent owner follow-up before the first ACP dispatch becomes active", async () => {
+    resetAcpActiveTurnsForTests();
+    const requesterKey = "agent:main:discord:direct:atomic-parent";
+    const targetKey = "agent:main:subagent:atomic-acp-child";
+    const acp = durableOneShotAcpMeta();
+    loadSessionEntryByKeyMock.mockReturnValue({
+      sessionId: "atomic-child-session",
+      updatedAt: 1,
+      spawnedBy: requesterKey,
+      parentSessionKey: requesterKey,
+      acp,
+    });
+    let releaseFirstDispatch!: () => void;
+    const firstDispatchHeld = new Promise<void>((resolve) => {
+      releaseFirstDispatch = resolve;
+    });
+    let notifyFirstDispatch!: () => void;
+    const firstDispatchEntered = new Promise<void>((resolve) => {
+      notifyFirstDispatch = resolve;
+    });
+    let agentDispatches = 0;
+    let firstAdmissionId = "";
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: { idempotencyKey?: string } };
+      if (request.method !== "agent") {
+        return {};
+      }
+      agentDispatches += 1;
+      firstAdmissionId = request.params?.idempotencyKey ?? "";
+      notifyFirstDispatch();
+      await firstDispatchHeld;
+      markAcpTurnActive(targetKey, firstAdmissionId);
+      return { runId: firstAdmissionId, status: "accepted", acceptedAt: 2_000 };
+    });
+    const tool = getSessionTool("sessions_send", {
+      agentSessionKey: requesterKey,
+      agentChannel: "discord",
+      readAcpSessionMeta: () => acp,
+    });
+
+    const firstResultPromise = tool.execute("call-atomic-first", {
+      sessionKey: targetKey,
+      message: "first follow-up",
+      timeoutSeconds: 15,
+    });
+    await firstDispatchEntered;
+    const secondResult = await tool.execute("call-atomic-second", {
+      sessionKey: targetKey,
+      message: "second follow-up",
+      timeoutSeconds: 15,
+    });
+
+    expect(sessionsSendDetails(secondResult.details)).toMatchObject({ status: "error" });
+    expect(sessionsSendDetails(secondResult.details).error).toContain(
+      "another follow-up is being admitted",
+    );
+    expect(agentDispatches).toBe(1);
+    releaseFirstDispatch();
+    expect(sessionsSendDetails((await firstResultPromise).details)).toMatchObject({
+      status: "accepted",
+    });
+    clearAcpTurnActive(targetKey);
+    resetAcpActiveTurnsForTests();
+  });
+
+  it("sessions_send releases a failed ACP follow-up admission so its owner can retry", async () => {
+    resetAcpActiveTurnsForTests();
+    const requesterKey = "agent:main:discord:direct:retry-parent";
+    const targetKey = "agent:main:subagent:retry-acp-child";
+    const acp = durableOneShotAcpMeta();
+    loadSessionEntryByKeyMock.mockReturnValue({
+      sessionId: "retry-child-session",
+      updatedAt: 1,
+      spawnedBy: requesterKey,
+      parentSessionKey: requesterKey,
+      acp,
+    });
+    let agentDispatches = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: { idempotencyKey?: string } };
+      if (request.method !== "agent") {
+        return {};
+      }
+      agentDispatches += 1;
+      if (agentDispatches === 1) {
+        throw new Error("dispatch rejected");
+      }
+      const admissionId = request.params?.idempotencyKey ?? "";
+      markAcpTurnActive(targetKey, admissionId);
+      return { runId: admissionId, status: "accepted", acceptedAt: 2_000 };
+    });
+    const tool = getSessionTool("sessions_send", {
+      agentSessionKey: requesterKey,
+      agentChannel: "discord",
+      readAcpSessionMeta: () => acp,
+    });
+
+    const failed = await tool.execute("call-retry-first", {
+      sessionKey: targetKey,
+      message: "first attempt",
+      timeoutSeconds: 15,
+    });
+    expect(sessionsSendDetails(failed.details)).toMatchObject({
+      status: "error",
+      error: "dispatch rejected",
+    });
+
+    const retried = await tool.execute("call-retry-second", {
+      sessionKey: targetKey,
+      message: "retry",
+      timeoutSeconds: 15,
+    });
+    expect(sessionsSendDetails(retried.details)).toMatchObject({ status: "accepted" });
+    expect(agentDispatches).toBe(2);
+    clearAcpTurnActive(targetKey);
+    resetAcpActiveTurnsForTests();
+  });
+
+  it("sessions_send rejects a live parent-owned ACP one-shot before transcript reads or dispatch", async () => {
+    const requesterKey = "agent:main:discord:direct:parent";
+    const targetKey = "agent:main:subagent:acp-child";
+    const acp = durableOneShotAcpMeta();
+    loadSessionEntryByKeyMock.mockReturnValue({
+      sessionId: "child-session",
+      updatedAt: 1,
+      spawnedBy: requesterKey,
+      parentSessionKey: requesterKey,
+      acp,
+    });
+    const tool = getSessionTool("sessions_send", {
+      agentSessionKey: requesterKey,
+      agentChannel: "discord",
+      isAcpTurnActive: (sessionKey) => sessionKey === targetKey,
+      readAcpSessionMeta: () => acp,
+    });
+
+    const result = await tool.execute("call-active-acp", {
+      sessionKey: targetKey,
+      message: "too soon",
+      timeoutSeconds: 15,
+    });
+
+    const details = sessionsSendDetails(result.details);
+    expect(details.status).toBe("error");
+    expect(details.error).toContain("current turn is active");
+    expect(callGatewayMock.mock.calls.some(([call]) => call.method === "chat.history")).toBe(false);
+    expect(callGatewayMock.mock.calls.some(([call]) => call.method === "agent")).toBe(false);
+  });
+
+  it.each([
+    { name: "missing durable metadata", meta: undefined },
+    {
+      name: "unsupported metadata",
+      meta: durableOneShotAcpMeta({}, { sessionResumeSupported: false }),
+    },
+    {
+      name: "unresolved metadata",
+      meta: durableOneShotAcpMeta({}, { state: "pending" }),
+    },
+    {
+      name: "not-ready metadata",
+      meta: durableOneShotAcpMeta({}, { sessionResumeReady: false }),
+    },
+    { name: "legacy metadata", meta: durableOneShotAcpMeta({ identity: undefined }) },
+    {
+      name: "metadata without a stable resume ID",
+      meta: durableOneShotAcpMeta({}, { acpxSessionId: undefined, agentSessionId: undefined }),
+    },
+    { name: "metadata without a backend", meta: durableOneShotAcpMeta({ backend: "" }) },
+  ])(
+    "sessions_send rejects parent-owned ACP one-shots with $name before dispatch",
+    async ({ meta }) => {
+      const requesterKey = "agent:main:discord:direct:parent";
+      const targetKey = "agent:main:subagent:acp-child";
+      const routeAcp = durableOneShotAcpMeta();
+      loadSessionEntryByKeyMock.mockReturnValue({
+        sessionId: "child-session",
+        updatedAt: 1,
+        spawnedBy: requesterKey,
+        parentSessionKey: requesterKey,
+        acp: routeAcp,
+      });
+      const tool = getSessionTool("sessions_send", {
+        agentSessionKey: requesterKey,
+        agentChannel: "discord",
+        isAcpTurnActive: () => false,
+        readAcpSessionMeta: () => meta,
+      });
+
+      const result = await tool.execute("call-unverified-acp", {
+        sessionKey: targetKey,
+        message: "continue",
+        timeoutSeconds: 15,
+      });
+
+      const details = sessionsSendDetails(result.details);
+      expect(details.status).toBe("error");
+      expect(details.error).toContain("not a verified completed resumable session");
+      expect(callGatewayMock.mock.calls.some(([call]) => call.method === "chat.history")).toBe(
+        false,
+      );
+      expect(callGatewayMock.mock.calls.some(([call]) => call.method === "agent")).toBe(false);
+    },
+  );
+
+  it("sessions_send rejects mismatched parent-owned ACP backend metadata before dispatch", async () => {
+    const requesterKey = "agent:main:discord:direct:parent";
+    const targetKey = "agent:main:subagent:acp-child";
+    const routeAcp = durableOneShotAcpMeta({ backend: "other-backend" });
+    const durableAcp = durableOneShotAcpMeta();
+    loadSessionEntryByKeyMock.mockReturnValue({
+      sessionId: "child-session",
+      updatedAt: 1,
+      spawnedBy: requesterKey,
+      parentSessionKey: requesterKey,
+      acp: routeAcp,
+    });
+    const tool = getSessionTool("sessions_send", {
+      agentSessionKey: requesterKey,
+      agentChannel: "discord",
+      isAcpTurnActive: () => false,
+      readAcpSessionMeta: () => durableAcp,
+    });
+
+    const result = await tool.execute("call-wrong-backend-acp", {
+      sessionKey: targetKey,
+      message: "continue",
+      timeoutSeconds: 15,
+    });
+
+    expect(sessionsSendDetails(result.details).status).toBe("error");
+    expect(callGatewayMock.mock.calls.some(([call]) => call.method === "agent")).toBe(false);
+  });
+
+  it("sessions_send leaves unrelated authorized ACP senders on the existing A2A path", async () => {
+    const ownerKey = "agent:main:discord:direct:owner";
+    const requesterKey = "agent:main:discord:direct:peer";
+    const targetKey = "agent:main:subagent:acp-child";
+    const unsupportedAcp = durableOneShotAcpMeta({}, { sessionResumeSupported: false });
+    loadSessionEntryByKeyMock.mockReturnValue({
+      sessionId: "child-session",
+      updatedAt: 1,
+      spawnedBy: ownerKey,
+      parentSessionKey: ownerKey,
+      acp: unsupportedAcp,
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-unrelated-acp", status: "accepted", acceptedAt: 2_000 };
+      }
+      return {};
+    });
+    const tool = getSessionTool("sessions_send", {
+      agentSessionKey: requesterKey,
+      agentChannel: "discord",
+      isAcpTurnActive: () => true,
+      readAcpSessionMeta: () => unsupportedAcp,
+    });
+
+    const result = await tool.execute("call-unrelated-acp", {
+      sessionKey: targetKey,
+      message: "peer message",
+      timeoutSeconds: 0,
+    });
+
+    expect(sessionsSendDetails(result.details)).toMatchObject({
+      status: "accepted",
+      delivery: { status: "pending", mode: "announce" },
+    });
+    expect(callGatewayMock.mock.calls.filter(([call]) => call.method === "agent")).toHaveLength(1);
   });
 
   it("sessions_send preserves threadId when announce target is hydrated via sessions.list", async () => {
