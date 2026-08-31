@@ -330,21 +330,30 @@ export class AcpSessionManager {
     });
   }
 
-  async closeSession(input: AcpCloseSessionInput): Promise<AcpCloseSessionResult> {
+  async closeSession(
+    input: AcpCloseSessionInput,
+    revalidate?: () => boolean,
+  ): Promise<AcpCloseSessionResult> {
     const target = resolveAcpSessionTarget(input);
-    return await this.withSessionActor(
-      target,
-      async () =>
-        await runManagerCloseSession({
-          input,
-          ...target,
-          deps: this.deps,
-          runtimeHandles: this.runtimeHandles,
-          resolveSession: this.resolveSession.bind(this),
-          ensureRuntimeHandle: this.ensureRuntimeHandle.bind(this),
-          writeSessionMeta: this.writeSessionMeta.bind(this),
-        }),
-    );
+    return await this.withSessionActor(target, async () => {
+      // The actor wait may admit queued work. Recheck cleanup authority only
+      // after that wait, immediately before the destructive close boundary.
+      if (revalidate && !revalidate()) {
+        return {
+          runtimeClosed: false,
+          metaCleared: false,
+        };
+      }
+      return await runManagerCloseSession({
+        input,
+        ...target,
+        deps: this.deps,
+        runtimeHandles: this.runtimeHandles,
+        resolveSession: this.resolveSession.bind(this),
+        ensureRuntimeHandle: this.ensureRuntimeHandle.bind(this),
+        writeSessionMeta: this.writeSessionMeta.bind(this),
+      });
+    });
   }
 
   private async ensureRuntimeHandle(params: {
