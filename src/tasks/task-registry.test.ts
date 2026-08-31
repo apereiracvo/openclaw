@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AcpSessionStoreEntry } from "../acp/runtime/session-meta.js";
 import { emitAcpLifecycleStart } from "../agents/command/attempt-execution.js";
 import { startAcpSpawnParentStreamRelay } from "../agents/subagents/spawn/acp-spawn-parent-stream.js";
+import type { SessionAcpMeta } from "../config/sessions/types.js";
 import { resetCronActiveJobs } from "../cron/active-jobs.js";
 import { emitAgentEvent, resetAgentEventsForTest } from "../infra/agent-events.js";
 import { registerAgentRunContext } from "../infra/agent-run-registry.js";
@@ -190,6 +191,7 @@ function configureTaskRegistryMaintenanceRuntimeForTest(params: {
   acpEntry?: AcpSessionStoreEntry;
   acpEntries?: AcpSessionStoreEntry[];
   listAcpSessionEntries?: () => Promise<AcpSessionStoreEntry[]>;
+  readAcpSessionEntry?: (params: { sessionKey: string }) => AcpSessionStoreEntry | null;
   hasActiveAcpTurn?: (sessionKey: string) => boolean;
   isBackgroundExecSessionActive?: (sessionId: string) => boolean;
   runtimeAuthoritative?: boolean;
@@ -199,6 +201,7 @@ function configureTaskRegistryMaintenanceRuntimeForTest(params: {
     sessionKey: string;
     reason: string;
   }) => Promise<void>;
+  beforeSerializedAcpClose?: (sessionKey: string) => void;
   unbindSessionBindings?: (params: {
     targetSessionKey?: string;
     bindingId?: string;
@@ -215,9 +218,22 @@ function configureTaskRegistryMaintenanceRuntimeForTest(params: {
   } satisfies AcpSessionStoreEntry;
   setTaskRegistryMaintenanceRuntimeForTests({
     listAcpSessionEntries: params.listAcpSessionEntries ?? (async () => params.acpEntries ?? []),
-    readAcpSessionEntry: () => params.acpEntry ?? emptyAcpEntry,
+    readAcpSessionEntry:
+      params.readAcpSessionEntry ??
+      (({ sessionKey }) =>
+        params.acpEntry ??
+        params.acpEntries?.find((entry) => entry.sessionKey === sessionKey) ??
+        emptyAcpEntry),
     listSessionBindingsBySession: () => params.sessionBindings ?? [],
-    closeAcpSession: params.closeAcpSession,
+    closeAcpSession: params.closeAcpSession
+      ? async (input, revalidate) => {
+          params.beforeSerializedAcpClose?.(input.sessionKey);
+          if (!revalidate()) {
+            return;
+          }
+          await params.closeAcpSession?.(input);
+        }
+      : undefined,
     unbindSessionBindings: params.unbindSessionBindings,
     listSessionEntries: () => [],
     resolveStorePath: () => "",
@@ -304,15 +320,17 @@ function createAcpSessionStoreEntry(params: {
   sessionKey: string;
   parentSessionKey: string;
   mode: "persistent" | "oneshot";
+  acpOverrides?: Partial<SessionAcpMeta>;
 }): AcpSessionStoreEntry {
-  const acp = {
+  const acp: SessionAcpMeta = {
     backend: "acpx",
     agent: "claude",
     runtimeSessionName: `${params.sessionKey}:runtime`,
     mode: params.mode,
     state: "idle",
     lastActivityAt: Date.now(),
-  } as const;
+    ...params.acpOverrides,
+  };
   return {
     cfg: {} as never,
     storePath: "/tmp/openclaw-test-sessions.json",
@@ -327,6 +345,97 @@ function createAcpSessionStoreEntry(params: {
     acp,
     storeReadFailed: false,
   };
+}
+
+function durableOneShotAcpOverrides(
+  identityOverrides: Partial<NonNullable<SessionAcpMeta["identity"]>> = {},
+): Partial<SessionAcpMeta> {
+  return {
+    identity: {
+      state: "resolved",
+      source: "status",
+      acpxRecordId: "record-1",
+      acpxSessionId: "session-1",
+      sessionResumeSupported: true,
+      sessionResumeReady: true,
+      lastUpdatedAt: Date.now(),
+      ...identityOverrides,
+    },
+  };
+}
+
+function nonDurableOneShotCases(): Array<{
+  name: string;
+  status: "succeeded" | "failed" | "cancelled";
+  acpOverrides: Partial<SessionAcpMeta>;
+}> {
+  return [
+    {
+      name: "unsupported",
+      status: "succeeded",
+      acpOverrides: durableOneShotAcpOverrides({ sessionResumeSupported: false }),
+    },
+    {
+      name: "unresolved",
+      status: "succeeded",
+      acpOverrides: durableOneShotAcpOverrides({ state: "pending" }),
+    },
+    {
+      name: "cancelled",
+      status: "cancelled",
+      acpOverrides: durableOneShotAcpOverrides({ sessionResumeReady: false }),
+    },
+    {
+      name: "failed",
+      status: "failed",
+      acpOverrides: {
+        state: "error",
+        ...durableOneShotAcpOverrides({ sessionResumeReady: false }),
+      },
+    },
+    {
+      name: "pre-prompt",
+      status: "cancelled",
+      acpOverrides: {
+        state: "running",
+        identity: {
+          state: "pending",
+          source: "ensure",
+          acpxRecordId: "record-pre-prompt",
+          sessionResumeSupported: true,
+          lastUpdatedAt: Date.now(),
+        },
+      },
+    },
+    { name: "legacy", status: "succeeded", acpOverrides: {} },
+    {
+      name: "not-ready",
+      status: "succeeded",
+      acpOverrides: durableOneShotAcpOverrides({ sessionResumeReady: false }),
+    },
+    {
+      name: "missing-id",
+      status: "succeeded",
+      acpOverrides: durableOneShotAcpOverrides({
+        acpxSessionId: undefined,
+        agentSessionId: undefined,
+      }),
+    },
+    {
+      name: "record-id-only",
+      status: "succeeded",
+      acpOverrides: durableOneShotAcpOverrides({
+        state: "pending",
+        acpxSessionId: undefined,
+        agentSessionId: undefined,
+      }),
+    },
+    {
+      name: "missing-backend-ownership",
+      status: "succeeded",
+      acpOverrides: { backend: "", ...durableOneShotAcpOverrides() },
+    },
+  ];
 }
 
 function waitForAssertion(assertion: () => void, timeoutMs = 2_000, stepMs = 5) {
@@ -3601,6 +3710,98 @@ describe("task-registry", () => {
     },
   );
 
+  it("closes every unverified terminal parent-owned one-shot ACP session", async () => {
+    await withTaskRegistryTempDir(async () => {
+      const parentSessionKey = "agent:main:telegram:direct:owner";
+      const cases = nonDurableOneShotCases();
+      const entries = new Map<string, AcpSessionStoreEntry>();
+      const tasks = cases.map((testCase, index) => {
+        const childSessionKey = `agent:claude:acp:terminal-negative-${index}`;
+        entries.set(
+          childSessionKey,
+          createAcpSessionStoreEntry({
+            sessionKey: childSessionKey,
+            parentSessionKey,
+            mode: "oneshot",
+            acpOverrides: testCase.acpOverrides,
+          }),
+        );
+        return {
+          ...createTaskFixture("acp", {
+            ownerKey: parentSessionKey,
+            requesterSessionKey: parentSessionKey,
+            childSessionKey,
+            runId: `run-terminal-negative-${index}`,
+            task: `Unverified ${testCase.name} ACP task`,
+            status: testCase.status,
+            deliveryStatus: "delivered",
+          }),
+          endedAt: Date.now() - 60_000,
+          lastEventAt: Date.now() - 60_000,
+        };
+      });
+      const closeAcpSession = vi.fn().mockResolvedValue(undefined);
+
+      configureTaskRegistryMaintenanceRuntimeForTest({
+        currentTasks: new Map(tasks.map((task) => [task.taskId, task])),
+        snapshotTasks: tasks,
+        readAcpSessionEntry: ({ sessionKey }) => entries.get(sessionKey) ?? null,
+        closeAcpSession,
+      });
+
+      await runTaskRegistryMaintenance();
+
+      expect(closeAcpSession).toHaveBeenCalledTimes(cases.length);
+      expect(closeAcpSession.mock.calls.map(([call]) => call.sessionKey)).toEqual(
+        cases.map((_, index) => `agent:claude:acp:terminal-negative-${index}`),
+      );
+    });
+  });
+
+  it("retains verified terminal parent-owned one-shot metadata despite stale task state", async () => {
+    await withTaskRegistryTempDir(async () => {
+      const parentSessionKey = "agent:main:telegram:direct:owner";
+      const childSessionKey = "agent:claude:acp:verified-terminal";
+      const task = {
+        ...createTaskFixture("acp", {
+          ownerKey: parentSessionKey,
+          requesterSessionKey: parentSessionKey,
+          childSessionKey,
+          runId: "run-verified-terminal",
+          task: "Verified resumable ACP task",
+          status: "failed",
+          deliveryStatus: "failed",
+        }),
+        endedAt: Date.now() - 60_000,
+        lastEventAt: Date.now() - 60_000,
+      };
+      const acpEntry = createAcpSessionStoreEntry({
+        sessionKey: childSessionKey,
+        parentSessionKey,
+        mode: "oneshot",
+        acpOverrides: { state: "running", ...durableOneShotAcpOverrides() },
+      });
+      const closeAcpSession = vi.fn().mockResolvedValue(undefined);
+      const unbindSessionBindings = vi.fn().mockResolvedValue([]);
+
+      configureTaskRegistryMaintenanceRuntimeForTest({
+        currentTasks: new Map([[task.taskId, task]]),
+        snapshotTasks: [task],
+        acpEntry,
+        closeAcpSession,
+        unbindSessionBindings,
+      });
+
+      await runTaskRegistryMaintenance();
+      await runTaskRegistryMaintenance();
+
+      expect(closeAcpSession).not.toHaveBeenCalled();
+      expect(unbindSessionBindings).not.toHaveBeenCalled();
+      expect(acpEntry.acp?.identity?.acpxSessionId).toBe("session-1");
+      expect(acpEntry.acp?.identity?.sessionResumeReady).toBe(true);
+    });
+  });
+
   it("does not relist task records for each terminal ACP cleanup check", async () => {
     await withTaskRegistryTempDir(async () => {
       const now = Date.now();
@@ -3686,6 +3887,72 @@ describe("task-registry", () => {
     });
   });
 
+  it("revalidates terminal and orphan ACP cleanup after a turn starts before serialized close", async () => {
+    await withTaskRegistryTempDir(async () => {
+      const parentSessionKey = "agent:main:telegram:direct:owner";
+      const terminalSessionKey = "agent:claude:acp:racing-terminal";
+      const orphanSessionKey = "agent:claude:acp:racing-orphan";
+      const task = {
+        ...createTaskFixture("acp", {
+          ownerKey: parentSessionKey,
+          requesterSessionKey: parentSessionKey,
+          childSessionKey: terminalSessionKey,
+          runId: "run-racing-terminal",
+          task: "Stale task record before a replacement turn",
+          status: "failed",
+          deliveryStatus: "failed",
+        }),
+        endedAt: Date.now() - 60_000,
+      };
+      const entries = new Map<string, AcpSessionStoreEntry>(
+        [terminalSessionKey, orphanSessionKey].map(
+          (sessionKey) =>
+            [
+              sessionKey,
+              createAcpSessionStoreEntry({
+                sessionKey,
+                parentSessionKey,
+                mode: "oneshot",
+              }),
+            ] as const,
+        ),
+      );
+      const activeTurns = new Set<string>();
+      const hasActiveAcpTurn = vi.fn((sessionKey: string) => activeTurns.has(sessionKey));
+      const closeAcpSession = vi.fn().mockResolvedValue(undefined);
+      const unbindSessionBindings = vi.fn().mockResolvedValue([]);
+
+      configureTaskRegistryMaintenanceRuntimeForTest({
+        currentTasks: new Map([[task.taskId, task]]),
+        snapshotTasks: [task],
+        acpEntries: [...entries.values()],
+        readAcpSessionEntry: ({ sessionKey }) => entries.get(sessionKey) ?? null,
+        hasActiveAcpTurn,
+        beforeSerializedAcpClose: (sessionKey) => {
+          activeTurns.add(sessionKey);
+          const acp = entries.get(sessionKey)!.acp!;
+          Object.assign(acp, durableOneShotAcpOverrides());
+        },
+        closeAcpSession,
+        unbindSessionBindings,
+      });
+
+      await runTaskRegistryMaintenance();
+
+      expect(closeAcpSession).not.toHaveBeenCalled();
+      expect(unbindSessionBindings).not.toHaveBeenCalled();
+      for (const sessionKey of entries.keys()) {
+        expect(
+          hasActiveAcpTurn.mock.calls.filter(([candidate]) => candidate === sessionKey).length,
+        ).toBeGreaterThanOrEqual(2);
+      }
+      for (const entry of entries.values()) {
+        expect(entry.acp?.identity?.acpxSessionId).toBe("session-1");
+        expect(entry.acp?.identity?.sessionResumeReady).toBe(true);
+      }
+    });
+  });
+
   it.each([
     {
       name: "closes orphaned parent-owned one-shot ACP sessions after task records are gone",
@@ -3742,6 +4009,56 @@ describe("task-registry", () => {
         targetSessionKey: childSessionKey,
         reason: "orphaned-parent-task-cleanup",
       });
+    });
+  });
+
+  it("retains only verified orphaned parent-owned one-shot ACP metadata", async () => {
+    await withTaskRegistryTempDir(async () => {
+      const parentSessionKey = "agent:main:telegram:direct:owner";
+      const negativeEntries = nonDurableOneShotCases().map((testCase, index) =>
+        createAcpSessionStoreEntry({
+          sessionKey: `agent:claude:acp:orphan-negative-${index}`,
+          parentSessionKey,
+          mode: "oneshot",
+          acpOverrides: testCase.acpOverrides,
+        }),
+      );
+      const retained = createAcpSessionStoreEntry({
+        sessionKey: "agent:claude:acp:orphan-verified",
+        parentSessionKey,
+        mode: "oneshot",
+        acpOverrides: { state: "running", ...durableOneShotAcpOverrides() },
+      });
+      const unrelated = createAcpSessionStoreEntry({
+        sessionKey: "agent:claude:acp:orphan-unrelated",
+        parentSessionKey: "",
+        mode: "oneshot",
+      });
+      const active = createAcpSessionStoreEntry({
+        sessionKey: "agent:claude:acp:orphan-active",
+        parentSessionKey,
+        mode: "oneshot",
+      });
+      const closeAcpSession = vi.fn().mockResolvedValue(undefined);
+      const unbindSessionBindings = vi.fn().mockResolvedValue([]);
+
+      configureTaskRegistryMaintenanceRuntimeForTest({
+        currentTasks: new Map(),
+        snapshotTasks: [],
+        acpEntries: [...negativeEntries, retained, unrelated, active],
+        hasActiveAcpTurn: (sessionKey) => sessionKey === active.sessionKey,
+        closeAcpSession,
+        unbindSessionBindings,
+      });
+
+      await runTaskRegistryMaintenance();
+
+      expect(closeAcpSession.mock.calls.map(([call]) => call.sessionKey)).toEqual(
+        negativeEntries.map((entry) => entry.sessionKey),
+      );
+      expect(unbindSessionBindings).toHaveBeenCalledTimes(negativeEntries.length);
+      expect(retained.acp?.identity?.acpxSessionId).toBe("session-1");
+      expect(retained.acp?.identity?.sessionResumeReady).toBe(true);
     });
   });
 
