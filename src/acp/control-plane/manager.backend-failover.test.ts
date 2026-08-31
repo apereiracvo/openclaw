@@ -5,7 +5,6 @@ import {
   resolveBackendCandidatePlan,
   shouldAttemptBackendFailover,
 } from "./manager.backend-failover.js";
-
 describe("ACP manager backend failover helpers", () => {
   it("dedupes configured, resolved, and fallback backends while preserving order", () => {
     const plan = resolveBackendCandidatePlan({
@@ -24,6 +23,18 @@ describe("ACP manager backend failover helpers", () => {
 
     expect(plan.candidateBackends).toEqual([""]);
     expect(plan.describeBackendCandidate("")).toBe("<auto>");
+  });
+
+  it("pins an explicit continuation to its sole persisted backend", () => {
+    const plan = resolveBackendCandidatePlan({
+      configuredPrimaryBackend: "configured",
+      resolvedPrimaryBackend: "persisted",
+      fallbackBackends: ["fallback"],
+      pinnedBackend: "persisted",
+    });
+
+    expect(plan.candidateBackends).toEqual(["persisted"]);
+    expect(plan.describeBackendCandidate("")).toBe("persisted");
   });
 
   it("classifies only early transient backend errors as failover-worthy", () => {

@@ -74,6 +74,7 @@ export async function runManagerCloseSession(params: {
         sessionKey,
         agentId,
         meta,
+        intent: "runtime-close",
       });
       await withAcpRuntimeErrorBoundary({
         run: async () =>

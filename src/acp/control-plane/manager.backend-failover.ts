@@ -17,25 +17,31 @@ type BackendCandidatePlan = {
   describeBackendCandidate: (backend: string) => string;
 };
 
-/** Builds the deduped backend order from configured primary, resolved primary, and fallbacks. */
+/** Builds the deduped backend order, or one persisted owner for an exact continuation. */
 export function resolveBackendCandidatePlan(params: {
   configuredPrimaryBackend?: string;
   resolvedPrimaryBackend?: string;
   fallbackBackends?: readonly unknown[];
+  pinnedBackend?: string;
 }): BackendCandidatePlan {
   const configuredPrimaryBackend = normalizeText(params.configuredPrimaryBackend);
   const resolvedPrimaryBackend = normalizeText(params.resolvedPrimaryBackend);
+  const pinnedBackend = normalizeText(params.pinnedBackend);
   const fallbackBackends = Array.isArray(params.fallbackBackends)
     ? params.fallbackBackends
         .map((backend) => normalizeText(backend))
         .filter((backend): backend is string => backend != null)
     : [];
   return {
-    candidateBackends: Array.from(
-      new Set([configuredPrimaryBackend ?? resolvedPrimaryBackend ?? "", ...fallbackBackends]),
-    ),
+    // Exact one-shot continuation belongs to one persisted backend. Including any fallback here
+    // could silently turn an unavailable conversation into a different backend conversation.
+    candidateBackends: pinnedBackend
+      ? [pinnedBackend]
+      : Array.from(
+          new Set([configuredPrimaryBackend ?? resolvedPrimaryBackend ?? "", ...fallbackBackends]),
+        ),
     describeBackendCandidate: (backend) =>
-      backend || resolvedPrimaryBackend || configuredPrimaryBackend || "<auto>",
+      backend || pinnedBackend || resolvedPrimaryBackend || configuredPrimaryBackend || "<auto>",
   };
 }
 

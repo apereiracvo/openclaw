@@ -191,11 +191,19 @@ export type ResolveManagerSession = (params: {
   agentId: string;
 }) => AcpSessionResolution;
 
+export type EnsureManagerRuntimeHandleIntent =
+  | "turn-continuation"
+  | "observation"
+  | "runtime-control"
+  | "runtime-close"
+  | "identity-reconciliation";
+
 export type EnsureManagerRuntimeHandle = (params: {
   cfg: OpenClawConfig;
   sessionKey: string;
   agentId: string;
   meta: SessionAcpMeta;
+  intent: EnsureManagerRuntimeHandleIntent;
   selectedBackend?: string;
 }) => Promise<{ runtime: AcpRuntime; handle: AcpRuntimeHandle; meta: SessionAcpMeta }>;
 

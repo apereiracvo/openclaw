@@ -20,6 +20,42 @@ type AcpTurnStreamOutcome = {
   terminalStatus?: "completed" | "cancelled";
 };
 
+class AcpTurnStreamTerminalError extends Error {
+  constructor(
+    readonly failure: unknown,
+    readonly outcome: AcpTurnStreamOutcome,
+  ) {
+    super("ACP turn stream failed after terminal evidence was observed", { cause: failure });
+    this.name = "AcpTurnStreamTerminalError";
+  }
+}
+
+function throwAcpTurnStreamFailure(error: unknown, outcome: AcpTurnStreamOutcome): never {
+  if (error instanceof AcpTurnStreamTerminalError) {
+    throw error;
+  }
+  if (outcome.terminalStatus) {
+    throw new AcpTurnStreamTerminalError(error, outcome);
+  }
+  throw error;
+}
+
+/** Reads canonical terminal evidence and the original failure from a stream rejection. */
+export function readAcpTurnStreamFailure(error: unknown):
+  | {
+      error: unknown;
+      outcome: AcpTurnStreamOutcome;
+    }
+  | undefined {
+  if (!(error instanceof AcpTurnStreamTerminalError)) {
+    return undefined;
+  }
+  return {
+    error: error.failure,
+    outcome: error.outcome,
+  };
+}
+
 function isCancellationStopReason(stopReason: string | undefined): boolean {
   return stopReason === "cancel" || stopReason === "cancelled" || stopReason === "manual-cancel";
 }
@@ -43,36 +79,40 @@ async function consumeAcpTurnEvents(params: {
   let sawOutput = false;
   let terminalStatus: AcpTurnStreamOutcome["terminalStatus"];
 
-  for await (const event of params.events) {
-    if (!params.eventGate.open) {
-      continue;
+  try {
+    for await (const event of params.events) {
+      if (!params.eventGate.open) {
+        continue;
+      }
+      let forwardedEvent = event;
+      if (event.type === "done") {
+        // Legacy runTurn adapters may omit status but retain the cancellation reason.
+        terminalStatus = resolveAcpTurnTerminalStatus(event);
+        forwardedEvent = { ...event, status: terminalStatus };
+      } else if (event.type === "error") {
+        streamError = new AcpRuntimeError(
+          normalizeAcpErrorCode(event.code),
+          normalizeText(event.message) || "ACP turn failed before completion.",
+          event.detailCode ? { detailCode: event.detailCode } : undefined,
+        );
+      } else if (event.type === "text_delta" || event.type === "tool_call") {
+        sawOutput = true;
+        await params.onOutputEvent?.(event);
+      }
+      await params.onEvent?.(forwardedEvent);
     }
-    let forwardedEvent = event;
-    if (event.type === "done") {
-      // Legacy runTurn adapters may omit status but retain the cancellation reason.
-      terminalStatus = resolveAcpTurnTerminalStatus(event);
-      forwardedEvent = { ...event, status: terminalStatus };
-    } else if (event.type === "error") {
-      streamError = new AcpRuntimeError(
-        normalizeAcpErrorCode(event.code),
-        normalizeText(event.message) || "ACP turn failed before completion.",
-        event.detailCode ? { detailCode: event.detailCode } : undefined,
-      );
-    } else if (event.type === "text_delta" || event.type === "tool_call") {
-      sawOutput = true;
-      await params.onOutputEvent?.(event);
+
+    if (params.eventGate.open && streamError) {
+      throw streamError;
     }
-    await params.onEvent?.(forwardedEvent);
-  }
 
-  if (params.eventGate.open && streamError) {
-    throw streamError;
+    return {
+      sawOutput,
+      terminalStatus,
+    };
+  } catch (error) {
+    return throwAcpTurnStreamFailure(error, { sawOutput, terminalStatus });
   }
-
-  return {
-    sawOutput,
-    terminalStatus,
-  };
 }
 
 function errorFromTurnResult(result: Extract<AcpRuntimeTurnResult, { status: "failed" }>) {
@@ -173,7 +213,10 @@ export async function consumeAcpTurnStream(params: {
         // The canonical result settles only after backend persistence and client cleanup finish.
         const terminalOutcome = await resultPromise;
         if (terminalOutcome.kind === "result" && terminalOutcome.result.status === "completed") {
-          throw readiness.error;
+          throwAcpTurnStreamFailure(readiness.error, {
+            sawOutput: false,
+            terminalStatus: "completed",
+          });
         }
       }
     } else {
@@ -186,6 +229,18 @@ export async function consumeAcpTurnStream(params: {
     const firstOutcome = await Promise.race([eventsPromise, resultPromise]);
     if (firstOutcome.kind === "event-error") {
       await turn.closeStream({ reason: "turn-events-error" }).catch(() => {});
+      const queuedResult = await Promise.race([resultPromise, waitForQueuedEvents()]);
+      if (queuedResult !== "pending" && queuedResult.kind === "result") {
+        if (
+          queuedResult.result.status === "completed" ||
+          queuedResult.result.status === "cancelled"
+        ) {
+          throwAcpTurnStreamFailure(firstOutcome.error, {
+            sawOutput: false,
+            terminalStatus: queuedResult.result.status,
+          });
+        }
+      }
       throw firstOutcome.error;
     }
     if (firstOutcome.kind === "events") {
@@ -215,6 +270,12 @@ export async function consumeAcpTurnStream(params: {
         eventsOutcome = await eventsPromise;
       }
       if (eventsOutcome.kind === "event-error") {
+        if (result.status === "completed" || result.status === "cancelled") {
+          throwAcpTurnStreamFailure(eventsOutcome.error, {
+            sawOutput: false,
+            terminalStatus: result.status,
+          });
+        }
         throw eventsOutcome.error;
       }
       eventOutcome = eventsOutcome.outcome;
@@ -222,11 +283,21 @@ export async function consumeAcpTurnStream(params: {
     if (result.status !== "completed" && !closedTerminalStream) {
       await turn.closeStream({ reason: `turn-result-${result.status}` }).catch(() => {});
     }
-    await notifyTerminalResult({
-      result,
-      eventGate: params.eventGate,
-      onEvent: params.onEvent,
-    });
+    try {
+      await notifyTerminalResult({
+        result,
+        eventGate: params.eventGate,
+        onEvent: params.onEvent,
+      });
+    } catch (error) {
+      if (result.status === "completed" || result.status === "cancelled") {
+        throwAcpTurnStreamFailure(error, {
+          sawOutput: eventOutcome.sawOutput,
+          terminalStatus: result.status,
+        });
+      }
+      throw error;
+    }
     if (result.status === "failed") {
       throw errorFromTurnResult(result);
     }
