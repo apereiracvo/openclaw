@@ -67,6 +67,7 @@ export async function runManagerStartupIdentityReconcile(params: {
           cfg: params.cfg,
           sessionKey: session.sessionKey,
           meta: resolution.meta,
+          intent: "identity-reconciliation",
         });
         const reconciled = await params.reconcileRuntimeSessionIdentifiers({
           cfg: params.cfg,

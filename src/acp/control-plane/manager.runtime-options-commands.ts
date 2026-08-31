@@ -51,6 +51,7 @@ export async function runSetManagerSessionRuntimeMode(
     cfg: params.cfg,
     sessionKey: params.sessionKey,
     meta: resolvedMeta,
+    intent: "runtime-control",
   });
   const capabilities = await params.resolveRuntimeCapabilities({ runtime, handle });
   if (!capabilities.controls.includes("session/set_mode") || !runtime.setMode) {
@@ -94,6 +95,7 @@ export async function runSetManagerSessionConfigOption(
     cfg: params.cfg,
     sessionKey: params.sessionKey,
     meta: resolvedMeta,
+    intent: "runtime-control",
   });
   const inferredPatch = inferRuntimeOptionPatchFromConfigOption(params.key, params.value);
   const capabilities = await params.resolveRuntimeCapabilities({
@@ -176,6 +178,7 @@ export async function runResetManagerSessionRuntimeOptions(
     cfg: params.cfg,
     sessionKey: params.sessionKey,
     meta: resolvedMeta,
+    intent: "runtime-control",
   });
   await withAcpRuntimeErrorBoundary({
     run: async () =>

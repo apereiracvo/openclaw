@@ -69,6 +69,7 @@ export async function runManagerCloseSession(params: {
         cfg: input.cfg,
         sessionKey,
         meta,
+        intent: "runtime-close",
       });
       await withAcpRuntimeErrorBoundary({
         run: async () =>
