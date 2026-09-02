@@ -11,6 +11,28 @@ function requireAcpxOwnerMigration(sessionKey: string): never {
   );
 }
 
+const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+function isExplicitOneShotResumeRecord(
+  resource: string,
+  persisted: AcpRuntimeHandle,
+  decoded: ReturnType<typeof decodeAcpxRuntimeHandleState>,
+): boolean {
+  const recordId = persisted.acpxRecordId;
+  const backendSessionId = persisted.backendSessionId;
+  const prefix = `${resource}:oneshot-resume:`;
+  return Boolean(
+    recordId &&
+    backendSessionId &&
+    decoded?.mode === "persistent" &&
+    decoded.name === recordId &&
+    decoded.acpxRecordId === recordId &&
+    decoded.backendSessionId === backendSessionId &&
+    recordId.startsWith(prefix) &&
+    UUID.test(recordId.slice(prefix.length)),
+  );
+}
+
 export function assertAcpxSessionOwnerLocator(
   target: {
     sessionKey: string;
@@ -33,10 +55,11 @@ export function assertAcpxSessionOwnerLocator(
   }
   if (persisted) {
     const decoded = decodeAcpxRuntimeHandleState(persisted.runtimeSessionName);
+    const explicitOneShotResume = isExplicitOneShotResumeRecord(resource, persisted, decoded);
     if (
       (!qualified && !decoded) ||
       (decoded &&
-        (decoded.name !== resource ||
+        ((decoded.name !== resource && !explicitOneShotResume) ||
           (persisted.acpxRecordId && decoded.acpxRecordId !== persisted.acpxRecordId)))
     ) {
       requireAcpxOwnerMigration(target.sessionKey);
