@@ -4521,6 +4521,11 @@ describe("AcpxRuntime one-shot resume identity", () => {
       });
       expect(handleState?.name).toBe(handle.acpxRecordId);
       expect(handle.acpxRecordId).not.toBe(originalKey);
+      await expect(
+        runtime.getStatus({
+          handle: { ...handle, sessionKey: "agent:fixture:acp:other" },
+        }),
+      ).rejects.toMatchObject({ detailCode: "SESSION_OWNER_MIGRATION_REQUIRED" });
 
       const lease = Array.from(leaseStore.leases.values())[0];
       expect(lease).toMatchObject({
