@@ -1006,11 +1006,6 @@ export function createSessionsSendTool(opts?: {
                 : false;
             return watchRequested ? { watched } : {};
           };
-          const fallbackA2ASessionKey =
-            timeoutSeconds === 0 && isIsolatedCronRequester
-              ? resolveCronRunScopedFallbackSessionKey(displayKey)
-              : undefined;
-
           const targetSessionEntry = loadSessionEntryByKey(resolvedKey, targetAgentId);
           const targetAcpMeta = (opts?.readAcpSessionMeta ?? readAcpSessionMeta)({
             sessionKey: resolvedKey,
@@ -1103,41 +1098,6 @@ export function createSessionsSendTool(opts?: {
             (opts?.releaseAcpTurnAdmission ?? releaseAcpTurnAdmission)(acpFollowupAdmission);
             acpFollowupAdmissionHeld = false;
           };
-
-          // Capture the pre-run assistant snapshot before starting the nested run.
-          // Fast in-process test doubles and short-circuit agent paths can finish
-          // before we reach the post-run read, which would otherwise make the new
-          // reply look like the baseline and hide it from the caller.
-          // Fire-and-forget same-session sends still need this baseline because the
-          // A2A follow-up may deliver directly to the source channel. Isolated cron
-          // requesters also need it to avoid attributing a stale target reply.
-          const baselineReply =
-            timeoutSeconds !== 0 && !taskOwnsAcpFollowupDelivery
-              ? await readLatestAssistantReplySnapshot({
-                  sessionKey: resolvedKey,
-                  agentId: targetAgentId,
-                  limit: SESSIONS_SEND_REPLY_HISTORY_LIMIT,
-                  callGateway: gatewayCall,
-                })
-              : sameSessionA2A || isIsolatedCronRequester
-                ? await readLatestAssistantReplySnapshot({
-                    sessionKey: resolvedKey,
-                    agentId: targetAgentId,
-                    limit: SESSIONS_SEND_REPLY_HISTORY_LIMIT,
-                    callGateway: gatewayCall,
-                  }).catch(() => undefined)
-                : undefined;
-          // Active-run delivery can fall back to the durable cron parent. Snapshot
-          // that target before dispatch so a fast reply cannot become its baseline.
-          const fallbackBaselineReply =
-            fallbackA2ASessionKey && fallbackA2ASessionKey !== resolvedKey
-              ? await readLatestAssistantReplySnapshot({
-                  sessionKey: fallbackA2ASessionKey,
-                  agentId: targetAgentId,
-                  limit: SESSIONS_SEND_REPLY_HISTORY_LIMIT,
-                   callGateway: gatewayCall,
-                 }).catch(() => undefined)
-               : undefined;
 
           const agentMessageContext = buildAgentToAgentMessageContext({
             requesterSessionKey: replyRequesterSessionKey,
