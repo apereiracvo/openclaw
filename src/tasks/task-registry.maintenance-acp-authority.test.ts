@@ -7,10 +7,7 @@ import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.j
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createInMemoryTaskRegistryStore } from "../test-utils/task-registry-store.js";
-import {
-  loadTaskAcpSessionCloser,
-  type CloseAcpSession,
-} from "./task-registry-acp-cleanup.js";
+import { loadTaskAcpSessionCloser, type CloseAcpSession } from "./task-registry-acp-cleanup.js";
 import { captureTaskDeliveryWork } from "./task-registry-delivery.test-support.js";
 import {
   configureTaskRegistryMaintenance,
@@ -30,7 +27,9 @@ vi.mock("./task-registry-acp-cleanup.js", { spy: true });
 const parentSessionKey = "agent:main:main";
 
 function createCleanupEffects() {
-  const close = vi.fn<CloseAcpSession>().mockResolvedValue(undefined);
+  const close = vi.fn<CloseAcpSession>().mockImplementation(async (_params, revalidate) => {
+    revalidate?.();
+  });
   const unbind = vi.spyOn(getSessionBindingService(), "unbind").mockResolvedValue([]);
   vi.mocked(loadTaskAcpSessionCloser).mockReset().mockResolvedValue(close);
   vi.mocked(listAcpSessionEntries).mockReset().mockResolvedValue([]);
@@ -111,6 +110,9 @@ describe("task maintenance ACP cleanup authority", () => {
         } else if (boundary === "close") {
           close.mockImplementationOnce(retireStore);
         } else {
+          // Maintain a cleanup-eligible revalidate read so the serialized close
+          // admits the unbind, then retire the task store while unbinding.
+          vi.mocked(readAcpSessionEntry).mockReturnValue(entries[0]);
           unbind.mockImplementationOnce(async () => {
             await retireStore();
             return [];
@@ -158,12 +160,15 @@ describe("task maintenance ACP cleanup authority", () => {
       await expect(runTaskRegistryMaintenance()).rejects.toThrow(
         "Task registry read owner is no longer current.",
       );
-      expect(close).toHaveBeenCalledExactlyOnceWith({
-        cfg: entry.cfg,
-        agentId: entry.agentId,
-        sessionKey: entry.sessionKey,
-        reason: "terminal-task-cleanup",
-      });
+      expect(close).toHaveBeenCalledExactlyOnceWith(
+        {
+          cfg: entry.cfg,
+          agentId: entry.agentId,
+          sessionKey: entry.sessionKey,
+          reason: "terminal-task-cleanup",
+        },
+        expect.any(Function),
+      );
       expect(unbind).not.toHaveBeenCalled();
     });
   });
@@ -218,7 +223,12 @@ describe("task maintenance ACP cleanup authority", () => {
         mode: "oneshot",
       });
       vi.mocked(listAcpSessionEntries).mockResolvedValue([negative, retained, unrelated]);
-      vi.mocked(readAcpSessionEntry).mockReturnValue(retained);
+      vi.mocked(readAcpSessionEntry).mockImplementation(
+        ({ sessionKey }) =>
+          [negative, retained, unrelated].find(
+            (candidate) => candidate.sessionKey === sessionKey,
+          ) ?? null,
+      );
 
       await runTaskRegistryMaintenance();
 

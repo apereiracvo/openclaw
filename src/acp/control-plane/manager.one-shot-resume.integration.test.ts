@@ -16,10 +16,8 @@ import type { SessionAcpMeta } from "../../config/sessions/types.js";
 import { listSessionStateEventsSince } from "../../sessions/session-state-events.js";
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
-import {
-  resetTaskRegistryMaintenanceRuntimeForTests,
-  runTaskRegistryMaintenance,
-} from "../../tasks/task-registry.maintenance.js";
+import { runTaskRegistryMaintenance } from "../../tasks/task-registry.maintenance.js";
+import { resetTaskRegistryMaintenanceMocks } from "../../tasks/task-registry.maintenance.test-support.js";
 import { AcpRuntimeError } from "../runtime/errors.js";
 import {
   listAcpSessionEntries,
@@ -114,14 +112,14 @@ function createManager(params: {
 beforeEach(() => {
   managerTesting.resetAcpSessionManagerForTests();
   resetAcpActiveTurnsForTests();
-  resetTaskRegistryMaintenanceRuntimeForTests();
+  resetTaskRegistryMaintenanceMocks();
   vi.useRealTimers();
 });
 
 afterEach(() => {
   resetAcpActiveTurnsForTests();
   resetAcpManagerTaskStateForTests();
-  resetTaskRegistryMaintenanceRuntimeForTests();
+  resetTaskRegistryMaintenanceMocks();
   closeOpenClawAgentDatabasesForTest();
   closeOpenClawStateDatabaseForTest();
 });
