@@ -232,6 +232,12 @@ type GatewayCall = {
   params?: Record<string, unknown>;
 };
 
+function mockGatewayResponses(responses: Record<string, unknown>) {
+  callGatewayMock.mockImplementation(
+    async (request: GatewayCall) => responses[request.method ?? ""] ?? {},
+  );
+}
+
 type AgentCallParams = {
   message?: string;
   lane?: string;
@@ -514,33 +520,9 @@ describe("sessions tools", () => {
     { alias: "SendMessage", value: "hello from SendMessage" },
     { alias: "content", value: "hello from content" },
     { alias: "text", value: "hello from text" },
-  ])("sessions_send prepares hidden $alias alias before validation", ({ alias, value }) => {
-    const tool = getSessionTool("sessions_send");
-    if (!tool.prepareArguments) {
-      throw new Error("sessions_send missing prepareArguments");
-    }
-
-    const prepared = tool.prepareArguments({
-      sessionKey: "main",
-      [alias]: value,
-      timeoutSeconds: 0,
-    }) as Record<string, unknown>;
-
-    expect(prepared.message).toBe(value);
-    expect(prepared[alias]).toBeUndefined();
-  });
-
-  it.each([
-    { alias: "SendMessage", value: "hello from SendMessage" },
-    { alias: "content", value: "hello from content" },
-    { alias: "text", value: "hello from text" },
   ])("sessions_send normalizes $alias alias to message", async ({ alias, value }) => {
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "agent") {
-        return { runId: "run-alias", status: "accepted" };
-      }
-      return {};
+    mockGatewayResponses({
+      agent: { runId: "run-alias", status: "accepted" },
     });
 
     const tool = getSessionTool("sessions_send");
@@ -560,12 +542,8 @@ describe("sessions tools", () => {
   });
 
   it("sessions_send sanitizes formatted reasoning from aliases", async () => {
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "agent") {
-        return { runId: "run-alias", status: "accepted" };
-      }
-      return {};
+    mockGatewayResponses({
+      agent: { runId: "run-alias", status: "accepted" },
     });
 
     const tool = getSessionTool("sessions_send");
@@ -864,29 +842,25 @@ describe("sessions tools", () => {
   });
 
   it("sessions_history filters tool messages by default", async () => {
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "chat.history") {
-        return {
-          messages: [
-            { role: "toolResult", content: [] },
-            {
-              role: "assistant",
-              provider: "openclaw",
-              model: "delivery-mirror",
-              content: [{ type: "text", text: "mirrored" }],
-            },
-            {
-              role: "assistant",
-              provider: "openclaw",
-              model: "gateway-injected",
-              content: [{ type: "text", text: "injected" }],
-            },
-            { role: "assistant", content: [{ type: "text", text: "ok" }] },
-          ],
-        };
-      }
-      return {};
+    mockGatewayResponses({
+      "chat.history": {
+        messages: [
+          { role: "toolResult", content: [] },
+          {
+            role: "assistant",
+            provider: "openclaw",
+            model: "delivery-mirror",
+            content: [{ type: "text", text: "mirrored" }],
+          },
+          {
+            role: "assistant",
+            provider: "openclaw",
+            model: "gateway-injected",
+            content: [{ type: "text", text: "injected" }],
+          },
+          { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        ],
+      },
     });
 
     const tool = getSessionTool("sessions_history");
@@ -936,12 +910,8 @@ describe("sessions tools", () => {
         output: 1,
       },
     }));
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "chat.history") {
-        return { messages: oversized };
-      }
-      return {};
+    mockGatewayResponses({
+      "chat.history": { messages: oversized },
     });
 
     const tool = getSessionTool("sessions_history");
@@ -987,20 +957,16 @@ describe("sessions tools", () => {
   });
 
   it("sessions_history enforces a hard byte cap even when a single message is huge", async () => {
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "chat.history") {
-        return {
-          messages: [
-            {
-              role: "assistant",
-              content: [{ type: "text", text: "ok" }],
-              extra: "x".repeat(200_000),
-            },
-          ],
-        };
-      }
-      return {};
+    mockGatewayResponses({
+      "chat.history": {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "ok" }],
+            extra: "x".repeat(200_000),
+          },
+        ],
+      },
     });
 
     const tool = getSessionTool("sessions_history");
@@ -1031,14 +997,10 @@ describe("sessions tools", () => {
 
   it("sessions_history sets contentRedacted when sensitive data is redacted", async () => {
     callGatewayMock.mockReset();
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "chat.history") {
-        return {
-          messages: [textAssistant("Use sk-1234567890abcdef1234 to authenticate with the API.")],
-        };
-      }
-      return {};
+    mockGatewayResponses({
+      "chat.history": {
+        messages: [textAssistant("Use sk-1234567890abcdef1234 to authenticate with the API.")],
+      },
     });
 
     const tool = getSessionTool("sessions_history");
@@ -1063,19 +1025,15 @@ describe("sessions tools", () => {
     callGatewayMock.mockReset();
     const longPrefix = "safe text ".repeat(420);
     const sensitiveText = `${longPrefix} sk-9876543210fedcba9876 end`;
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "chat.history") {
-        return {
-          messages: [
-            {
-              role: "assistant",
-              content: [{ type: "text", text: sensitiveText }],
-            },
-          ],
-        };
-      }
-      return {};
+    mockGatewayResponses({
+      "chat.history": {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: sensitiveText }],
+          },
+        ],
+      },
     });
 
     const tool = getSessionTool("sessions_history");
@@ -1094,22 +1052,13 @@ describe("sessions tools", () => {
   it("sessions_history resolves sessionId inputs", async () => {
     const sessionId = "sess-group";
     const targetKey = "agent:main:discord:channel:1457165743010611293";
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as {
-        method?: string;
-        params?: Record<string, unknown>;
-      };
-      if (request.method === "sessions.resolve") {
-        return {
-          key: targetKey,
-        };
-      }
-      if (request.method === "chat.history") {
-        return {
-          messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
-        };
-      }
-      return {};
+    mockGatewayResponses({
+      "sessions.resolve": {
+        key: targetKey,
+      },
+      "chat.history": {
+        messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+      },
     });
 
     const tool = getSessionTool("sessions_history");
@@ -1550,21 +1499,10 @@ describe("sessions tools", () => {
   it("sessions_send resolves sessionId inputs", async () => {
     const sessionId = "sess-send";
     const targetKey = "agent:main:discord:channel:123";
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as {
-        method?: string;
-        params?: Record<string, unknown>;
-      };
-      if (request.method === "sessions.resolve") {
-        return { key: targetKey };
-      }
-      if (request.method === "agent") {
-        return { runId: "run-1", acceptedAt: 123 };
-      }
-      if (request.method === "agent.wait") {
-        return { status: "ok", terminalReply: { disposition: "empty" } };
-      }
-      return {};
+    mockGatewayResponses({
+      "sessions.resolve": { key: targetKey },
+      agent: { runId: "run-1", acceptedAt: 123 },
+      "agent.wait": { status: "ok", terminalReply: { disposition: "empty" } },
     });
 
     const tool = getSessionTool("sessions_send", {
@@ -2109,15 +2047,9 @@ describe("sessions tools", () => {
 
   it("sessions_send preserves delivery evidence for post-start agent errors", async () => {
     const targetKey = "agent:director1:main";
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
-      if (request.method === "agent") {
-        return { runId: "run-error", status: "accepted", acceptedAt: 2000 };
-      }
-      if (request.method === "agent.wait") {
-        return { runId: "run-error", status: "error", error: "agent failed" };
-      }
-      return {};
+    mockGatewayResponses({
+      agent: { runId: "run-error", status: "accepted", acceptedAt: 2000 },
+      "agent.wait": { runId: "run-error", status: "error", error: "agent failed" },
     });
 
     const tool = getSessionTool("sessions_send", {

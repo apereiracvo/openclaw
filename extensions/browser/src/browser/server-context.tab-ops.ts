@@ -26,7 +26,7 @@ import type { CdpActionTimeouts } from "./cdp.js";
 import { getChromeMcpModule } from "./chrome-mcp.runtime.js";
 import type { BrowserOpenResult } from "./client.types.js";
 import type { ResolvedBrowserProfile } from "./config.js";
-import { BrowserTabNotFoundError, BrowserTargetAmbiguousError } from "./errors.js";
+import { resolveBrowserEngine } from "./engines/registry.js";
 import {
   assertBrowserNavigationAllowed,
   assertBrowserNavigationResultAllowed,
@@ -35,7 +35,6 @@ import {
   withBrowserNavigationPolicy,
 } from "./navigation-guard.js";
 import { getBrowserProfileCapabilities } from "./profile-capabilities.js";
-import type { PwAiModule } from "./pw-ai-module.js";
 import { getPwAiModule } from "./pw-ai-module.js";
 import {
   MANAGED_BROWSER_PAGE_TAB_LIMIT,
@@ -47,13 +46,14 @@ import type {
   BrowserServerState,
   BrowserTab,
   ProfileRuntimeState,
+  ProfileContext,
 } from "./server-context.types.js";
 import { findRetainedBrowserDashboardTab, readBrowserDashboardTabs } from "./session-tab-store.js";
 import {
   assignTabAlias,
   assignTabAliases,
   normalizeTabLabel,
-  resolveTargetIdFromTabs,
+  resolveBrowserTabOrThrow,
 } from "./target-id.js";
 
 type TabOpsDeps = {
@@ -62,17 +62,7 @@ type TabOpsDeps = {
   runtime: ProfileRuntimeState;
 };
 
-type ProfileTabOps = {
-  listTabs: (options?: BrowserOperationOptions) => Promise<BrowserTab[]>;
-  openTab: (
-    url: string,
-    opts?: {
-      label?: string;
-      signal?: AbortSignal;
-      timeoutMs?: number;
-      requireDurableOwnership?: boolean;
-    },
-  ) => Promise<BrowserOpenResult>;
+type ProfileTabOps = Pick<ProfileContext, "listTabs" | "openTab"> & {
   labelTab: (
     targetId: string,
     label: string,
@@ -136,8 +126,7 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
 
     if (capabilities.usesPersistentPlaywright) {
       const mod = await getPwAiModule({ mode: "strict" });
-      const listPagesViaPlaywright = (mod as Partial<PwAiModule> | null)?.listPagesViaPlaywright;
-      if (typeof listPagesViaPlaywright === "function") {
+      if (mod) {
         const ssrfPolicy = getCdpControlPolicy();
         const resolved = state().resolved;
         // Enumeration budget must reflect the work of listing all tabs, not the
@@ -150,9 +139,9 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
             : resolved.actionTimeoutMs;
         const timeoutMs = Math.max(enumerationBudgetMs, resolved.remoteCdpHandshakeTimeoutMs);
         await assertCdpEndpointAllowed(profile.cdpUrl, ssrfPolicy);
-        const pages = await listPagesViaPlaywright({
+        const pages = await mod.listPagesViaPlaywright({
           cdpUrl: profile.cdpUrl,
-          ...(profile.engine === "lightpanda" ? { engine: profile.engine } : {}),
+          ...(profile.engine ? { engine: profile.engine } : {}),
           ssrfPolicy,
           timeoutMs,
           ...(capabilities.requiresCompleteTargetEnumeration
@@ -204,15 +193,7 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
       }
     }
 
-    const raw = await fetchJson<
-      Array<{
-        id?: string;
-        title?: string;
-        url?: string;
-        webSocketDebuggerUrl?: string;
-        type?: string;
-      }>
-    >(
+    const raw = await fetchJson<CdpTarget[]>(
       appendCdpPath(cdpHttpBase, "/json/list"),
       options?.timeoutMs,
       options?.signal ? { signal: options.signal } : undefined,
@@ -253,7 +234,8 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
     return assignTabAliases(
       runtime,
       tabs,
-      !capabilities.usesChromeMcp && profile.engine !== "lightpanda",
+      !capabilities.usesChromeMcp &&
+        resolveBrowserEngine(profile.engine).descriptor.sessionScope !== "connection",
     );
   };
 
@@ -321,7 +303,7 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
     tab: BrowserTab,
     options?: BrowserOperationOptions & { requireDurableOwnership?: boolean },
   ): Promise<BrowserOpenResult> => {
-    if (profile.engine === "lightpanda") {
+    if (resolveBrowserEngine(profile.engine).descriptor.sessionScope === "connection") {
       if (options?.requireDurableOwnership) {
         throw new Error("Connection-scoped browser pages cannot be retained by a dashboard.");
       }
@@ -345,15 +327,7 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
     return { ...tab, ownership };
   };
 
-  const openTab = async (
-    url: string,
-    opts?: {
-      label?: string;
-      signal?: AbortSignal;
-      timeoutMs?: number;
-      requireDurableOwnership?: boolean;
-    },
-  ): Promise<BrowserOpenResult> => {
+  const openTab: ProfileTabOps["openTab"] = async (url, opts) => {
     opts?.signal?.throwIfAborted();
     const normalizedLabel = opts?.label === undefined ? undefined : normalizeTabLabel(opts.label);
     const ssrfPolicyOpts = getNavigationPolicy();
@@ -381,12 +355,10 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
     try {
       if (capabilities.usesPersistentPlaywright) {
         const mod = await getPwAiModule({ mode: "strict" });
-        const createPageViaPlaywright = (mod as Partial<PwAiModule> | null)
-          ?.createPageViaPlaywright;
-        if (typeof createPageViaPlaywright === "function") {
-          const page = await createPageViaPlaywright({
+        if (mod) {
+          const page = await mod.createPageViaPlaywright({
             cdpUrl: profile.cdpUrl,
-            ...(profile.engine === "lightpanda" ? { engine: profile.engine } : {}),
+            ...(profile.engine ? { engine: profile.engine } : {}),
             url,
             cdpPolicy,
             ...(opts?.signal ? { signal: opts.signal } : {}),
@@ -537,34 +509,21 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
           })
         : undefined;
       opts?.signal?.throwIfAborted();
-      if (!committedUrl) {
-        return await withTabOwnership(
-          {
-            targetId: created.id,
-            title: created.title ?? "",
-            url: resolvedUrl,
-            wsUrl,
-            ...(wsPin?.lookup ? { wsLookup: wsPin.lookup } : {}),
-            type: created.type,
-          },
-          opts,
-        );
+      if (committedUrl) {
+        await assertBrowserNavigationResultAllowed({ url: committedUrl, ...ssrfPolicyOpts });
       }
-      await assertBrowserNavigationResultAllowed({ url: committedUrl, ...ssrfPolicyOpts });
-      return adoptValidatedTab(
-        await withTabOwnership(
-          {
-            targetId: created.id,
-            title: created.title ?? "",
-            url: committedUrl,
-            wsUrl,
-            ...(wsPin?.lookup ? { wsLookup: wsPin.lookup } : {}),
-            type: created.type,
-          },
-          opts,
-        ),
-        { ...opts, label: normalizedLabel },
+      const opened = await withTabOwnership(
+        {
+          targetId: created.id,
+          title: created.title ?? "",
+          url: committedUrl || resolvedUrl,
+          wsUrl,
+          ...(wsPin?.lookup ? { wsLookup: wsPin.lookup } : {}),
+          type: created.type,
+        },
+        opts,
       );
+      return committedUrl ? adoptValidatedTab(opened, { ...opts, label: normalizedLabel }) : opened;
     } catch (openError) {
       if (closeCreatedPage) {
         await closeCreatedPage().catch(() => {});
@@ -589,17 +548,7 @@ export function createProfileTabOps({ profile, state, runtime }: TabOpsDeps): Pr
   ): Promise<BrowserTab> => {
     const normalizedLabel = normalizeTabLabel(label);
     const tabs = await listTabs(options);
-    const resolved = resolveTargetIdFromTabs(targetId, tabs);
-    if (!resolved.ok) {
-      if (resolved.reason === "ambiguous") {
-        throw new BrowserTargetAmbiguousError();
-      }
-      throw new BrowserTabNotFoundError({ input: targetId });
-    }
-    const tab = tabs.find((candidate) => candidate.targetId === resolved.targetId);
-    if (!tab) {
-      throw new BrowserTabNotFoundError({ input: targetId });
-    }
+    const tab = resolveBrowserTabOrThrow(targetId, tabs);
     return assignTabAlias({ profileState: runtime, tab, label: normalizedLabel });
   };
 

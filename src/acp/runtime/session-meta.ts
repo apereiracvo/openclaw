@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 /** SQLite-backed ACP session metadata storage keyed through session-store entries. */
 import type { DatabaseSync } from "node:sqlite";
 import type { Insertable } from "kysely";
-import { getRuntimeConfig } from "../../config/config.js";
 import { patchSessionEntryWithKey } from "../../config/sessions/session-accessor.js";
 import { readLegacyAcpMigrationContext } from "../../config/sessions/session-accessor.sqlite-acp-provenance.js";
 import {
@@ -24,7 +23,6 @@ import {
 } from "../../state/openclaw-state-db.js";
 import {
   acpSessionRowMatchesEntry,
-  type AcpSessionRow,
   type AcpSessionsTable,
   buildAcpDatabaseSessionKey,
   getAcpSessionKysely,
@@ -39,11 +37,7 @@ import {
 } from "./session-meta-keys.js";
 import { clearLegacyEmbeddedAcpMetadata } from "./session-meta-legacy-cleanup.js";
 import { readAcpSessionMetaForEntry, rowToAcpSessionMeta } from "./session-meta-readonly.js";
-import {
-  readSessionEntryFromStore,
-  resolveSessionStorePathForAcp,
-  resolveStoreEntryForSessionKey,
-} from "./session-meta-store.js";
+import { readSessionEntryFromStore, type AcpSessionStoreEntry } from "./session-meta-store.js";
 import {
   resolveAcpSessionStoreUpdateOptions,
   type UpsertAcpSessionMetaParams,
@@ -53,16 +47,7 @@ import {
 /** ACP metadata joined with its legacy session-store row and config context. */
 export { resolveSessionStorePathForAcp } from "./session-meta-store.js";
 
-export type AcpSessionStoreEntry = {
-  cfg: OpenClawConfig;
-  agentId?: string;
-  storePath: string;
-  sessionKey: string;
-  storeSessionKey: string;
-  entry?: SessionEntry;
-  acp?: SessionAcpMeta;
-  storeReadFailed?: boolean;
-};
+export type { AcpSessionStoreEntry } from "./session-meta-store.js";
 
 function bindAcpSessionMeta(params: {
   sessionKey: string;
@@ -196,23 +181,6 @@ export function readAcpSessionMetaBatch(params: {
   return result;
 }
 
-function selectAcpSessionRows(options: OpenClawStateDatabaseOptions = {}): AcpSessionRow[] {
-  return (
-    withExistingOpenClawStateDatabaseReadOnly(
-      ({ db }) =>
-        executeSqliteQuerySync(
-          db,
-          getAcpSessionKysely(db)
-            .selectFrom("acp_sessions")
-            .selectAll()
-            .orderBy("last_activity_at", "desc")
-            .orderBy("session_key", "asc"),
-        ).rows,
-      options,
-    ) ?? []
-  );
-}
-
 export function writeAcpSessionMetaForMigration(params: {
   sessionKey: string;
   sessionId?: string;
@@ -296,65 +264,7 @@ export function readAcpSessionEntry(params: {
   };
 }
 
-export async function listAcpSessionEntries(params: {
-  cfg?: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-  clone?: boolean;
-  databasePath?: string;
-}): Promise<AcpSessionStoreEntry[]> {
-  const cfg = params.cfg ?? getRuntimeConfig();
-  const rows = selectAcpSessionRows({
-    env: params.env,
-    path: params.databasePath,
-  });
-  const entries: AcpSessionStoreEntry[] = [];
-
-  for (const row of rows) {
-    for (const databaseIdentity of parseAcpDatabaseSessionKeyCandidates(row.session_key)) {
-      const sessionKey = databaseIdentity.storeSessionKey;
-      const { agentId, storePath } = resolveSessionStorePathForAcp({
-        sessionKey,
-        agentId: databaseIdentity.agentId,
-        cfg,
-        env: params.env,
-      });
-      if (!storePath) {
-        continue;
-      }
-      let storeSessionKey: string;
-      let entry: SessionEntry | undefined;
-      try {
-        ({ storeSessionKey, entry } = resolveStoreEntryForSessionKey({
-          ...(agentId ? { agentId } : {}),
-          storePath,
-          sessionKey,
-          ...(params.clone === false ? { clone: false } : {}),
-        }));
-      } catch {
-        continue;
-      }
-      const readableRow = resolveReadableAcpSessionRow({
-        row,
-        entry,
-      });
-      if (!entry || !readableRow) {
-        continue;
-      }
-      entries.push({
-        cfg,
-        agentId,
-        storePath,
-        sessionKey,
-        storeSessionKey,
-        entry,
-        acp: rowToAcpSessionMeta(readableRow),
-      });
-      break;
-    }
-  }
-
-  return entries;
-}
+export { listAcpSessionEntries } from "./session-meta-list.js";
 
 function consumeLegacyAcpMigrationSources(params: {
   database: DatabaseSync;
