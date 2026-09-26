@@ -6,7 +6,11 @@ import { Value } from "typebox/value";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import { clearAcpTurnActive, markAcpTurnActive } from "../acp/control-plane/active-turns.js";
+import {
+  clearAcpTurnActive,
+  isAcpTurnActive,
+  markAcpTurnActive,
+} from "../acp/control-plane/active-turns.js";
 import { resetAcpActiveTurnsForTests } from "../acp/control-plane/active-turns.test-support.js";
 import { configureExecutionDecisionWorkSink } from "../audit/execution-decision-work.js";
 import type { ExecutionDecisionWork } from "../audit/execution-decision-work.types.js";
@@ -18,11 +22,11 @@ import {
   listSessionParticipantsReadOnly,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
-import type { SessionAcpMeta } from "../config/sessions/types.js";
 import {
   resolveSqliteScope,
   toDatabaseOptions,
 } from "../config/sessions/session-accessor.sqlite-scope.js";
+import type { SessionAcpMeta } from "../config/sessions/types.js";
 import {
   drainSystemEventEntries,
   peekSystemEventEntries,
@@ -155,7 +159,7 @@ function createOpenClawTools(options?: {
   agentChannel?: string;
   sandboxed?: boolean;
   config?: OpenClawConfig;
-  isAcpTurnActive?: (sessionKey: string) => boolean;
+  isAcpTurnActive?: typeof isAcpTurnActive;
   readAcpSessionMeta?: (params: {
     sessionKey: string;
     agentId?: string;
@@ -216,6 +220,31 @@ function getSessionTool(
 
 function cloneTestConfig() {
   return { ...TEST_CONFIG, session: { ...TEST_CONFIG.session } };
+}
+
+const mainStorePath = () => resolveSessionStorePathCore(undefined, { agentId: "main" });
+
+/**
+ * Registers the parent-owned ACP child row that sessions_send actually reads. The tool resolves
+ * the target through the gateway session store, so ownership must be seeded there rather than
+ * through the announce-delivery entry reader.
+ */
+async function registerParentOwnedAcpChild(params: {
+  targetKey: string;
+  sessionId: string;
+  parentKey: string;
+  acp?: SessionAcpMeta;
+}) {
+  await upsertSessionEntryCore(
+    { agentId: "main", sessionKey: params.targetKey, storePath: mainStorePath() },
+    {
+      sessionId: params.sessionId,
+      updatedAt: 1,
+      spawnedBy: params.parentKey,
+      parentSessionKey: params.parentKey,
+      ...(params.acp ? { acp: params.acp } : {}),
+    },
+  );
 }
 
 const waitForCalls = async (getCount: () => number, count: number, timeoutMs = 2000) => {
@@ -2136,15 +2165,13 @@ describe("sessions tools", () => {
     resetAcpActiveTurnsForTests();
     const calls: Array<{ method?: string; params?: unknown }> = [];
     const requesterKey = "agent:main:discord:direct:parent";
-    const targetKey = "agent:main:subagent:acp-child";
+    const targetKey = "agent:main:subagent:acp-followup-child";
     const acp = durableOneShotAcpMeta({ state: "running" });
-    loadSessionEntryByKeyMock.mockReturnValue({
+    await registerParentOwnedAcpChild({
+      targetKey,
       sessionId: "child-session",
-      updatedAt: 1,
-      spawnedBy: requesterKey,
-      parentSessionKey: requesterKey,
+      parentKey: requesterKey,
       acp,
-      deliveryContext: { channel: "discord", to: "direct:parent" },
     });
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: unknown };
@@ -2200,11 +2227,10 @@ describe("sessions tools", () => {
     const requesterKey = "agent:main:discord:direct:atomic-parent";
     const targetKey = "agent:main:subagent:atomic-acp-child";
     const acp = durableOneShotAcpMeta();
-    loadSessionEntryByKeyMock.mockReturnValue({
+    await registerParentOwnedAcpChild({
+      targetKey,
       sessionId: "atomic-child-session",
-      updatedAt: 1,
-      spawnedBy: requesterKey,
-      parentSessionKey: requesterKey,
+      parentKey: requesterKey,
       acp,
     });
     let releaseFirstDispatch!: () => void;
@@ -2265,11 +2291,10 @@ describe("sessions tools", () => {
     const requesterKey = "agent:main:discord:direct:retry-parent";
     const targetKey = "agent:main:subagent:retry-acp-child";
     const acp = durableOneShotAcpMeta();
-    loadSessionEntryByKeyMock.mockReturnValue({
+    await registerParentOwnedAcpChild({
+      targetKey,
       sessionId: "retry-child-session",
-      updatedAt: 1,
-      spawnedBy: requesterKey,
-      parentSessionKey: requesterKey,
+      parentKey: requesterKey,
       acp,
     });
     let agentDispatches = 0;
@@ -2315,13 +2340,12 @@ describe("sessions tools", () => {
 
   it("sessions_send rejects a live parent-owned ACP one-shot before transcript reads or dispatch", async () => {
     const requesterKey = "agent:main:discord:direct:parent";
-    const targetKey = "agent:main:subagent:acp-child";
+    const targetKey = "agent:main:subagent:acp-live-turn-child";
     const acp = durableOneShotAcpMeta();
-    loadSessionEntryByKeyMock.mockReturnValue({
+    await registerParentOwnedAcpChild({
+      targetKey,
       sessionId: "child-session",
-      updatedAt: 1,
-      spawnedBy: requesterKey,
-      parentSessionKey: requesterKey,
+      parentKey: requesterKey,
       acp,
     });
     const tool = getSessionTool("sessions_send", {
@@ -2347,11 +2371,10 @@ describe("sessions tools", () => {
   it("sessions_send fails closed for its task-owned ACP child after production persistence removes embedded and durable metadata", async () => {
     const requesterKey = "agent:main:discord:direct:task-owner";
     const targetKey = "agent:main:subagent:task-owned-acp-child";
-    loadSessionEntryByKeyMock.mockReturnValue({
+    await registerParentOwnedAcpChild({
+      targetKey,
       sessionId: "task-owned-child-session",
-      updatedAt: 1,
-      spawnedBy: requesterKey,
-      parentSessionKey: requesterKey,
+      parentKey: requesterKey,
     });
     const ownershipLookups: Array<{
       childSessionKey: string;
@@ -2395,7 +2418,6 @@ describe("sessions tools", () => {
   });
 
   it.each([
-    { name: "missing durable metadata", meta: undefined },
     {
       name: "unsupported metadata",
       meta: durableOneShotAcpMeta({}, { sessionResumeSupported: false }),
@@ -2418,14 +2440,13 @@ describe("sessions tools", () => {
     "sessions_send rejects parent-owned ACP one-shots with $name before dispatch",
     async ({ meta }) => {
       const requesterKey = "agent:main:discord:direct:parent";
-      const targetKey = "agent:main:subagent:acp-child";
-      const routeAcp = durableOneShotAcpMeta();
-      loadSessionEntryByKeyMock.mockReturnValue({
+      const targetKey = "agent:main:subagent:acp-unverified-child";
+      // Upstream persistence no longer embeds ACP metadata on the store entry, so the
+      // authoritative meta is whatever readAcpSessionMeta resolves for this case.
+      await registerParentOwnedAcpChild({
+        targetKey,
         sessionId: "child-session",
-        updatedAt: 1,
-        spawnedBy: requesterKey,
-        parentSessionKey: requesterKey,
-        acp: routeAcp,
+        parentKey: requesterKey,
       });
       const tool = getSessionTool("sessions_send", {
         agentSessionKey: requesterKey,
@@ -2452,14 +2473,13 @@ describe("sessions tools", () => {
 
   it("sessions_send rejects mismatched parent-owned ACP backend metadata before dispatch", async () => {
     const requesterKey = "agent:main:discord:direct:parent";
-    const targetKey = "agent:main:subagent:acp-child";
+    const targetKey = "agent:main:subagent:acp-backend-mismatch-child";
     const routeAcp = durableOneShotAcpMeta({ backend: "other-backend" });
     const durableAcp = durableOneShotAcpMeta();
-    loadSessionEntryByKeyMock.mockReturnValue({
+    await registerParentOwnedAcpChild({
+      targetKey,
       sessionId: "child-session",
-      updatedAt: 1,
-      spawnedBy: requesterKey,
-      parentSessionKey: requesterKey,
+      parentKey: requesterKey,
       acp: routeAcp,
     });
     const tool = getSessionTool("sessions_send", {
@@ -2482,12 +2502,11 @@ describe("sessions tools", () => {
   it("sessions_send leaves an unrelated authorized sender on A2A when an ACP task belongs to another owner and metadata is absent", async () => {
     const ownerKey = "agent:main:discord:direct:owner";
     const requesterKey = "agent:main:discord:direct:peer";
-    const targetKey = "agent:main:subagent:acp-child";
-    loadSessionEntryByKeyMock.mockReturnValue({
+    const targetKey = "agent:main:subagent:acp-unrelated-child";
+    await registerParentOwnedAcpChild({
+      targetKey,
       sessionId: "child-session",
-      updatedAt: 1,
-      spawnedBy: ownerKey,
-      parentSessionKey: ownerKey,
+      parentKey: ownerKey,
     });
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string };

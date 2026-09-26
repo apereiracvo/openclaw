@@ -197,26 +197,30 @@ export async function runUpdateManagerSessionRuntimeOptions(
 export async function runResetManagerSessionRuntimeOptions(
   params: RuntimeOptionCommandContext,
 ): Promise<AcpSessionRuntimeOptions> {
-  const resolvedMeta = resolveRuntimeOptionSessionMeta(params);
-  const { runtime, handle } = await params.ensureRuntimeHandle({
-    cfg: params.cfg,
-    sessionKey: params.sessionKey,
-    agentId: params.agentId,
-    meta: resolvedMeta,
-    intent: "runtime-control",
-  });
-  await withAcpRuntimeErrorBoundary({
-    run: async () =>
-      await runtime.close({
-        handle,
-        reason: "reset-runtime-options",
-      }),
-    fallbackCode: "ACP_TURN_FAILED",
-    fallbackMessage: "Could not reset ACP runtime options.",
-  });
-  params.runtimeHandles.clear(params);
+  resolveRuntimeOptionSessionMeta(params);
+  // Reset only settles what this process already admitted. Ensuring a handle here would spawn a
+  // replacement backend for a session that may have no live runtime, and a completed one-shot must
+  // never be recreated just to clear its options.
+  const cached = params.runtimeHandles.get(params);
+  if (cached) {
+    await withAcpRuntimeErrorBoundary({
+      run: async () =>
+        await cached.runtime.close({
+          handle: cached.handle,
+          reason: "reset-runtime-options",
+        }),
+      fallbackCode: "ACP_TURN_FAILED",
+      fallbackMessage: "Could not reset ACP runtime options.",
+    });
+    if (!params.isCurrentActor()) {
+      throw createSupersededActorError(params.sessionKey);
+    }
+    params.runtimeHandles.clearIfHandleMatches({ ...params, handle: cached.handle });
+  }
   await persistManagerRuntimeOptions({
     ...params,
+    // Closing an admitted handle owns its settlement; a metadata-only reset still needs authority.
+    assertCommitAllowed: cached ? undefined : params.assertActive,
     options: {},
   });
   return {};
