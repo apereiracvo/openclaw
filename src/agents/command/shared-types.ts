@@ -145,6 +145,13 @@ export type AgentRunInputContext = {
   /** Task working directory for tool/runtime execution. Defaults to workspaceDir. */
   cwd?: string;
   /**
+   * Selected execution project root whose `AGENTS.md` layers after the canonical
+   * agent bootstrap. Set only from creation-validated `spawnedBy` + `projectId` +
+   * `spawnedCwd` provenance without a managed worktree; it never becomes the run's
+   * agent workspace.
+   */
+  executionAgentsRootDir?: string;
+  /**
    * Run config consumed by core paths (model selection, tools, plugin
    * activation). Plugin harnesses resolve `plugins.entries.<id>.config` from
    * the live global config, NOT from this object — per-run plugin-config

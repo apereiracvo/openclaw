@@ -231,6 +231,13 @@ export type FollowupRun = {
     workspaceDir: string;
     /** Task working directory for runtime execution. Defaults to workspaceDir. */
     cwd?: string;
+    /**
+     * Selected execution project root whose `AGENTS.md` layers after the canonical
+     * agent bootstrap. Derived from the creation-validated `spawnedBy` + `projectId` +
+     * `spawnedCwd` triple, so an unregistered `cwd` and a managed worktree checkout
+     * never acquire this layer.
+     */
+    executionAgentsRootDir?: string;
     permissionMode?: SessionEntry["permissionMode"];
     sessionRoot?: string;
     config: OpenClawConfig;

@@ -109,6 +109,7 @@ export async function buildEmbeddedRunBaseParams(params: {
     sessionFile: params.run.sessionFile,
     workspaceDir: params.run.workspaceDir,
     cwd: params.run.cwd,
+    executionAgentsRootDir: params.run.executionAgentsRootDir,
     permissionMode: params.run.permissionMode,
     sessionRoot: params.run.sessionRoot,
     agentDir: params.run.agentDir,

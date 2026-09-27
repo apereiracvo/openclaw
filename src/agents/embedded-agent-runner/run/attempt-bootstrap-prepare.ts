@@ -1,4 +1,5 @@
 import path from "node:path";
+import { resolveRealpathOrAbsolute } from "../../../infra/boundary-path.js";
 import { isEmbeddedMode } from "../../../infra/embedded-mode.js";
 import { buildBootstrapBudgetState, buildBootstrapInjectionStats } from "../../bootstrap-budget.js";
 import {
@@ -17,6 +18,7 @@ import {
   DEFAULT_AGENTS_FILENAME,
   DEFAULT_BOOTSTRAP_FILENAME,
   isWorkspaceBootstrapPending,
+  loadWorkspaceBootstrapFiles,
   type WorkspaceBootstrapFile,
 } from "../../workspace.js";
 import { log } from "../logger.js";
@@ -116,19 +118,27 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     resolveBootstrapContextForRun: async () => {
       const bootstrapFiles =
         preloadedBootstrapFiles ?? (await resolveWorkspaceBootstrapFiles(bootstrapWorkspaceDir));
+      // A spawned project child resolves the run workspace to the target agent's
+      // workspace and expresses the selected project root only as its execution
+      // cwd, so the project root comes from creation-validated provenance rather
+      // than from the run workspace. Absent that fact, layering stays suppressed.
+      const executionAgentsRoot = attempt.executionAgentsRootDir ?? params.setup.resolvedWorkspace;
       const executionAgentsPath = path.join(
-        path.resolve(params.setup.resolvedWorkspace),
+        path.resolve(executionAgentsRoot),
         DEFAULT_AGENTS_FILENAME,
       );
+      // The layer is provenance-derived rather than run-policy-derived, so it reads
+      // exactly one root file. The run resolver would instead read the project's
+      // SOUL/MEMORY/BOOTSTRAP/USER, classify memory, open writable setup state, fire
+      // `agent:bootstrap` hooks, and evict the sessionKey-keyed snapshot the agent
+      // workspace owns, all to discard everything but this AGENTS.md.
       const executionProjectFiles =
-        bootstrapWorkspaceDir === params.setup.resolvedWorkspace
+        resolveRealpathOrAbsolute(bootstrapWorkspaceDir) ===
+        resolveRealpathOrAbsolute(executionAgentsRoot)
           ? []
-          : (await resolveWorkspaceBootstrapFiles(params.setup.resolvedWorkspace)).filter(
-              (file) =>
-                file.name === DEFAULT_AGENTS_FILENAME &&
-                !file.missing &&
-                path.resolve(file.path) === executionAgentsPath,
-            );
+          : (
+              await loadWorkspaceBootstrapFiles(executionAgentsRoot, [DEFAULT_AGENTS_FILENAME])
+            ).filter((file) => !file.missing && path.resolve(file.path) === executionAgentsPath);
       const layeredBootstrapFiles = [...bootstrapFiles, ...executionProjectFiles];
       return {
         bootstrapFiles: layeredBootstrapFiles,

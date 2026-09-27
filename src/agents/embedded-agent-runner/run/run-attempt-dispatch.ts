@@ -456,6 +456,7 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     trajectoryRecorder: trajectoryRecorder ?? undefined,
     ...resolveHarnessWorkspace(workspaceDir, params, pluginWorkspace, pluginSandbox),
     bootstrapWorkspaceDir,
+    executionAgentsRootDir: params.executionAgentsRootDir,
     permissionMode: params.permissionMode,
     requireWorkspaceOnly: params.requireWorkspaceOnly,
     requireWritableSandbox: params.requireWritableSandbox,

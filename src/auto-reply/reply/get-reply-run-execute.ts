@@ -384,6 +384,23 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     InternalTurnSource: ctx.InternalTurnSource ?? sessionCtx.InternalTurnSource,
     InputProvenance: inputProvenance,
   });
+  // A spawned project child keeps the target agent's workspace and runs from the
+  // selected project root, so that root's AGENTS.md must layer after agent
+  // bootstrap. The triple is creation-validated provenance: sessions.create
+  // canonicalized and containment-checked `spawnedCwd` for this `projectId`, and
+  // `spawnedBy` proves lineage. An unregistered `cwd` and a non-project child never
+  // satisfy it. A worktree child also carries all three, but its `spawnedCwd` is a
+  // checkout path and may be nested inside it for a nested source workspace, so it
+  // is not a registered project root and stays excluded.
+  const provenanceEntry = state.sessionEntry;
+  const spawnedCwd = normalizeOptionalString(provenanceEntry?.spawnedCwd);
+  const executionAgentsRootDir =
+    spawnedCwd &&
+    !provenanceEntry?.worktree &&
+    normalizeOptionalString(provenanceEntry?.spawnedBy) &&
+    normalizeOptionalString(provenanceEntry?.projectId)
+      ? spawnedCwd
+      : undefined;
   const followupRun = {
     prompt: queuedBody,
     personalBootstrapEligible,
@@ -481,8 +498,8 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       approvalReviewerDeviceId: normalizeOptionalString(ctx.ApprovalReviewerDeviceId),
       sessionFile: preparedSessionState.sessionFile,
       workspaceDir,
-      cwd:
-        normalizeOptionalString(state.sessionEntry?.spawnedCwd) ?? resolveAgentRunCwd(cfg, agentId),
+      cwd: spawnedCwd ?? resolveAgentRunCwd(cfg, agentId),
+      executionAgentsRootDir,
       permissionMode: admittedSessionSettings
         ? admittedSessionSettings.permissionMode
         : preparedSessionState.sessionEntry?.permissionMode,
