@@ -235,7 +235,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
           expect(params.sourceReplyDeliveryMode).toBe("message_tool_only");
           expect(params.inputProvenance).toEqual({
             kind: "inter_session",
-            sourceSessionKey: "agent:codex:main",
+            sourceSessionKey: parentSessionKey,
             sourceChannel: "discord",
             sourceTool: "sessions_send",
           });
@@ -276,7 +276,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
             status: expectedStatus,
             sessionKey,
             ...(expectedStatus === "accepted"
-              ? { delivery: { status: "skipped", mode: "announce" } }
+              ? { delivery: { status: "skipped" } }
               : {}),
           });
           return result;
