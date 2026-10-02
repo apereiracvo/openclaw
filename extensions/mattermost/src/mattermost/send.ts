@@ -107,25 +107,6 @@ function cacheOutboundEntry<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries
   pruneMapToMaxSize(cache, maxEntries);
 }
 
-function createMattermostSendReceipt(params: {
-  messageId: string;
-  channelId: string;
-  kind: MessageReceiptPartKind;
-  replyToId?: string;
-}): MessageReceipt {
-  return createMessageReceiptFromOutboundResults({
-    kind: params.kind,
-    ...(params.replyToId ? { replyToId: params.replyToId } : {}),
-    results: [
-      {
-        channel: "mattermost",
-        messageId: params.messageId,
-        channelId: params.channelId,
-      },
-    ],
-  });
-}
-
 function resolveMattermostReceiptKind(params: {
   fileIds?: readonly string[];
   buttons?: readonly unknown[];
@@ -158,15 +139,6 @@ function cacheKey(baseUrl: string, token: string): string {
   return `${baseUrl}::${token}`;
 }
 
-function normalizeMessage(text: string, mediaUrl?: string): string {
-  const trimmed = normalizeOptionalString(text) ?? "";
-  const media = normalizeOptionalString(mediaUrl);
-  return [trimmed, media].filter(Boolean).join("\n");
-}
-
-function isHttpUrl(value: string): boolean {
-  return /^https?:\/\//i.test(value);
-}
 async function resolveBotUser(client: MattermostClient): Promise<MattermostUser> {
   const key = cacheKey(client.baseUrl, client.token);
   const cached = botUserCache.get(key);
@@ -277,14 +249,10 @@ async function resolveTargetChannelId(params: ResolveTargetChannelIdParams): Pro
     {
       ...params.dmRetryOptions,
       onRetry: (attempt, delayMs, error) => {
-        // Call user's onRetry if provided
         params.dmRetryOptions?.onRetry?.(attempt, delayMs, error);
-        // Log if verbose mode is enabled
-        if (params.logger) {
-          params.logger.warn?.(
-            `DM channel creation retry ${attempt} after ${delayMs}ms: ${error.message}`,
-          );
-        }
+        params.logger?.warn?.(
+          `DM channel creation retry ${attempt} after ${delayMs}ms: ${error.message}`,
+        );
       },
     },
   );
@@ -336,7 +304,6 @@ async function resolveMattermostSendContext(
     allowPrivateNetwork: isPrivateNetworkOptInEnabled(account.config),
     assertRequestCurrent: opts.assertDirectAdapterHandoff,
   });
-  // Build retry options from account config, allowing opts to override
   const dmRetryOptions = mergeDmRetryOptions(account.config.dmChannelRetry, opts.dmRetryOptions);
 
   let channelId: string;
@@ -435,7 +402,9 @@ export async function sendMessageMattermost(
           `mattermost send: media upload failed, falling back to URL text: ${String(err)}`,
         );
       }
-      message = normalizeMessage(message, isHttpUrl(mediaUrl) ? mediaUrl : "");
+      message = [message, /^https?:\/\//i.test(mediaUrl) ? mediaUrl : ""]
+        .filter(Boolean)
+        .join("\n");
     }
   }
 
@@ -473,15 +442,14 @@ export async function sendMessageMattermost(
   });
 
   const messageId = post.id;
-  const receipt = createMattermostSendReceipt({
-    messageId,
-    channelId,
+  const receipt = createMessageReceiptFromOutboundResults({
+    results: [{ channel: "mattermost", messageId, channelId }],
     kind: resolveMattermostReceiptKind({
       fileIds,
       buttons: opts.buttons,
       props,
     }),
-    replyToId: opts.replyToId,
+    ...(opts.replyToId ? { replyToId: opts.replyToId } : {}),
   });
   const result: MattermostSendResult = {
     messageId,

@@ -241,7 +241,6 @@ describe("ACP session metadata write serialization", () => {
         {
           cfg,
           sessionKey: "agent:codex:acp:blocked",
-          mutate: () => undefined,
         },
         async () => {
           firstEntered.resolve();
@@ -256,7 +255,6 @@ describe("ACP session metadata write serialization", () => {
         {
           cfg,
           sessionKey: "agent:codex:acp:independent",
-          mutate: () => undefined,
         },
         async () => {
           secondEntered.resolve();

@@ -1,10 +1,7 @@
 /** Tests exact one-shot resume reconstruction and terminal readiness fencing. */
 import { describe, expect, it, vi } from "vitest";
-import {
-  requireTaskByRunId,
-  withAcpManagerTaskStateDir,
-} from "../../../test/helpers/acp-manager-task-state.js";
 import { listSessionStateEventsSince } from "../../sessions/session-state-events.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { isAcpTurnActive } from "./active-turns.js";
 import {
   AcpRuntimeError,
@@ -122,92 +119,92 @@ function installStatefulSession(params: {
 describe("AcpSessionManager one-shot resume", () => {
   installAcpSessionManagerTestLifecycle();
 
-  it("commits readiness before liveness release, task success, idle, and close", async () => {
-    await withAcpManagerTaskStateDir(async () => {
-      const sessionKey = "agent:codex:acp:terminal-readiness";
-      const parentSessionKey = "agent:main:main";
-      const runtimeState = createRuntime();
-      const order: string[] = [];
-      runtimeState.ensureSession.mockImplementation(async (input) => ({
-        sessionKey: input.sessionKey,
-        backend: "persisted-backend",
-        runtimeSessionName: "fresh-runtime",
-        cwd: "/workspace/persisted",
-        acpxRecordId: "fresh-record",
-        backendSessionId: "fresh-acp-id",
-        sessionResumeSupported: true,
-      }));
-      runtimeState.runTurn.mockImplementation(async function* () {
-        order.push("terminal-result");
-        yield { type: "done" as const };
-      });
-      runtimeState.getStatus.mockImplementation(async () => {
-        order.push("final-status");
-        return {
-          summary: "status=alive",
+  it("commits readiness before liveness release, idle, and close", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:terminal-readiness";
+        const parentSessionKey = "agent:main:main";
+        const runtimeState = createRuntime();
+        const order: string[] = [];
+        runtimeState.ensureSession.mockImplementation(async (input) => ({
+          sessionKey: input.sessionKey,
+          backend: "persisted-backend",
+          runtimeSessionName: "fresh-runtime",
+          cwd: "/workspace/persisted",
           acpxRecordId: "fresh-record",
           backendSessionId: "fresh-acp-id",
           sessionResumeSupported: true,
-        };
-      });
-      runtimeState.close.mockImplementation(async () => {
-        order.push("close");
-      });
-      hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
-        id: "persisted-backend",
-        runtime: runtimeState.runtime,
-      });
-      const manager = new AcpSessionManager();
-      let managerWriteIndex = 0;
-      const persisted = installStatefulSession({
-        sessionKey,
-        parentSessionKey,
-        initialMeta: readySessionMeta({
-          backend: "persisted-backend",
-          runtimeSessionName: "fresh-runtime",
-          mode: "oneshot",
-          runtimeOptions: { cwd: "/workspace/persisted" },
-        }),
-        onPersist: (observation) => {
-          if (observation.skipMaintenance && observation.takeCacheOwnership) {
-            if (managerWriteIndex === 1) {
-              order.push("readiness");
-              expect(observation.next.identity?.sessionResumeReady).toBe(true);
-              expect(isAcpTurnActive(sessionKey)).toBe(true);
-              expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
-              expect(requireTaskByRunId("terminal-readiness-run").status).not.toBe("succeeded");
-            } else if (managerWriteIndex === 2) {
-              order.push("idle");
-              expect(observation.next.state).toBe("idle");
-              expect(isAcpTurnActive(sessionKey)).toBe(false);
-              expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
-              expect(requireTaskByRunId("terminal-readiness-run").status).toBe("succeeded");
+        }));
+        runtimeState.runTurn.mockImplementation(async function* () {
+          order.push("terminal-result");
+          yield { type: "done" as const };
+        });
+        runtimeState.getStatus.mockImplementation(async () => {
+          order.push("final-status");
+          return {
+            summary: "status=alive",
+            acpxRecordId: "fresh-record",
+            backendSessionId: "fresh-acp-id",
+            sessionResumeSupported: true,
+          };
+        });
+        runtimeState.close.mockImplementation(async () => {
+          order.push("close");
+        });
+        hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+          id: "persisted-backend",
+          runtime: runtimeState.runtime,
+        });
+        const manager = new AcpSessionManager();
+        let managerWriteIndex = 0;
+        const persisted = installStatefulSession({
+          sessionKey,
+          parentSessionKey,
+          initialMeta: readySessionMeta({
+            backend: "persisted-backend",
+            runtimeSessionName: "fresh-runtime",
+            mode: "oneshot",
+            runtimeOptions: { cwd: "/workspace/persisted" },
+          }),
+          onPersist: (observation) => {
+            if (observation.skipMaintenance && observation.takeCacheOwnership) {
+              if (managerWriteIndex === 1) {
+                order.push("readiness");
+                expect(observation.next.identity?.sessionResumeReady).toBe(true);
+                expect(isAcpTurnActive(sessionKey)).toBe(true);
+                expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
+              } else if (managerWriteIndex === 2) {
+                order.push("idle");
+                expect(observation.next.state).toBe("idle");
+                expect(isAcpTurnActive(sessionKey)).toBe(false);
+                expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
+              }
+              managerWriteIndex += 1;
             }
-            managerWriteIndex += 1;
-          }
-        },
-      });
+          },
+        });
 
-      await manager.runTurn({
-        provenance: "system",
-        cfg: { acp: { ...baseCfg.acp, backend: "persisted-backend" } },
-        sessionKey,
-        text: "complete once",
-        mode: "prompt",
-        requestId: "terminal-readiness-run",
-      });
+        await manager.runTurn({
+          provenance: "system",
+          cfg: { acp: { ...baseCfg.acp, backend: "persisted-backend" } },
+          sessionKey,
+          text: "complete once",
+          mode: "prompt",
+          requestId: "terminal-readiness-run",
+        });
 
-      expect(order).toEqual(["terminal-result", "final-status", "readiness", "idle", "close"]);
-      expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
-      expect(runtimeState.getStatus).toHaveBeenCalledOnce();
-      expect(requireTaskByRunId("terminal-readiness-run").status).toBe("succeeded");
-      expect(managerWriteIndex).toBe(3);
-      expect(
-        listSessionStateEventsSince(sessionKey, "codex", 0, 20).events.filter(
-          (event) => event.runId === "terminal-readiness-run" && event.kind === "run_completed",
-        ),
-      ).toHaveLength(1);
-    });
+        expect(order).toEqual(["terminal-result", "final-status", "readiness", "idle", "close"]);
+        expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
+        expect(runtimeState.getStatus).toHaveBeenCalledOnce();
+        expect(managerWriteIndex).toBe(3);
+        expect(
+          listSessionStateEventsSince(sessionKey, "codex", 0, 20).events.filter(
+            (event) => event.runId === "terminal-readiness-run" && event.kind === "run_completed",
+          ),
+        ).toHaveLength(1);
+      },
+    );
   }, 300_000);
 
   it("reconstructs two follow-ups from durable id, backend, cwd, and child key", async () => {
@@ -436,97 +433,100 @@ describe("AcpSessionManager one-shot resume", () => {
   });
 
   it("rejects a replaced identity generation immediately before final reconciliation", async () => {
-    await withAcpManagerTaskStateDir(async () => {
-      const sessionKey = "agent:codex:acp:reconciliation-generation-race";
-      const runtimeState = createRuntime();
-      const replacement = resumableOneShotMeta({
-        backend: "replacement-backend",
-        runtimeSessionName: "replacement-runtime",
-        identity: {
-          state: "resolved",
-          source: "status",
-          acpxRecordId: "replacement-record",
-          acpxSessionId: "replacement-acp-id",
-          sessionResumeSupported: true,
-          sessionResumeReady: false,
-          lastUpdatedAt: 2,
-        },
-      });
-      let injected = false;
-      let unownedWrites = 0;
-      let readinessWrites = 0;
-      const persisted = installStatefulSession({
-        sessionKey,
-        parentSessionKey: "agent:main:main",
-        initialMeta: readySessionMeta({
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:reconciliation-generation-race";
+        const runtimeState = createRuntime();
+        const replacement = resumableOneShotMeta({
+          backend: "replacement-backend",
+          runtimeSessionName: "replacement-runtime",
+          identity: {
+            state: "resolved",
+            source: "status",
+            acpxRecordId: "replacement-record",
+            acpxSessionId: "replacement-acp-id",
+            sessionResumeSupported: true,
+            sessionResumeReady: false,
+            lastUpdatedAt: 2,
+          },
+        });
+        let injected = false;
+        let unownedWrites = 0;
+        let readinessWrites = 0;
+        const persisted = installStatefulSession({
+          sessionKey,
+          parentSessionKey: "agent:main:main",
+          initialMeta: readySessionMeta({
+            backend: "primary-backend",
+            runtimeSessionName: "runtime",
+            mode: "oneshot",
+          }),
+          beforeMutate: (options) => {
+            if (!options.skipMaintenance) {
+              unownedWrites += 1;
+            }
+            if (!injected && unownedWrites === 2) {
+              injected = true;
+              return replacement;
+            }
+            return undefined;
+          },
+          onPersist: (observation) => {
+            if (
+              observation.skipMaintenance &&
+              observation.takeCacheOwnership &&
+              observation.next.identity?.sessionResumeReady === true
+            ) {
+              readinessWrites += 1;
+            }
+          },
+        });
+        runtimeState.ensureSession.mockImplementation(async (input) => ({
+          sessionKey: input.sessionKey,
           backend: "primary-backend",
           runtimeSessionName: "runtime",
-          mode: "oneshot",
-        }),
-        beforeMutate: (options) => {
-          if (!options.skipMaintenance) {
-            unownedWrites += 1;
-          }
-          if (!injected && unownedWrites === 2) {
-            injected = true;
-            return replacement;
-          }
-          return undefined;
-        },
-        onPersist: (observation) => {
-          if (
-            observation.skipMaintenance &&
-            observation.takeCacheOwnership &&
-            observation.next.identity?.sessionResumeReady === true
-          ) {
-            readinessWrites += 1;
-          }
-        },
-      });
-      runtimeState.ensureSession.mockImplementation(async (input) => ({
-        sessionKey: input.sessionKey,
-        backend: "primary-backend",
-        runtimeSessionName: "runtime",
-        acpxRecordId: "turn-record",
-        backendSessionId: "turn-acp-id",
-        sessionResumeSupported: true,
-      }));
-      runtimeState.getStatus.mockResolvedValue({
-        summary: "status=alive",
-        acpxRecordId: "turn-record",
-        backendSessionId: "turn-acp-id",
-        sessionResumeSupported: true,
-      });
-      hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
-        id: "primary-backend",
-        runtime: runtimeState.runtime,
-      });
+          acpxRecordId: "turn-record",
+          backendSessionId: "turn-acp-id",
+          sessionResumeSupported: true,
+        }));
+        runtimeState.getStatus.mockResolvedValue({
+          summary: "status=alive",
+          acpxRecordId: "turn-record",
+          backendSessionId: "turn-acp-id",
+          sessionResumeSupported: true,
+        });
+        hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+          id: "primary-backend",
+          runtime: runtimeState.runtime,
+        });
 
-      await expect(
-        new AcpSessionManager().runTurn({
-          provenance: "system",
-          cfg: { acp: { ...baseCfg.acp, backend: "primary-backend" } },
-          sessionKey,
-          text: "complete against the original generation",
-          mode: "prompt",
-          requestId: "reconciliation-generation-race",
-        }),
-      ).rejects.toMatchObject({
-        code: "ACP_TURN_FAILED",
-        message: expect.stringContaining("identity changed"),
-      });
+        await expect(
+          new AcpSessionManager().runTurn({
+            provenance: "system",
+            cfg: { acp: { ...baseCfg.acp, backend: "primary-backend" } },
+            sessionKey,
+            text: "complete against the original generation",
+            mode: "prompt",
+            requestId: "reconciliation-generation-race",
+          }),
+        ).rejects.toMatchObject({
+          code: "ACP_TURN_FAILED",
+          message: expect.stringContaining("identity changed"),
+        });
 
-      expect(injected).toBe(true);
-      expect(readinessWrites).toBe(0);
-      expect(persisted.currentMeta.backend).toBe("replacement-backend");
-      expect(persisted.currentMeta.identity).toMatchObject({
-        acpxRecordId: "replacement-record",
-        acpxSessionId: "replacement-acp-id",
-        sessionResumeReady: false,
-      });
-      expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
-      expect(runtimeState.runTurn).toHaveBeenCalledOnce();
-    });
+        expect(injected).toBe(true);
+        expect(readinessWrites).toBe(0);
+        expect(persisted.currentMeta.backend).toBe("replacement-backend");
+        expect(persisted.currentMeta.identity).toMatchObject({
+          acpxRecordId: "replacement-record",
+          acpxSessionId: "replacement-acp-id",
+          sessionResumeReady: false,
+        });
+        expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
+        expect(runtimeState.runTurn).toHaveBeenCalledOnce();
+      },
+    );
   }, 300_000);
 
   it.each([
@@ -607,200 +607,206 @@ describe("AcpSessionManager one-shot resume", () => {
     expect(managerStateWrites.filter((state) => state === "running")).toHaveLength(1);
   });
 
-  it("retains manager and global liveness through cancelled task writes and cleanup", async () => {
-    await withAcpManagerTaskStateDir(async () => {
-      const sessionKey = "agent:codex:acp:cancelled-liveness-order";
-      const runtimeState = createRuntime();
-      const order: string[] = [];
-      const manager = new AcpSessionManager();
-      installStatefulSession({
-        sessionKey,
-        parentSessionKey: "agent:main:main",
-        initialMeta: readySessionMeta({ mode: "oneshot" }),
-        onPersist: (observation) => {
-          if (observation.next.state === "idle") {
-            order.push("idle");
-            expect(requireTaskByRunId("cancelled-liveness-order").status).toBe("cancelled");
-            expect(isAcpTurnActive(sessionKey)).toBe(true);
-            expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
-          }
-        },
-      });
-      runtimeState.runTurn.mockImplementation(async function* () {
-        yield { type: "done" as const, status: "cancelled" as const };
-      });
-      runtimeState.close.mockImplementation(async () => {
-        order.push("close");
-        expect(isAcpTurnActive(sessionKey)).toBe(true);
-        expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
-      });
-      hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
-        id: "acpx",
-        runtime: runtimeState.runtime,
-      });
+  it("retains manager and global liveness through cancelled state writes and cleanup", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:cancelled-liveness-order";
+        const runtimeState = createRuntime();
+        const order: string[] = [];
+        const manager = new AcpSessionManager();
+        installStatefulSession({
+          sessionKey,
+          parentSessionKey: "agent:main:main",
+          initialMeta: readySessionMeta({ mode: "oneshot" }),
+          onPersist: (observation) => {
+            if (observation.next.state === "idle") {
+              order.push("idle");
+              expect(isAcpTurnActive(sessionKey)).toBe(true);
+              expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
+            }
+          },
+        });
+        runtimeState.runTurn.mockImplementation(async function* () {
+          yield { type: "done" as const, status: "cancelled" as const };
+        });
+        runtimeState.close.mockImplementation(async () => {
+          order.push("close");
+          expect(isAcpTurnActive(sessionKey)).toBe(true);
+          expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
+        });
+        hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+          id: "acpx",
+          runtime: runtimeState.runtime,
+        });
 
-      await manager.runTurn({
-        provenance: "system",
-        cfg: baseCfg,
-        sessionKey,
-        text: "cancel cleanly",
-        mode: "prompt",
-        requestId: "cancelled-liveness-order",
-      });
-
-      expect(order).toEqual(["idle", "idle", "close"]);
-      expect(isAcpTurnActive(sessionKey)).toBe(false);
-      expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
-    });
-  }, 300_000);
-
-  it("retains manager and global liveness through failed task writes and cleanup", async () => {
-    await withAcpManagerTaskStateDir(async () => {
-      const sessionKey = "agent:codex:acp:failed-liveness-order";
-      const runtimeState = createRuntime();
-      const order: string[] = [];
-      const manager = new AcpSessionManager();
-      installStatefulSession({
-        sessionKey,
-        parentSessionKey: "agent:main:main",
-        initialMeta: readySessionMeta({ mode: "oneshot" }),
-        onPersist: (observation) => {
-          if (observation.next.state === "error") {
-            order.push("error");
-            expect(requireTaskByRunId("failed-liveness-order").status).toBe("failed");
-            expect(isAcpTurnActive(sessionKey)).toBe(true);
-            expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
-          }
-        },
-      });
-      runtimeState.runTurn.mockImplementation(async function* () {
-        if (Date.now() < 0) {
-          yield { type: "done" as const };
-        }
-        throw new AcpRuntimeError("ACP_TURN_FAILED", "deterministic turn failure");
-      });
-      runtimeState.close.mockImplementation(async () => {
-        order.push("close");
-        expect(isAcpTurnActive(sessionKey)).toBe(true);
-        expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
-      });
-      hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
-        id: "acpx",
-        runtime: runtimeState.runtime,
-      });
-
-      await expect(
-        manager.runTurn({
+        await manager.runTurn({
           provenance: "system",
           cfg: baseCfg,
           sessionKey,
-          text: "fail cleanly",
+          text: "cancel cleanly",
           mode: "prompt",
-          requestId: "failed-liveness-order",
-        }),
-      ).rejects.toThrow("deterministic turn failure");
+          requestId: "cancelled-liveness-order",
+        });
 
-      expect(order).toEqual(["error", "close"]);
-      expect(isAcpTurnActive(sessionKey)).toBe(false);
-      expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
-    });
+        expect(order).toEqual(["idle", "idle", "close"]);
+        expect(isAcpTurnActive(sessionKey)).toBe(false);
+        expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
+      },
+    );
+  }, 300_000);
+
+  it("retains manager and global liveness through failed state writes and cleanup", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:failed-liveness-order";
+        const runtimeState = createRuntime();
+        const order: string[] = [];
+        const manager = new AcpSessionManager();
+        installStatefulSession({
+          sessionKey,
+          parentSessionKey: "agent:main:main",
+          initialMeta: readySessionMeta({ mode: "oneshot" }),
+          onPersist: (observation) => {
+            if (observation.next.state === "error") {
+              order.push("error");
+              expect(isAcpTurnActive(sessionKey)).toBe(true);
+              expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
+            }
+          },
+        });
+        runtimeState.runTurn.mockImplementation(async function* () {
+          if (Date.now() < 0) {
+            yield { type: "done" as const };
+          }
+          throw new AcpRuntimeError("ACP_TURN_FAILED", "deterministic turn failure");
+        });
+        runtimeState.close.mockImplementation(async () => {
+          order.push("close");
+          expect(isAcpTurnActive(sessionKey)).toBe(true);
+          expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
+        });
+        hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+          id: "acpx",
+          runtime: runtimeState.runtime,
+        });
+
+        await expect(
+          manager.runTurn({
+            provenance: "system",
+            cfg: baseCfg,
+            sessionKey,
+            text: "fail cleanly",
+            mode: "prompt",
+            requestId: "failed-liveness-order",
+          }),
+        ).rejects.toThrow("deterministic turn failure");
+
+        expect(order).toEqual(["error", "close"]);
+        expect(isAcpTurnActive(sessionKey)).toBe(false);
+        expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
+      },
+    );
   }, 300_000);
 
   it("fails a readiness write once without replay or backend fallback", async () => {
-    await withAcpManagerTaskStateDir(async () => {
-      const sessionKey = "agent:codex:acp:readiness-write-failure";
-      const runtimeState = createRuntime();
-      let readinessAttempts = 0;
-      let managerWriteCount = 0;
-      const persisted = installStatefulSession({
-        sessionKey,
-        parentSessionKey: "agent:main:main",
-        initialMeta: readySessionMeta({
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:readiness-write-failure";
+        const runtimeState = createRuntime();
+        let readinessAttempts = 0;
+        let managerWriteCount = 0;
+        const persisted = installStatefulSession({
+          sessionKey,
+          parentSessionKey: "agent:main:main",
+          initialMeta: readySessionMeta({
+            backend: "primary-backend",
+            runtimeSessionName: "runtime",
+            mode: "oneshot",
+          }),
+        });
+        runtimeState.ensureSession.mockImplementation(async (input) => ({
+          sessionKey: input.sessionKey,
           backend: "primary-backend",
           runtimeSessionName: "runtime",
-          mode: "oneshot",
-        }),
-      });
-      runtimeState.ensureSession.mockImplementation(async (input) => ({
-        sessionKey: input.sessionKey,
-        backend: "primary-backend",
-        runtimeSessionName: "runtime",
-        acpxRecordId: "record",
-        backendSessionId: "acp-id",
-        sessionResumeSupported: true,
-      }));
-      runtimeState.getStatus.mockResolvedValue({
-        summary: "status=alive",
-        acpxRecordId: "record",
-        backendSessionId: "acp-id",
-        sessionResumeSupported: true,
-      });
-      hoisted.requireAcpRuntimeBackendMock.mockImplementation((backendId?: string) => {
-        if (backendId !== "primary-backend") {
-          throw new Error(`fallback attempted: ${backendId ?? "<auto>"}`);
-        }
-        return { id: backendId, runtime: runtimeState.runtime };
-      });
-      const persist = hoisted.upsertAcpSessionMetaMock.getMockImplementation();
-      hoisted.upsertAcpSessionMetaMock.mockImplementation(async (inputUnknown: unknown) => {
-        const input = inputUnknown as {
-          failOnError?: boolean;
-          skipMaintenance?: boolean;
-          takeCacheOwnership?: boolean;
-          mutate: (
-            current: SessionAcpMeta | undefined,
-            entry: { acp?: SessionAcpMeta } | undefined,
-          ) => SessionAcpMeta | null | undefined;
-        };
-        const preview = input.mutate(persisted.currentMeta, {
-          acp: persisted.currentMeta,
+          acpxRecordId: "record",
+          backendSessionId: "acp-id",
+          sessionResumeSupported: true,
+        }));
+        runtimeState.getStatus.mockResolvedValue({
+          summary: "status=alive",
+          acpxRecordId: "record",
+          backendSessionId: "acp-id",
+          sessionResumeSupported: true,
         });
-        if (input.skipMaintenance === true && input.takeCacheOwnership === true) {
-          managerWriteCount += 1;
-          if (managerWriteCount === 2) {
-            expect(preview?.identity?.sessionResumeReady).toBe(true);
-            readinessAttempts += 1;
-            throw new Error("resume metadata temporarily unavailable");
+        hoisted.requireAcpRuntimeBackendMock.mockImplementation((backendId?: string) => {
+          if (backendId !== "primary-backend") {
+            throw new Error(`fallback attempted: ${backendId ?? "<auto>"}`);
           }
-        }
-        if (!persist) {
-          throw new Error("stateful persistence mock missing");
-        }
-        return await persist(inputUnknown);
-      });
-      const manager = new AcpSessionManager();
+          return { id: backendId, runtime: runtimeState.runtime };
+        });
+        const persist = hoisted.upsertAcpSessionMetaMock.getMockImplementation();
+        hoisted.upsertAcpSessionMetaMock.mockImplementation(async (inputUnknown: unknown) => {
+          const input = inputUnknown as {
+            failOnError?: boolean;
+            skipMaintenance?: boolean;
+            takeCacheOwnership?: boolean;
+            mutate: (
+              current: SessionAcpMeta | undefined,
+              entry: { acp?: SessionAcpMeta } | undefined,
+            ) => SessionAcpMeta | null | undefined;
+          };
+          const preview = input.mutate(persisted.currentMeta, {
+            acp: persisted.currentMeta,
+          });
+          if (input.skipMaintenance === true && input.takeCacheOwnership === true) {
+            managerWriteCount += 1;
+            if (managerWriteCount === 2) {
+              expect(preview?.identity?.sessionResumeReady).toBe(true);
+              readinessAttempts += 1;
+              throw new Error("resume metadata temporarily unavailable");
+            }
+          }
+          if (!persist) {
+            throw new Error("stateful persistence mock missing");
+          }
+          return await persist(inputUnknown);
+        });
+        const manager = new AcpSessionManager();
 
-      await expect(
-        manager.runTurn({
-          provenance: "system",
-          cfg: {
-            acp: {
-              ...baseCfg.acp,
-              backend: "primary-backend",
-              fallbacks: ["fallback-backend"],
+        await expect(
+          manager.runTurn({
+            provenance: "system",
+            cfg: {
+              acp: {
+                ...baseCfg.acp,
+                backend: "primary-backend",
+                fallbacks: ["fallback-backend"],
+              },
             },
-          },
-          sessionKey,
-          text: "complete without replay",
-          mode: "prompt",
-          requestId: "readiness-write-failure",
-        }),
-      ).rejects.toMatchObject({ code: "ACP_TURN_FAILED" });
+            sessionKey,
+            text: "complete without replay",
+            mode: "prompt",
+            requestId: "readiness-write-failure",
+          }),
+        ).rejects.toMatchObject({ code: "ACP_TURN_FAILED" });
 
-      expect(readinessAttempts).toBe(1);
-      expect(runtimeState.runTurn).toHaveBeenCalledOnce();
-      expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
-      expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
-      expect(persisted.currentMeta.identity?.sessionResumeReady).not.toBe(true);
-      expect(requireTaskByRunId("readiness-write-failure").status).toBe("failed");
-      expect(manager.getObservabilitySnapshot().turns).toMatchObject({ completed: 0, failed: 1 });
-      expect(managerWriteCount).toBe(3);
-      expect(
-        listSessionStateEventsSince(sessionKey, "codex", 0, 20).events.filter(
-          (event) => event.runId === "readiness-write-failure" && event.kind === "run_failed",
-        ),
-      ).toHaveLength(1);
-    });
+        expect(readinessAttempts).toBe(1);
+        expect(runtimeState.runTurn).toHaveBeenCalledOnce();
+        expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
+        expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
+        expect(persisted.currentMeta.identity?.sessionResumeReady).not.toBe(true);
+        expect(manager.getObservabilitySnapshot().turns).toMatchObject({ completed: 0, failed: 1 });
+        expect(managerWriteCount).toBe(3);
+        expect(
+          listSessionStateEventsSince(sessionKey, "codex", 0, 20).events.filter(
+            (event) => event.runId === "readiness-write-failure" && event.kind === "run_failed",
+          ),
+        ).toHaveLength(1);
+      },
+    );
   }, 300_000);
 
   it("fails closed on final status error without committing readiness", async () => {

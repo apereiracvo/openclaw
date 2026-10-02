@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   isFailoverWorthyBackendError,
   resolveBackendCandidatePlan,
-  shouldAttemptBackendFailover,
 } from "./manager.backend-failover.js";
 describe("ACP manager backend failover helpers", () => {
   it("dedupes configured, resolved, and fallback backends while preserving order", () => {
@@ -74,12 +73,5 @@ describe("ACP manager backend failover helpers", () => {
         sawOutput: false,
       }),
     ).toBe(false);
-  });
-
-  it("allows failover only when another candidate remains", () => {
-    const candidateBackends = ["primary", "fallback"];
-
-    expect(shouldAttemptBackendFailover({ backendIndex: 0, candidateBackends })).toBe(true);
-    expect(shouldAttemptBackendFailover({ backendIndex: 1, candidateBackends })).toBe(false);
   });
 });

@@ -1,9 +1,6 @@
 /** Adversarial production-path tests for terminal evidence surviving later stream failures. */
 import { describe, expect, it, vi } from "vitest";
-import {
-  requireTaskByRunId,
-  withAcpManagerTaskStateDir,
-} from "../../../test/helpers/acp-manager-task-state.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   AcpSessionManager,
   baseCfg,
@@ -85,75 +82,79 @@ describe("ACP manager post-terminal stream failures", () => {
   installAcpSessionManagerTestLifecycle();
 
   it("does not replay a production startTurn result when event draining fails after completion", async () => {
-    await withAcpManagerTaskStateDir(async () => {
-      const sessionKey = "agent:codex:acp:start-turn-post-completed-error";
-      const runtimeState = createRuntime();
-      const persisted = installFreshOneShot(sessionKey, runtimeState);
-      const completedResult = Promise.resolve({
-        status: "completed" as const,
-        stopReason: "end_turn",
-      });
-      const startTurn = vi.fn((input) => ({
-        requestId: input.requestId,
-        events: (async function* () {
-          await completedResult;
-          if (Date.now() < 0) {
-            yield { type: "done" as const };
-          }
-          throw new Error("event drain failed after completed result");
-        })(),
-        result: completedResult,
-        cancel: vi.fn(async () => {}),
-        closeStream: vi.fn(async () => {}),
-      }));
-      runtimeState.runtime.startTurn = startTurn;
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-terminal-evidence-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:start-turn-post-completed-error";
+        const runtimeState = createRuntime();
+        const persisted = installFreshOneShot(sessionKey, runtimeState);
+        const completedResult = Promise.resolve({
+          status: "completed" as const,
+          stopReason: "end_turn",
+        });
+        const startTurn = vi.fn((input) => ({
+          requestId: input.requestId,
+          events: (async function* () {
+            await completedResult;
+            if (Date.now() < 0) {
+              yield { type: "done" as const };
+            }
+            throw new Error("event drain failed after completed result");
+          })(),
+          result: completedResult,
+          cancel: vi.fn(async () => {}),
+          closeStream: vi.fn(async () => {}),
+        }));
+        runtimeState.runtime.startTurn = startTurn;
 
-      await expect(
-        new AcpSessionManager().runTurn({
-          provenance: "system",
-          cfg,
-          sessionKey,
-          text: "complete once through startTurn",
-          mode: "prompt",
-          requestId: "start-turn-post-completed-error",
-        }),
-      ).rejects.toThrow("event drain failed after completed result");
+        await expect(
+          new AcpSessionManager().runTurn({
+            provenance: "system",
+            cfg,
+            sessionKey,
+            text: "complete once through startTurn",
+            mode: "prompt",
+            requestId: "start-turn-post-completed-error",
+          }),
+        ).rejects.toThrow("event drain failed after completed result");
 
-      expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
-      expect(startTurn).toHaveBeenCalledOnce();
-      expect(runtimeState.runTurn).not.toHaveBeenCalled();
-      expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
-      expect(requireTaskByRunId("start-turn-post-completed-error").status).toBe("failed");
-      expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
-    });
+        expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
+        expect(startTurn).toHaveBeenCalledOnce();
+        expect(runtimeState.runTurn).not.toHaveBeenCalled();
+        expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
+        expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
+      },
+    );
   }, 300_000);
 
   it("does not replay a legacy runTurn stream that throws after a completed done event", async () => {
-    await withAcpManagerTaskStateDir(async () => {
-      const sessionKey = "agent:codex:acp:legacy-post-completed-error";
-      const runtimeState = createRuntime();
-      const persisted = installFreshOneShot(sessionKey, runtimeState);
-      runtimeState.runTurn.mockImplementation(async function* () {
-        yield { type: "done" as const, status: "completed" as const };
-        throw new Error("legacy event observer failed after done");
-      });
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-terminal-evidence-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:legacy-post-completed-error";
+        const runtimeState = createRuntime();
+        const persisted = installFreshOneShot(sessionKey, runtimeState);
+        runtimeState.runTurn.mockImplementation(async function* () {
+          yield { type: "done" as const, status: "completed" as const };
+          throw new Error("legacy event observer failed after done");
+        });
 
-      await expect(
-        new AcpSessionManager().runTurn({
-          provenance: "system",
-          cfg,
-          sessionKey,
-          text: "complete once through runTurn",
-          mode: "prompt",
-          requestId: "legacy-post-completed-error",
-        }),
-      ).rejects.toThrow("legacy event observer failed after done");
+        await expect(
+          new AcpSessionManager().runTurn({
+            provenance: "system",
+            cfg,
+            sessionKey,
+            text: "complete once through runTurn",
+            mode: "prompt",
+            requestId: "legacy-post-completed-error",
+          }),
+        ).rejects.toThrow("legacy event observer failed after done");
 
-      expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
-      expect(runtimeState.runTurn).toHaveBeenCalledOnce();
-      expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
-      expect(requireTaskByRunId("legacy-post-completed-error").status).toBe("failed");
-      expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
-    });
+        expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
+        expect(runtimeState.runTurn).toHaveBeenCalledOnce();
+        expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
+        expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
+      },
+    );
   }, 300_000);
 });

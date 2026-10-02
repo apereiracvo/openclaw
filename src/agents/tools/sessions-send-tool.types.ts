@@ -5,14 +5,15 @@ import type {
 } from "../../acp/control-plane/active-turns.js";
 import type { readAcpSessionMeta } from "../../acp/runtime/session-meta.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import type { isAcpChildSessionOwnedBy } from "../../tasks/task-owner-access.js";
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import type { AgentToolGatewayRequestCaller } from "./in-process-gateway.js";
 
 export type SessionsSendToolOptions = {
+  workerPlacement?: boolean;
   agentId?: string;
   agentSessionKey?: string;
   agentSessionId?: string;
+  requesterTurnRunId?: string;
   agentChannel?: string;
   requesterOrigin?: DeliveryContext;
   sandboxed?: boolean;
@@ -20,6 +21,7 @@ export type SessionsSendToolOptions = {
   callGateway?: AgentToolGatewayRequestCaller;
   /** Backend-derived target incarnation; never sourced from model arguments. */
   expectedTargetSessionId?: string;
+  expectedTargetStorePath?: string;
   /** Backend-owned downstream operation id; never sourced from model arguments. */
   idempotencyKey?: string;
   signal?: AbortSignal;
@@ -28,6 +30,4 @@ export type SessionsSendToolOptions = {
   reserveAcpTurnAdmission?: typeof reserveAcpTurnAdmission;
   releaseAcpTurnAdmission?: typeof releaseAcpTurnAdmission;
   readAcpSessionMeta?: typeof readAcpSessionMeta;
-  /** Test seam for authoritative task-registry ACP child ownership. */
-  isAcpChildSessionOwnedBy?: typeof isAcpChildSessionOwnedBy;
 };

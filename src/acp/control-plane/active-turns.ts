@@ -1,17 +1,19 @@
-/** Process-local active-turn registry for ACP maintenance and recovery decisions. */
+/** Process-local active-turn registry for restart draining and ACP child admission. */
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { AcpSessionTarget } from "./manager.types.js";
 import { acpSessionActorKey, resolveAcpAgentFromSessionKey } from "./manager.utils.js";
 
-// Process-local liveness signal for in-flight ACP prompt turns, kept off the
-// SDK-exported AcpSessionManager so plugins cannot read this maintenance-only
-// state. Mirrors cron's active-jobs registry: task maintenance asks "is a turn
-// still running for this session?" to avoid reclaiming a live run whose persisted
-// session entry survived a crash. The AcpSessionManager marks/clears it in lockstep
-// with its in-memory turn map.
+type AcpActiveTurnEntry = {
+  token: symbol;
+  sessionKey: string;
+  ownerSessionKey?: string;
+};
+
+/** Turn-registration target; a bare key resolves its agent from the key itself. */
+type AcpActiveTurnTarget = (AcpSessionTarget & { ownerSessionKey?: string }) | string;
 
 type AcpActiveTurnState = {
-  activeTurnKeys: Map<string, symbol>;
+  activeTurnKeys: Map<string, AcpActiveTurnEntry>;
   admissionsBySession: Map<string, { ownerKey: string; admissionId: string; expiresAt: number }>;
 };
 
@@ -21,14 +23,14 @@ const ACP_ACTIVE_TURN_STATE_KEY = Symbol.for("openclaw.acp.activeTurns");
 
 function getAcpActiveTurnState(): AcpActiveTurnState {
   const state = resolveGlobalSingleton<AcpActiveTurnState>(ACP_ACTIVE_TURN_STATE_KEY, () => ({
-    activeTurnKeys: new Map<string, symbol>(),
+    activeTurnKeys: new Map<string, AcpActiveTurnEntry>(),
     admissionsBySession: new Map(),
   }));
   state.admissionsBySession ??= new Map();
   return state;
 }
 
-function resolveAcpTurnKey(target: AcpSessionTarget | string): string {
+function resolveAcpTurnKey(target: AcpActiveTurnTarget): string {
   if (typeof target === "string") {
     if (!target) {
       return "";
@@ -88,7 +90,7 @@ export function releaseAcpTurnAdmission(params: {
 
 /** Registers the current turn and returns its ownership-checked release callback. */
 export function markAcpTurnActive(
-  target: AcpSessionTarget,
+  target: AcpSessionTarget & { ownerSessionKey?: string },
   admissionId?: string,
 ): (() => void) | undefined;
 export function markAcpTurnActive(
@@ -96,7 +98,7 @@ export function markAcpTurnActive(
   admissionId?: string,
 ): (() => void) | undefined;
 export function markAcpTurnActive(
-  target: AcpSessionTarget | string,
+  target: AcpActiveTurnTarget,
   admissionId?: string,
 ): (() => void) | undefined {
   const actorKey = resolveAcpTurnKey(target);
@@ -108,9 +110,13 @@ export function markAcpTurnActive(
     state.admissionsBySession.delete(actorKey);
   }
   const owner = Symbol("acp-active-turn");
-  state.activeTurnKeys.set(actorKey, owner);
+  state.activeTurnKeys.set(actorKey, {
+    token: owner,
+    sessionKey: typeof target === "string" ? target : target.sessionKey,
+    ownerSessionKey: typeof target === "string" ? undefined : target.ownerSessionKey,
+  });
   return () => {
-    if (state.activeTurnKeys.get(actorKey) === owner) {
+    if (state.activeTurnKeys.get(actorKey)?.token === owner) {
       state.activeTurnKeys.delete(actorKey);
     }
   };
@@ -119,7 +125,7 @@ export function markAcpTurnActive(
 /** Clears the active-turn marker for a session. */
 export function clearAcpTurnActive(target: AcpSessionTarget): void;
 export function clearAcpTurnActive(sessionKey: string): void;
-export function clearAcpTurnActive(target: AcpSessionTarget | string): void {
+export function clearAcpTurnActive(target: AcpActiveTurnTarget): void {
   const actorKey = resolveAcpTurnKey(target);
   if (actorKey) {
     getAcpActiveTurnState().activeTurnKeys.delete(actorKey);
@@ -129,7 +135,18 @@ export function clearAcpTurnActive(target: AcpSessionTarget | string): void {
 /** Returns whether the process currently owns an in-flight ACP turn for a session. */
 export function isAcpTurnActive(target: AcpSessionTarget): boolean;
 export function isAcpTurnActive(sessionKey: string): boolean;
-export function isAcpTurnActive(target: AcpSessionTarget | string): boolean {
+export function isAcpTurnActive(target: AcpActiveTurnTarget): boolean {
   const actorKey = resolveAcpTurnKey(target);
   return Boolean(actorKey) && getAcpActiveTurnState().activeTurnKeys.has(actorKey);
+}
+
+/** Number of currently owned ACP turns that must settle before restart. */
+export function getActiveAcpTurnCount(): number {
+  return getAcpActiveTurnState().activeTurnKeys.size;
+}
+
+export function listActiveAcpSessionsForOwner(ownerSessionKey: string): string[] {
+  return [...getAcpActiveTurnState().activeTurnKeys.values()]
+    .filter((turn) => turn.ownerSessionKey === ownerSessionKey)
+    .map((turn) => turn.sessionKey);
 }

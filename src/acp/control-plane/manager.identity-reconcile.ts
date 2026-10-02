@@ -12,17 +12,24 @@ import type {
   AcpRuntimeHandle,
   AcpRuntimeStatus,
 } from "@openclaw/acp-core/runtime/types";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
 import { AcpRuntimeError, withAcpRuntimeErrorBoundary } from "../runtime/errors.js";
 import {
   isSameAcpSessionIdentityGeneration,
   resolveAcpOneShotReadinessTarget,
 } from "../session-resume.js";
-import { createSupersededActorError } from "./manager.runtime-handle-ensure.js";
 import { isAcpOwnerRepairRequired } from "./manager.runtime-owner.js";
-import type { AcpSessionTarget, SessionAcpMeta, WriteManagerSessionMeta } from "./manager.types.js";
-import { hasLegacyAcpIdentityProjection } from "./manager.utils.js";
+import type {
+  AcpSessionTarget,
+  ReconcileManagerRuntimeSessionIdentifiers,
+  SessionAcpMeta,
+  WriteManagerSessionMeta,
+} from "./manager.types.js";
+import {
+  assertCurrentAcpActor,
+  createSupersededActorError,
+  hasLegacyAcpIdentityProjection,
+} from "./manager.utils.js";
 
 const ACP_FINAL_STATUS_TIMEOUT_MS = 5_000;
 const ACP_FINAL_STATUS_TIMEOUT_DETAIL_CODE = "FINAL_STATUS_TIMEOUT";
@@ -93,27 +100,23 @@ async function readBoundedManagerRuntimeStatus(params: {
 }
 
 /** Reconciles runtime-reported session identifiers into persisted ACP session metadata. */
-export async function reconcileManagerRuntimeSessionIdentifiers(params: {
-  cfg: OpenClawConfig;
-  sessionKey: string;
-  agentId: string;
-  runtime: AcpRuntime;
-  handle: AcpRuntimeHandle;
-  meta: SessionAcpMeta;
-  runtimeStatus?: AcpRuntimeStatus;
-  failOnStatusError: boolean;
-  isCurrentActor?: () => boolean;
-  setCachedHandle: (target: AcpSessionTarget, handle: AcpRuntimeHandle) => void;
-  writeSessionMeta: WriteManagerSessionMeta;
-}): Promise<{
-  handle: AcpRuntimeHandle;
-  meta: SessionAcpMeta;
-  runtimeStatus?: AcpRuntimeStatus;
-}> {
+export async function reconcileManagerRuntimeSessionIdentifiers(
+  params: Parameters<ReconcileManagerRuntimeSessionIdentifiers>[0] & {
+    setCachedHandle: (target: AcpSessionTarget, handle: AcpRuntimeHandle) => void;
+    writeSessionMeta: WriteManagerSessionMeta;
+  },
+): ReturnType<ReconcileManagerRuntimeSessionIdentifiers> {
   const isCurrentActor = params.isCurrentActor ?? (() => true);
-  if (!isCurrentActor()) {
-    throw createSupersededActorError(params.sessionKey);
-  }
+  const assertCurrent = () => {
+    if (!isCurrentActor()) {
+      throw createSupersededActorError(params.sessionKey);
+    }
+    params.assertCurrent?.();
+    assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
+  };
+  const beforeControl = params.revalidateControl?.();
+  let acpControl = beforeControl ? (await beforeControl) || undefined : undefined;
+  assertCurrent();
   let runtimeStatus = params.runtimeStatus;
   if (!runtimeStatus && params.runtime.getStatus) {
     try {
@@ -135,9 +138,7 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
       if (params.failOnStatusError || isAcpOwnerRepairRequired(error)) {
         throw error;
       }
-      if (!isCurrentActor()) {
-        throw createSupersededActorError(params.sessionKey);
-      }
+      assertCurrent();
       logVerbose(
         `acp-manager: failed to refresh ACP runtime status for ${params.sessionKey}: ${String(error)}`,
       );
@@ -147,9 +148,9 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
         runtimeStatus,
       };
     }
-    if (!isCurrentActor()) {
-      throw createSupersededActorError(params.sessionKey);
-    }
+    const afterControl = params.revalidateControl?.();
+    acpControl = afterControl ? (await afterControl) || undefined : acpControl;
+    assertCurrent();
   }
 
   const now = Date.now();
@@ -177,6 +178,8 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
   const observationChanged =
     !identityEquals(expectedIdentity, observedIdentity) ||
     hasLegacyAcpIdentityProjection(params.meta);
+  // A completed one-shot still fences its readiness generation even when the runtime reported
+  // nothing new, so a stale readiness observation cannot publish over a replacement generation.
   const mustFenceReadinessGeneration =
     params.failOnStatusError &&
     resolveAcpOneShotReadinessTarget({
@@ -189,6 +192,7 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
     if (nextHandle !== params.handle) {
       params.setCachedHandle(params, nextHandle);
     }
+    assertCurrent();
     return {
       handle: nextHandle,
       meta: params.meta,
@@ -201,10 +205,10 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
     sessionKey: params.sessionKey,
     agentId: params.agentId,
     isCurrentActor,
+    assertCommitAllowed: assertCurrent,
+    acpControl,
     mutate: (current, entry) => {
-      if (!isCurrentActor()) {
-        return undefined;
-      }
+      assertCurrent();
       if (!entry || !current) {
         return null;
       }
@@ -256,7 +260,8 @@ export async function reconcileManagerRuntimeSessionIdentifiers(params: {
     },
     failOnError: params.failOnStatusError,
   });
-  const persistedMeta = persisted?.acp;
+  assertCurrent();
+  const persistedMeta: SessionAcpMeta | undefined = persisted?.acp;
   if (
     params.failOnStatusError &&
     params.meta.mode === "oneshot" &&
