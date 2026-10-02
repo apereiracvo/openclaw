@@ -44,6 +44,7 @@ describe("reset during ensured runtime metadata publication", () => {
     const params = {
       ...target,
       cfg: baseCfg,
+      intent: "observation" as const,
       meta: persisted,
       deps: {
         requireRuntimeBackend: () => ({ id: "acpx", runtime: state.runtime }),

@@ -60,6 +60,7 @@ import { createSessionsHistoryTool } from "./tools/sessions-history-tool.js";
 import { createSessionsListTool } from "./tools/sessions-list-tool.js";
 import * as sessionsSendFollowup from "./tools/sessions-send-followup-custody.js";
 import { createSessionsSendTool } from "./tools/sessions-send-tool.js";
+import type { SessionsSendToolOptions } from "./tools/sessions-send-tool.types.js";
 
 const { callGatewayMock } = await import("./openclaw-tools.sessions.mocks.test-support.js");
 
@@ -121,9 +122,15 @@ function installMessagingTestRegistry() {
   );
 }
 
+/** ACP admission seams the production send tool accepts; kept derived from its owner type. */
+type SessionToolAcpTestSeams = Pick<
+  SessionsSendToolOptions,
+  "isAcpTurnActive" | "readAcpSessionMeta"
+>;
+
 function getSessionTool(
   name: "sessions_list" | "sessions_history" | "sessions_send",
-  options?: {
+  options?: SessionToolAcpTestSeams & {
     agentSessionKey?: string;
     agentChannel?: string;
     sandboxed?: boolean;
@@ -1211,7 +1218,6 @@ describe("sessions tools", () => {
         sessionId: "child-session",
         updatedAt: 1,
         spawnedBy: requesterKey,
-        deliveryContext: { channel: "discord", to: "direct:parent" },
       },
     );
     callGatewayMock.mockImplementation(async (opts: unknown) => {
