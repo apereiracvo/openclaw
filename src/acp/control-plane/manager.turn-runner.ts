@@ -36,7 +36,6 @@ import {
 } from "./manager.turn-timeout.js";
 import type {
   AcpRunTurnInput,
-  AcpSessionManagerDeps,
   ActiveTurnState,
   EnsureManagerRuntimeHandle,
   ReconcileManagerRuntimeSessionIdentifiers,
@@ -58,7 +57,6 @@ export async function runManagerTurn(params: {
   acceptedTurn: AcceptedTurnState;
   sessionKey: string;
   agentId: string;
-  deps: AcpSessionManagerDeps;
   runtimeHandles: ManagerRuntimeHandleCache;
   activeTurnBySession: Map<string, ActiveTurnState>;
   resolveSession: ResolveManagerSessionAsync;
@@ -537,7 +535,7 @@ export async function runManagerTurn(params: {
                 childSessionKey: sessionKey,
                 runId: input.requestId,
                 requesterSessionKey: spawnedByWatcher,
-                outcomeStatus: turnOutcome.terminalStatus === "cancelled" ? "cancelled" : "ok",
+                outcomeStatus: cancelled ? "cancelled" : "ok",
               },
               cancelling ? assertCancellationPublicationCurrent : assertActorCurrent,
               cancelling ? params.acceptedTurn.cancelConstraint : undefined,

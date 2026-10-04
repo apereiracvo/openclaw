@@ -28,7 +28,8 @@ import type {
   SqliteSessionArtifactPreparationDiagnostics,
 } from "./session-accessor.sqlite-contract.js";
 import type { SqliteLifecycleTargetSnapshot } from "./session-accessor.sqlite-entry-equality.js";
-import type { SessionEntryMaintenanceAgeFact } from "./session-accessor.sqlite-maintenance-age.js";
+import type { SqliteSessionEntryRevision } from "./session-accessor.sqlite-entry-revision.js";
+import type { SessionEntryMaintenanceAgeChange } from "./session-accessor.sqlite-maintenance-age.js";
 import type {
   SessionEntryCommitContext,
   SessionEntryCreateWithTranscriptOptions,
@@ -119,7 +120,7 @@ export type ProjectedLifecycleCommitResult = {
   pendingArchives: boolean;
 };
 
-export type ProjectedLifecycleRemovalCommitInput = {
+export type ProjectedLifecycleCommitInput = {
   projected: ProjectedLifecycleMutation;
   materializationFailed: boolean;
   allowCanonicalRepair?: boolean;
@@ -183,7 +184,6 @@ export type SqliteSessionDeletionScope =
   | { kind: "entry"; phase: "plan" | "commit" }
   | { kind: "historical-generation"; phase: "plan" | "commit"; sessionId: string };
 export type SessionEntryMaintenanceInput = {
-  ageFact?: SessionEntryMaintenanceAgeFact;
   activeSessionKey?: string;
   activeSessionKeys?: readonly string[];
   archiveDirectory: string;
@@ -191,6 +191,12 @@ export type SessionEntryMaintenanceInput = {
   maintenance: ResolvedSessionMaintenanceConfig;
   preservation: SessionMaintenancePreservationSnapshot | null;
   storePath: string;
+};
+
+type SessionMaintenanceAgeSnapshot = {
+  incarnation: string;
+  revision: SqliteSessionEntryRevision;
+  capture: number;
 };
 
 export type SessionMaintenanceLiveProtection = Pick<
@@ -205,6 +211,32 @@ type SessionReclamationPlanBase = {
   materializedPlans: MaterializedSessionStateDeletePlan[];
 };
 
+export type SessionMaintenanceMetadataCommand =
+  | { kind: "maintenance-statistics" }
+  | {
+      kind: "maintenance-age";
+      ageChanges?: readonly SessionEntryMaintenanceAgeChange[];
+      maintenance: ResolvedSessionMaintenanceConfig;
+      expected?: SessionMaintenanceAgeSnapshot;
+    }
+  | {
+      kind: "maintenance-plan";
+      ageOwner?: string;
+      ageChanges?: readonly SessionEntryMaintenanceAgeChange[];
+      input: SessionEntryMaintenanceInput;
+    };
+
+export type SessionMaintenanceMetadataResult =
+  | { kind: "maintenance-statistics"; value: true }
+  | { kind: "maintenance-age"; nextAt: number | undefined }
+  | { kind: "maintenance-preservation-required" }
+  | { kind: "maintenance-plan-stale" }
+  | {
+      kind: "maintenance-plan";
+      value: SessionEntryMaintenancePlan;
+      ageSnapshot: SessionMaintenanceAgeSnapshot;
+    };
+
 export type SqliteSessionReclamationPlan =
   | (SessionReclamationPlanBase & {
       kind: "lifecycle-projection-plan";
@@ -213,7 +245,7 @@ export type SqliteSessionReclamationPlan =
   | (SessionReclamationPlanBase & {
       agentId: string;
       kind: "lifecycle-projection-commit";
-      input: ProjectedLifecycleRemovalCommitInput;
+      input: ProjectedLifecycleCommitInput;
     })
   | (SessionReclamationPlanBase & { kind: "lifecycle-projection-count" })
   | (SessionReclamationPlanBase & {
@@ -231,11 +263,7 @@ export type SqliteSessionReclamationPlan =
       nowMs: number;
     })
   | (SessionReclamationPlanBase & { kind: "maintenance-pages"; maxPages?: number })
-  | (SessionReclamationPlanBase & { kind: "maintenance-statistics" })
-  | (SessionReclamationPlanBase & {
-      kind: "maintenance-plan";
-      input: SessionEntryMaintenanceInput;
-    })
+  | (SessionReclamationPlanBase & SessionMaintenanceMetadataCommand & { materializedPlans: [] })
   | (SessionReclamationPlanBase & {
       agentId: string;
       entries: SessionEntryRemovalPlan[];
@@ -265,6 +293,11 @@ export type SqliteSessionReclamationPlan =
       sessionId: string;
     });
 
+export type SqliteArchiveReclamationPlan = Exclude<
+  SqliteSessionReclamationPlan,
+  SessionMaintenanceMetadataCommand
+>;
+
 export type SqliteSessionReclamationResult =
   | { kind: "lifecycle-projection-plan"; value: ProjectedLifecycleMutation }
   | { kind: "lifecycle-projection-commit"; value: ProjectedLifecycleCommitResult }
@@ -273,14 +306,7 @@ export type SqliteSessionReclamationResult =
   | { kind: "archive-publish-prepare"; value: TranscriptArchivePublishPlan[] }
   | { kind: "archive-publish-record"; value: true }
   | { kind: "maintenance-pages"; value: SqliteWalReclamationResult }
-  | { kind: "maintenance-statistics"; value: true }
-  | { kind: "maintenance-preservation-required" }
-  | { kind: "maintenance-plan-stale" }
-  | {
-      kind: "maintenance-plan";
-      value: SessionEntryMaintenancePlan;
-      ageFact?: SessionEntryMaintenanceAgeFact;
-    }
+  | SessionMaintenanceMetadataResult
   | {
       kind: "maintenance-finalize";
       value: {

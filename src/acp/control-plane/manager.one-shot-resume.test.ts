@@ -199,7 +199,7 @@ describe("AcpSessionManager one-shot resume", () => {
         expect(runtimeState.getStatus).toHaveBeenCalledOnce();
         expect(managerWriteIndex).toBe(3);
         expect(
-          listSessionStateEventsSince(sessionKey, "codex", 0, 20).events.filter(
+          (await listSessionStateEventsSince(sessionKey, "codex", 0, 20)).events.filter(
             (event) => event.runId === "terminal-readiness-run" && event.kind === "run_completed",
           ),
         ).toHaveLength(1);
@@ -529,6 +529,113 @@ describe("AcpSessionManager one-shot resume", () => {
     );
   }, 300_000);
 
+  it("fences readiness generation for an unchanged completed one-shot", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
+      async () => {
+        const sessionKey = "agent:codex:acp:unchanged-observation-generation-race";
+        const runtimeState = createRuntime();
+        const replacement = readySessionMeta({
+          backend: "replacement-backend",
+          runtimeSessionName: "replacement-runtime",
+          mode: "oneshot",
+          identity: {
+            state: "resolved",
+            source: "status",
+            acpxRecordId: "replacement-record",
+            acpxSessionId: "replacement-acp-id",
+            sessionResumeSupported: true,
+            sessionResumeReady: false,
+            lastUpdatedAt: 2,
+          },
+        });
+        let injected = false;
+        let unownedWrites = 0;
+        let readinessWrites = 0;
+        const persisted = installStatefulSession({
+          sessionKey,
+          parentSessionKey: "agent:main:main",
+          initialMeta: readySessionMeta({
+            backend: "primary-backend",
+            runtimeSessionName: "runtime",
+            mode: "oneshot",
+            identity: {
+              state: "resolved",
+              source: "status",
+              acpxRecordId: "turn-record",
+              acpxSessionId: "turn-acp-id",
+              sessionResumeSupported: true,
+              sessionResumeReady: false,
+              lastUpdatedAt: 1,
+            },
+          }),
+          beforeMutate: (options) => {
+            if (!options.skipMaintenance) {
+              unownedWrites += 1;
+            }
+            if (!injected && unownedWrites === 2) {
+              injected = true;
+              return replacement;
+            }
+            return undefined;
+          },
+          onPersist: (observation) => {
+            if (
+              observation.skipMaintenance &&
+              observation.takeCacheOwnership &&
+              observation.next.identity?.sessionResumeReady === true
+            ) {
+              readinessWrites += 1;
+            }
+          },
+        });
+        runtimeState.ensureSession.mockImplementation(async (input) => ({
+          sessionKey: input.sessionKey,
+          backend: "primary-backend",
+          runtimeSessionName: "runtime",
+          acpxRecordId: "turn-record",
+          backendSessionId: "turn-acp-id",
+          sessionResumeSupported: true,
+        }));
+        runtimeState.getStatus.mockResolvedValue({
+          summary: "status=alive",
+          acpxRecordId: "turn-record",
+          backendSessionId: "turn-acp-id",
+          sessionResumeSupported: true,
+        });
+        hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+          id: "primary-backend",
+          runtime: runtimeState.runtime,
+        });
+
+        await expect(
+          new AcpSessionManager().runTurn({
+            provenance: "system",
+            cfg: { acp: { ...baseCfg.acp, backend: "primary-backend" } },
+            sessionKey,
+            text: "complete against an unchanged observation",
+            mode: "prompt",
+            requestId: "unchanged-observation-generation-race",
+          }),
+        ).rejects.toMatchObject({
+          code: "ACP_TURN_FAILED",
+          message: expect.stringContaining("identity changed"),
+        });
+
+        expect(injected).toBe(true);
+        expect(readinessWrites).toBe(0);
+        expect(persisted.currentMeta.backend).toBe("replacement-backend");
+        expect(persisted.currentMeta.identity).toMatchObject({
+          acpxRecordId: "replacement-record",
+          acpxSessionId: "replacement-acp-id",
+          sessionResumeReady: false,
+        });
+        expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
+        expect(runtimeState.runTurn).toHaveBeenCalledOnce();
+      },
+    );
+  }, 300_000);
+
   it.each([
     {
       label: "cancelled",
@@ -801,7 +908,7 @@ describe("AcpSessionManager one-shot resume", () => {
         expect(manager.getObservabilitySnapshot().turns).toMatchObject({ completed: 0, failed: 1 });
         expect(managerWriteCount).toBe(3);
         expect(
-          listSessionStateEventsSince(sessionKey, "codex", 0, 20).events.filter(
+          (await listSessionStateEventsSince(sessionKey, "codex", 0, 20)).events.filter(
             (event) => event.runId === "readiness-write-failure" && event.kind === "run_failed",
           ),
         ).toHaveLength(1);

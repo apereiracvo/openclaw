@@ -275,9 +275,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
             runId: toolCallId,
             status: expectedStatus,
             sessionKey,
-            ...(expectedStatus === "accepted"
-              ? { delivery: { status: "skipped" } }
-              : {}),
+            ...(expectedStatus === "accepted" ? { delivery: { status: "skipped" } } : {}),
           });
           return result;
         };
@@ -299,7 +297,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
           "integrated-followup-2",
         ]) {
           expect(
-            listSessionStateEventsSince(sessionKey, "codex", 0, 100).events.filter(
+            (await listSessionStateEventsSince(sessionKey, "codex", 0, 100)).events.filter(
               (event) => event.runId === requestId && event.kind === "run_completed",
             ),
           ).toHaveLength(1);
@@ -372,9 +370,9 @@ describe("ACP one-shot cross-owner resume integration", () => {
           allowBackendUnavailable: true,
         });
         expect(readAcpSessionMeta({ cfg, sessionKey })).toBeUndefined();
-        expect(
-          (await listAcpSessionEntries({ clone: false })).map((row) => row.sessionKey),
-        ).not.toContain(sessionKey);
+        expect((await listAcpSessionEntries({ cfg })).map((row) => row.sessionKey)).not.toContain(
+          sessionKey,
+        );
       },
     );
   }, 300_000);
