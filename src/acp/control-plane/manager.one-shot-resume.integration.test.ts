@@ -17,7 +17,7 @@ import {
   listAcpSessionEntries,
   readAcpSessionEntry,
   readAcpSessionEntryAsync,
-  readAcpSessionMeta,
+  readAcpSessionMetaAsync,
   prepareAcpSessionControlRead,
   upsertAcpSessionMeta,
   upsertAcpSessionMetaForControl,
@@ -284,7 +284,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
           ["integrated-followup-1", "repeat marker"],
           ["integrated-followup-2", "repeat it again"],
         ] as const) {
-          expect(readAcpSessionMeta({ cfg, sessionKey })).toMatchObject({
+          expect(await readAcpSessionMetaAsync({ cfg, sessionKey })).toMatchObject({
             backend,
             identity: { acpxSessionId: protocolSessionId, sessionResumeReady: true },
           });
@@ -357,7 +357,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
         ]);
         expect(gatewayCalls.filter((call) => call.method === "agent")).toHaveLength(3);
 
-        expect(readAcpSessionMeta({ cfg, sessionKey })).toMatchObject({
+        expect(await readAcpSessionMetaAsync({ cfg, sessionKey })).toMatchObject({
           state: "error",
           identity: { acpxSessionId: protocolSessionId, sessionResumeReady: true },
         });
@@ -369,7 +369,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
           clearMeta: true,
           allowBackendUnavailable: true,
         });
-        expect(readAcpSessionMeta({ cfg, sessionKey })).toBeUndefined();
+        expect(await readAcpSessionMetaAsync({ cfg, sessionKey })).toBeUndefined();
         expect((await listAcpSessionEntries({ cfg })).map((row) => row.sessionKey)).not.toContain(
           sessionKey,
         );

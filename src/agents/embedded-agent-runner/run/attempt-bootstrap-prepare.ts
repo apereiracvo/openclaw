@@ -60,31 +60,22 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
   });
   const resolveWorkspaceBootstrapFiles = (workspaceDir: string) =>
     resolveBootstrapFilesForRun({
+      ...attempt,
       workspaceDir,
-      config: attempt.config,
-      sessionKey: attempt.sessionKey,
-      sessionId: attempt.sessionId,
-      bootstrapUserProfileId: attempt.bootstrapUserProfileId,
-      chatType: attempt.chatType,
       agentId: params.setup.sessionAgentId,
       warn: bootstrapWarn,
       contextMode: attempt.bootstrapContextMode,
       runKind: attempt.bootstrapContextRunKind,
     });
   let completedBootstrapTurn: boolean | undefined;
-  const hasCompletedBootstrapTurnForAttempt = async () => {
-    completedBootstrapTurn ??= await hasCompletedBootstrapTurn(attempt.sessionTarget);
-    return completedBootstrapTurn;
-  };
+  const hasCompletedBootstrapTurnForAttempt = async () =>
+    (completedBootstrapTurn ??= await hasCompletedBootstrapTurn(attempt.sessionTarget));
   const resolveBootstrapRouting = (bootstrapFiles?: readonly WorkspaceBootstrapFile[]) =>
     resolveWorkspaceBootstrapRouting({
+      ...attempt,
       isWorkspaceBootstrapPending,
       bootstrapFiles,
-      bootstrapContextRunKind: attempt.bootstrapContextRunKind,
-      trigger: attempt.trigger,
-      sessionKey: attempt.sessionKey,
       isPrimaryRun: isPrimaryBootstrapRun(attempt.sessionKey),
-      isCanonicalWorkspace: attempt.isCanonicalWorkspace,
       effectiveWorkspace: params.setup.effectiveWorkspace,
       resolvedWorkspace: bootstrapWorkspaceDir,
       hasBootstrapFileAccess: params.hasReadTool,
@@ -124,10 +115,12 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     resolveBootstrapContextForRun: async () => {
       const bootstrapFiles =
         preloadedBootstrapFiles ?? (await resolveWorkspaceBootstrapFiles(bootstrapWorkspaceDir));
-      // A spawned project child resolves the run workspace to the target agent's
-      // workspace and expresses the selected project root only as its execution
-      // cwd, so the project root comes from creation-validated provenance rather
-      // than from the run workspace. Absent that fact, layering stays suppressed.
+      // `executionAgentsRootDir` is creation-validated registered-project provenance
+      // (sessions.create canonicalized and containment-checked the spawned cwd for this
+      // project), so that root layers even when it is not the run workspace. Without it
+      // the layer falls back to the run workspace, so a projectless spawned cwd that
+      // became the run workspace (#162308) still layers its AGENTS.md; layering is
+      // skipped only when the execution root resolves to the bootstrap workspace.
       const executionAgentsRoot = attempt.executionAgentsRootDir ?? params.setup.resolvedWorkspace;
       const executionAgentsPath = path.join(
         path.resolve(executionAgentsRoot),

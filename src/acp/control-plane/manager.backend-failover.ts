@@ -11,19 +11,13 @@ export type BackendAttempt = {
   sawOutput: boolean;
 };
 
-/** Ordered backend candidates plus display helper for diagnostics. */
-type BackendCandidatePlan = {
-  candidateBackends: string[];
-  describeBackendCandidate: (backend: string) => string;
-};
-
 /** Builds the deduped backend order, or one persisted owner for an exact continuation. */
 export function resolveBackendCandidatePlan(params: {
   configuredPrimaryBackend?: string;
   resolvedPrimaryBackend?: string;
   fallbackBackends?: readonly unknown[];
   pinnedBackend?: string;
-}): BackendCandidatePlan {
+}) {
   const configuredPrimaryBackend = normalizeText(params.configuredPrimaryBackend);
   const resolvedPrimaryBackend = normalizeText(params.resolvedPrimaryBackend);
   const pinnedBackend = normalizeText(params.pinnedBackend);
@@ -40,7 +34,7 @@ export function resolveBackendCandidatePlan(params: {
       : Array.from(
           new Set([configuredPrimaryBackend ?? resolvedPrimaryBackend ?? "", ...fallbackBackends]),
         ),
-    describeBackendCandidate: (backend) =>
+    describeBackendCandidate: (backend: string) =>
       backend || pinnedBackend || resolvedPrimaryBackend || configuredPrimaryBackend || "<auto>",
   };
 }

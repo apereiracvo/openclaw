@@ -87,9 +87,10 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
   });
 
   it("layers a selected project root after agent bootstrap for a spawned project child", async () => {
-    // A visible sessions_spawn(projectId) child resolves its run workspace to the
-    // target agent's workspace and expresses the project root only as execution
-    // cwd, so workspace identity alone cannot locate the project's instructions.
+    // A visible sessions_spawn(projectId) child runs from its creation-validated
+    // project root as the run workspace (#162308). Canonical agent bootstrap still
+    // resolves from the target agent workspace, so the project root AGENTS.md has
+    // to layer on top rather than disappear into the run workspace.
     const agentWorkspace = await fs.realpath(
       await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-agent-workspace-")),
     );
@@ -106,7 +107,7 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
 
     const result = await prepare({
       agentWorkspace,
-      sessionWorkspace: agentWorkspace,
+      sessionWorkspace: projectRoot,
       cwd: projectRoot,
       executionAgentsRootDir: projectRoot,
     });
@@ -246,9 +247,10 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
     ).toHaveLength(1);
   });
 
-  it("keeps an unregistered execution cwd out of the bootstrap layer", async () => {
-    // An explicit spawn `cwd` carries no registered-project provenance, so its
-    // AGENTS.md must not become the project layer and output stays byte-identical
+  it("keeps an execution cwd out of the bootstrap layer when the run workspace stays canonical", async () => {
+    // Layering is skipped only when the execution root resolves to the bootstrap
+    // workspace. Here the run workspace stays the canonical agent workspace, so an
+    // explicit spawn cwd is not the execution root and output stays byte-identical
     // to the same-workspace route.
     const agentWorkspace = await fs.realpath(
       await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-agent-workspace-")),
@@ -274,6 +276,59 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
       expect.objectContaining({ path: path.join(unregisteredCwd, "AGENTS.md") }),
     );
     expect(withUnregisteredCwd).toEqual(sameWorkspace);
+  });
+
+  it("layers an unregistered spawned cwd that became the run workspace", async () => {
+    // #162308 runs a spawned child from its creation-validated cwd as the run
+    // workspace. With no registered-project provenance the layer falls back to that
+    // run workspace, so the cwd AGENTS.md layers after canonical agent bootstrap
+    // while project-only identity files stay out.
+    const agentWorkspace = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-agent-workspace-")),
+    );
+    const spawnedCwd = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-spawned-cwd-")),
+    );
+    tempDirs.push(agentWorkspace, spawnedCwd);
+    await fs.writeFile(path.join(agentWorkspace, "AGENTS.md"), "Canonical agent instructions");
+    await fs.writeFile(path.join(agentWorkspace, "SOUL.md"), "Canonical agent soul");
+    await fs.writeFile(path.join(agentWorkspace, "MEMORY.md"), "Canonical agent memory");
+    await fs.writeFile(path.join(spawnedCwd, "AGENTS.md"), "Spawned cwd instructions");
+    for (const name of ["SOUL.md", "MEMORY.md", "BOOTSTRAP.md", "USER.md"]) {
+      await fs.writeFile(path.join(spawnedCwd, name), `Spawned cwd ${name} must stay private`);
+    }
+
+    const result = await prepare({
+      agentWorkspace,
+      sessionWorkspace: spawnedCwd,
+      cwd: spawnedCwd,
+    });
+    const spawnedAgentsIndex = result.contextFiles.findIndex(
+      (file) => file.path === path.join(spawnedCwd, "AGENTS.md"),
+    );
+    const lastAgentFileIndex = result.contextFiles.findLastIndex((file) =>
+      file.path.startsWith(`${agentWorkspace}${path.sep}`),
+    );
+
+    expect(spawnedAgentsIndex).toBeGreaterThan(lastAgentFileIndex);
+    expect(result.contextFiles[spawnedAgentsIndex]).toEqual(
+      expect.objectContaining({
+        path: path.join(spawnedCwd, "AGENTS.md"),
+        content: "Spawned cwd instructions",
+      }),
+    );
+    for (const name of ["SOUL.md", "MEMORY.md"]) {
+      expect(result.contextFiles).toContainEqual(
+        expect.objectContaining({
+          path: path.join(agentWorkspace, name),
+        }),
+      );
+    }
+    for (const name of ["SOUL.md", "MEMORY.md", "BOOTSTRAP.md", "USER.md"]) {
+      expect(result.contextFiles).not.toContainEqual(
+        expect.objectContaining({ path: path.join(spawnedCwd, name) }),
+      );
+    }
   });
 
   it("keeps a project root outside the agent workspace on its real path", async () => {

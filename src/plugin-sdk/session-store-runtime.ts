@@ -20,6 +20,11 @@ import {
   readTranscriptStatsSync as readAccessorTranscriptStatsSync,
   updateSessionEntry,
 } from "../config/sessions/session-accessor.js";
+import { readSessionUpdatedAtInWorker } from "../config/sessions/session-entry-read-runtime.js";
+import {
+  captureExternalSessionCommitGuard,
+  sessionEntryCommitGuardOptions,
+} from "../config/sessions/session-source-authority.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import { normalizeResolvedMaintenanceConfigInput } from "../config/sessions/store-maintenance.js";
 import type { ResolvedSessionMaintenanceConfigInput } from "../config/sessions/store-maintenance.js";
@@ -234,7 +239,9 @@ export async function patchSessionEntry(
       return preserveGenerationPrivateFields(persistedEntry, projectPluginSessionEntryPatch(patch));
     },
     {
-      assertCommitAllowed: params.assertCommitAllowed,
+      ...sessionEntryCommitGuardOptions(
+        captureExternalSessionCommitGuard(params.assertCommitAllowed),
+      ),
       fallbackEntry: params.fallbackEntry
         ? projectPluginSessionEntry(params.fallbackEntry)
         : undefined,
@@ -251,9 +258,16 @@ export async function patchSessionEntry(
   return entry ? projectPluginSessionEntry(entry) : null;
 }
 
-/** Reads the last activity timestamp for one session entry. */
+/** @deprecated Use readSessionUpdatedAtAsync. Retained until the next Plugin SDK major. */
 export function readSessionUpdatedAt(params: SessionStoreReadParams): number | undefined {
   return readAccessorSessionUpdatedAt(toSessionAccessScope(params));
+}
+
+/** Reads the last activity timestamp without creating a missing session store. */
+export function readSessionUpdatedAtAsync(
+  params: SessionStoreReadParams,
+): Promise<number | undefined> {
+  return readSessionUpdatedAtInWorker(toSessionAccessScope(params));
 }
 
 export { resolveAmbientTranscriptWatermarkKey, updateAmbientTranscriptWatermark };
@@ -349,7 +363,11 @@ export function resolveSessionStoreBackupPaths(params: {
   return [...backupPaths];
 }
 
-/** Cleans stale lifecycle-owned session entries and orphan transcripts for one agent store. */
+/**
+ * Cleans stale lifecycle-owned session entries and orphan transcripts for one agent store.
+ * Joins pending startup preparation before capturing the database identity; failed preparation
+ * still surfaces through normal admission checks. Prepared agents do not wait.
+ */
 export async function cleanupSessionLifecycleArtifacts(
   params: SessionLifecycleArtifactsCleanupParams,
 ): Promise<SessionLifecycleArtifactsCleanupResult> {

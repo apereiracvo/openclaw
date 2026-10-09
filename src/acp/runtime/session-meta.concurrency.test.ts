@@ -11,7 +11,7 @@ import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-d
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { withTestDir } from "../../test-helpers/temp-dir.js";
 import { withAcpSessionMetaWriteLock } from "./session-meta-write-lock.js";
-import { readAcpSessionMeta, upsertAcpSessionMeta } from "./session-meta.js";
+import { readAcpSessionMetaAsync, upsertAcpSessionMeta } from "./session-meta.js";
 
 const ACP_AGENT_ID = "codex";
 
@@ -125,7 +125,9 @@ describe("ACP session metadata write serialization", () => {
       await Promise.all([writer.settled, first, second]);
 
       expect(mutationOrder).toEqual(["first", "second"]);
-      expect(readAcpSessionMeta({ cfg, databasePath, sessionKey })?.lastActivityAt).toBe(3);
+      expect((await readAcpSessionMetaAsync({ cfg, databasePath, sessionKey }))?.lastActivityAt).toBe(
+        3,
+      );
     });
   });
 
@@ -221,7 +223,7 @@ describe("ACP session metadata write serialization", () => {
       writer.release();
       await Promise.all([writer.settled, staleReadiness, replacement]);
 
-      expect(readAcpSessionMeta({ cfg, databasePath, sessionKey })).toMatchObject({
+      expect(await readAcpSessionMetaAsync({ cfg, databasePath, sessionKey })).toMatchObject({
         runtimeSessionName: "generation-b",
         identity: {
           acpxRecordId: "record-b",

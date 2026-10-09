@@ -1,4 +1,5 @@
 import { clampPositiveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { sleepWithAbort } from "openclaw/plugin-sdk/retry-runtime";
 import {
   BrowserProfileUnavailableError,
   BrowserTabNotFoundError,
@@ -12,13 +13,16 @@ import {
 import { getBrowserProfileCapabilities } from "../profile-capabilities.js";
 import { isManagedOnlyBrowserRequest } from "../request-policy.js";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
-import { isProfileRestartRequiredError } from "../server-context.lifecycle.js";
 import { clearSnapshotKeysForTab } from "../snapshot-delta-cache.js";
 import { resolveTargetIdFromTabs } from "../target-id.js";
-import { browserNavigationPolicyForProfile, resolveProfileContext } from "./agent.shared.js";
+import {
+  browserNavigationPolicyForProfile,
+  handleRouteError,
+  resolveProfileContext,
+} from "./agent.shared.js";
 import { readRouteNonNegativeInteger } from "./route-numeric.js";
 import type { BrowserRequest, BrowserResponse, BrowserRouteRegistrar } from "./types.js";
-import { jsonBrowserError, jsonError, runProfileRouteOperation, toStringOrEmpty } from "./utils.js";
+import { jsonError, runProfileRouteOperation, toStringOrEmpty } from "./utils.js";
 
 const DEFAULT_TAB_REACHABILITY_TIMEOUT_MS = 300;
 const TAB_REACHABILITY_RETRY_DELAY_MS = 250;
@@ -43,16 +47,10 @@ async function runTabsProfileRoute(params: {
       run: async (signal) => await params.run(profileCtx, signal),
     });
   } catch (err) {
-    if (isProfileRestartRequiredError(err)) {
-      throw err;
-    }
-    const mapped = params.mapTabError ? toBrowserErrorResponse(err) : undefined;
-    if (mapped) {
-      jsonBrowserError(params.res, mapped);
-    } else {
-      jsonError(params.res, 500, String(err));
-    }
-    return;
+    return handleRouteError(params.res, err, {
+      formatMessage: String,
+      mapBrowserError: params.mapTabError ?? false,
+    });
   }
   if (result) {
     params.res.json(result);
@@ -80,9 +78,7 @@ async function ensureBrowserRunning(
   // A running browser can outlive one short CDP probe; retry once before
   // rejecting a tab mutation and leaving session-owned tabs behind.
   if (!isReachable && !signal.aborted) {
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, TAB_REACHABILITY_RETRY_DELAY_MS);
-    });
+    await sleepWithAbort(TAB_REACHABILITY_RETRY_DELAY_MS);
     signal.throwIfAborted();
     isReachable = await checkTabReachability(ctx, profileCtx, signal);
   }

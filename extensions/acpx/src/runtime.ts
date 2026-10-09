@@ -861,11 +861,9 @@ export class AcpxRuntime implements CompleteAcpRuntime {
     });
   }
 
-  async findSession(input: {
-    sessionKey: string;
-    agent: string;
-    agentId?: string;
-  }): Promise<OpenClawRuntimeHandle | undefined> {
+  async findSession(
+    input: Parameters<CompleteAcpRuntime["findSession"]>[0],
+  ): Promise<OpenClawRuntimeHandle | undefined> {
     const resource = assertAcpxSessionOwnerLocator(input, this.legacyBareSessionKeys);
     const generation = this.generationRegistry.currentGeneration(resource);
     return this.runInGeneration(input, { generation }, async () => {
@@ -874,6 +872,8 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         agent: input.agent,
       });
       this.generationRegistry.assertCurrentGeneration(generation);
+      // Returned handles keep their reset fence, including closed persisted history.
+      generation.admitted ||= Boolean(handle);
       return handle
         ? {
             ...handle,

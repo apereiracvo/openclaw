@@ -3,7 +3,7 @@ import type {
   releaseAcpTurnAdmission,
   reserveAcpTurnAdmission,
 } from "../../acp/control-plane/active-turns.js";
-import type { readAcpSessionMeta } from "../../acp/runtime/session-meta.js";
+import type { readAcpSessionMetaAsync } from "../../acp/runtime/session-meta.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import type { AgentToolGatewayRequestCaller } from "./in-process-gateway.js";
@@ -14,6 +14,7 @@ export type SessionsSendToolOptions = {
   agentSessionKey?: string;
   agentSessionId?: string;
   requesterTurnRunId?: string;
+  inheritedToolPolicySource?: "sender";
   agentChannel?: string;
   requesterOrigin?: DeliveryContext;
   sandboxed?: boolean;
@@ -29,5 +30,5 @@ export type SessionsSendToolOptions = {
   isAcpTurnActive?: typeof isAcpTurnActive;
   reserveAcpTurnAdmission?: typeof reserveAcpTurnAdmission;
   releaseAcpTurnAdmission?: typeof releaseAcpTurnAdmission;
-  readAcpSessionMeta?: typeof readAcpSessionMeta;
+  readAcpSessionMetaAsync?: typeof readAcpSessionMetaAsync;
 };
