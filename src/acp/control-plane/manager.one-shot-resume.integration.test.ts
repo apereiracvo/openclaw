@@ -132,6 +132,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
         const backend = "wire-backend";
         const protocolSessionId = "wire-session-1";
         const openClawSessionId = "openclaw-child-session";
+        const parentSessionId = "openclaw-parent-session";
         const cfg = {
           session: { mainKey: "main", scope: "per-sender" },
           tools: {
@@ -150,12 +151,17 @@ describe("ACP one-shot cross-owner resume integration", () => {
         } as OpenClawConfig;
 
         await replaceSessionEntry(
+          { agentId: "codex", sessionKey: parentSessionKey },
+          { sessionId: parentSessionId, updatedAt: Date.now() },
+        );
+        await replaceSessionEntry(
           { agentId: "codex", sessionKey },
           {
             sessionId: openClawSessionId,
             updatedAt: Date.now(),
             spawnedBy: parentSessionKey,
             parentSessionKey,
+            parentSessionId,
           },
         );
         await upsertAcpSessionMeta({
@@ -383,10 +389,15 @@ describe("ACP one-shot cross-owner resume integration", () => {
       async ({ root }) => {
         const sessionKey = "agent:codex:acp:fenced-resume-child";
         const parentSessionKey = "agent:codex:main";
+        const parentSessionId = "fenced-parent-session";
         const cfg = {
           session: {},
           tools: { sessions: { visibility: "tree" }, agentToAgent: { enabled: true } },
         } as OpenClawConfig;
+        await replaceSessionEntry(
+          { agentId: "codex", sessionKey: parentSessionKey },
+          { sessionId: parentSessionId, updatedAt: Date.now() },
+        );
         await replaceSessionEntry(
           { agentId: "codex", sessionKey },
           {
@@ -394,6 +405,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
             updatedAt: Date.now(),
             spawnedBy: parentSessionKey,
             parentSessionKey,
+            parentSessionId,
             acp: {
               ...pendingOneShotMeta({
                 backend: "wire-backend",
