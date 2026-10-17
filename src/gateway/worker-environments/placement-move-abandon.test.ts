@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { setRuntimeConfigSnapshot } from "../../config/io.js";
 import {
   NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
   NODE_WORKER_WORKSPACE_EXEC_COMMAND,
@@ -43,6 +44,7 @@ describe("offline device placement abandonment", () => {
   let stopServices: Array<() => Promise<void>>;
 
   beforeEach(() => {
+    setRuntimeConfigSnapshot({});
     stopServices = [];
     root = tempDirs.make("openclaw-device-abandon-");
     database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
@@ -193,7 +195,7 @@ describe("offline device placement abandonment", () => {
       attachedSessionIds: [],
       lastError: FORCED_WORKER_ABANDONMENT_ERROR,
     });
-    expect(fixture.invoke).toHaveBeenLastCalledWith(
+    expect(fixture.invoke).toHaveBeenCalledWith(
       expect.objectContaining({
         command: NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
         params: expect.objectContaining({
@@ -203,8 +205,7 @@ describe("offline device placement abandonment", () => {
         }),
       }),
     );
-    expect(fixture.invoke).toHaveBeenNthCalledWith(
-      fixture.invoke.mock.calls.length - 1,
+    expect(fixture.invoke).toHaveBeenCalledWith(
       expect.objectContaining({
         command: NODE_WORKER_WORKSPACE_EXEC_COMMAND,
         params: expect.objectContaining({
@@ -252,10 +253,10 @@ describe("offline device placement abandonment", () => {
     await expect(harness.service.move(requestFor(active))).resolves.toMatchObject({
       state: "local",
     });
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
     expectRetainedDeviceCleanup(fixture);
     await finishDeviceCleanup(fixture);
-    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(invoke).toHaveBeenCalledTimes(4);
   });
 
   it("force destroys an unreachable device and accepts its already fenced placement for abandonment", async () => {

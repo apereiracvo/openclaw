@@ -186,6 +186,15 @@ describe("workshop library", () => {
     expect(await listWorkshopArchive({}, "main")).toEqual([]);
   });
 
+  it("rejects a patch whose old text matches overlapping places", async () => {
+    await createWorkshopSkill(ctx, { name: "deploy", content: skill("deploy", "run\nrun\nrun") });
+
+    await expect(
+      patchWorkshopSkill(ctx, { name: "deploy", oldText: "run\nrun", newText: "go" }),
+    ).rejects.toThrow(/matches 2 places/);
+    expect(await readLive("deploy")).toBe(skill("deploy", "run\nrun\nrun"));
+  });
+
   it("never lists or reads a symlinked saved version", async () => {
     await createWorkshopSkill(ctx, { name: "deploy", content: skill("deploy", "step 1") });
     const outside = path.join(state.root, "outside");
@@ -294,6 +303,33 @@ describe("workshop library", () => {
       "Learning is off.",
     );
     expect(await readLive("deploy")).toContain("step 1");
+  });
+
+  it("retains the original live copy when restore publication and rollback both fail", async () => {
+    await createWorkshopSkill(ctx, { name: "deploy", content: skill("deploy", "step 0") });
+    await patchWorkshopSkill(ctx, { name: "deploy", oldText: "step 0", newText: "step 1" });
+    const live = path.join(resolveWorkshopSkillsDir({}, "main"), "deploy");
+    let previous = "";
+    const rename = fs.rename;
+    const publishing = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (from === live) {
+        previous = String(to);
+      } else if (to === live) {
+        throw new Error(from === previous ? "rollback blocked" : "publication blocked");
+      }
+      await rename(from, to);
+    });
+    try {
+      await expect(restoreWorkshopSkill(ctx, { name: "deploy" })).rejects.toThrow(
+        "rollback blocked",
+      );
+    } finally {
+      publishing.mockRestore();
+    }
+    expect(previous).toContain(".restore-previous-");
+    expect(await fs.readFile(path.join(previous, "SKILL.md"), "utf8")).toBe(
+      skill("deploy", "step 1"),
+    );
   });
 
   it("keeps a longer legacy skill manageable while new names stay within 63 characters", async () => {

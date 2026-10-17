@@ -73,6 +73,7 @@ export function collectAgentDatabasePreflightTargets(options: {
     | readonly AgentTarget[]
     | ((registered: readonly AgentTarget[]) => readonly AgentTarget[]);
   configuredAgentDatabaseCandidatePaths?: readonly string[];
+  inspectHeldAgentDatabaseTargets?: readonly AgentTarget[];
   inspectCandidateOwners: boolean;
   onAgentDatabaseDiscovery?: (prepared: PreparedAgentDatabaseMigrationDiscovery) => void;
 }) {
@@ -144,6 +145,7 @@ export function collectAgentDatabasePreflightTargets(options: {
     registeredAgentDatabases: registeredDatabases,
   });
   return {
+    configuredTargets,
     candidates:
       purpose === "runtime"
         ? candidates.filter((row) => typeof classifyDeletion(row.path, row.agentId) !== "object")
@@ -162,7 +164,10 @@ export function collectAgentDatabasePreflightTargets(options: {
                 (row.agentId === undefined || !retainedAgentIds.has(row.agentId)) &&
                 !(
                   deletionJournal.status === "present" &&
-                  deletionJournal.held.some((target) => samePath(target.path, row.path))
+                  deletionJournal.held.some((target) => samePath(target.path, row.path)) &&
+                  !options.inspectHeldAgentDatabaseTargets?.some(
+                    (target) => target.agentId === row.agentId && samePath(target.path, row.path),
+                  )
                 ),
             ),
     isRetainedPath: (pathname: string) =>

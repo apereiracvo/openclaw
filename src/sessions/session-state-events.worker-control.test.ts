@@ -77,8 +77,11 @@ vi.mock("../infra/kysely-sync.js", async (importOriginal) => ({
   executeSqliteQuerySync: edge.forbidden,
   executeSqliteQueryTakeFirstSync: edge.forbidden,
 }));
-// Keep config loading from publishing metadata readers that capture this fixture's native mocks.
-vi.mock("../config/io.js", () => ({ getRuntimeConfig: () => ({}) }));
+// Resolve watcher stores without loading runtime config through the forbidden native boundary.
+vi.mock("../config/runtime-snapshot.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config/runtime-snapshot.js")>()),
+  readRuntimeConfig: () => ({}),
+}));
 vi.mock("../config/sessions/session-accessor.js", () => ({ loadSessionEntryReadOnly: vi.fn() }));
 vi.mock("../logging/subsystem.js", () => ({
   createSubsystemLogger: () => ({ warn: edge.warn }),
@@ -255,6 +258,8 @@ describe("Session signal worker reconciliation", () => {
         now,
         onlyIfWatched: undefined,
         expectedUpstream: undefined,
+        acpControl: undefined,
+        sessionEntryCurrentSource: undefined,
         event: {
           sessionKey: "global",
           sessionId: "original-session",

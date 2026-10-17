@@ -11,7 +11,7 @@ import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.j
 import { captureEnv } from "../test-utils/env.js";
 import {
   clearInternalHooks,
-  getRegisteredEventKeys,
+  hasInternalHookListeners,
   triggerInternalHook,
   createInternalHookEvent,
   registerInternalHook,
@@ -153,9 +153,8 @@ describe("loader", () => {
       // The typo'd key never fires, but validation is advisory: the hook still
       // loads and its valid subscriptions keep working.
       expect(count).toBe(1);
-      const keys = getRegisteredEventKeys();
-      expect(keys).toContain("command:nwe");
-      expect(keys).toContain("command:new");
+      expect(hasInternalHookListeners("command", "nwe")).toBe(true);
+      expect(hasInternalHookListeners("command", "new")).toBe(true);
       const event = createInternalHookEvent("command", "new", "test-session");
       await triggerInternalHook(event);
       expect(event.messages).toEqual(["typo-hook"]);
@@ -416,12 +415,12 @@ describe("loader", () => {
             },
           },
         };
-        const state = await import("../state/config-machine-state.js");
-        const installed = vi.spyOn(state, "readConfigMachineState");
-        installed.mockReturnValue(
+        const state = await import("./installs.js");
+        const installed = vi.spyOn(state, "readHookInstallsAsync");
+        installed.mockResolvedValue(
           removal === "install removal"
             ? { pack: { source: "path", hooks: ["selected-name"] } }
-            : undefined,
+            : {},
         );
         try {
           await commitPreparedHooks(config, tmpDir, options);
@@ -438,7 +437,7 @@ describe("loader", () => {
             delete entries["selected-name"];
           }
           if (removal === "install removal") {
-            installed.mockReturnValue(undefined);
+            installed.mockResolvedValue({});
           }
           const next: OpenClawConfig = {
             ...config,
@@ -615,7 +614,7 @@ describe("loader", () => {
 
       const disabledCount = await commitPreparedHooks(createEnabledHooksConfig(), tmpDir);
       expect(disabledCount).toBe(0);
-      expect(getRegisteredEventKeys()).not.toContain("command:new");
+      expect(hasInternalHookListeners("command", "new")).toBe(false);
 
       const enabledCount = await commitPreparedHooks(
         createEnabledHooksConfig("workspace-hook"),

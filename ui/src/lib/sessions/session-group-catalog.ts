@@ -38,6 +38,7 @@ function readLegacyStoredGroups(): string[] {
     );
     return normalizeUniqueTrimmedStringList(parsed);
   } catch {
+    // Malformed optional browser data must not block the canonical Gateway catalog.
     return [];
   }
 }
@@ -81,16 +82,17 @@ export function createSessionGroupCatalog(host: SessionGroupCatalogHost) {
     });
   };
 
-  const finishLoadFailure = (scope: SessionConnectionScope, error: unknown, retry: boolean) => {
-    if (!host.connection.isCurrent(scope)) {
+  const finishLoadFailure = (
+    scope: SessionConnectionScope,
+    error: unknown,
+    isCurrentLoad: () => boolean,
+  ) => {
+    if (!host.connection.isCurrent(scope) || !isCurrentLoad()) {
       return null;
     }
     if (defaultsStatus !== "unavailable") {
       defaultsStatus = "unavailable";
       host.publish({ ...host.readState() });
-    }
-    if (!retry) {
-      return null;
     }
     loadedEpoch = -1;
     const delay = host.retryDelayMs(error);
@@ -105,14 +107,10 @@ export function createSessionGroupCatalog(host: SessionGroupCatalogHost) {
     return null;
   };
 
-  const loadAttempt = async (
-    scope: SessionConnectionScope,
-    advertised: boolean | null,
-    isCurrentLoad: () => boolean,
-  ) => {
+  const loadAttempt = async (scope: SessionConnectionScope, isCurrentLoad: () => boolean) => {
     try {
       const listed = await scope.client.request(GROUPS_LIST_METHOD, {});
-      if (!host.connection.isCurrent(scope)) {
+      if (!host.connection.isCurrent(scope) || !isCurrentLoad()) {
         return null;
       }
       let settings = readSessionCustomGroups(listed);
@@ -127,12 +125,8 @@ export function createSessionGroupCatalog(host: SessionGroupCatalogHost) {
         }).allowed
       ) {
         if (settings.length === 0) {
-          // Legacy import replaces persisted groups; an invalidated read cannot authorize it.
-          if (!isCurrentLoad()) {
-            return null;
-          }
           const put = await scope.client.request("sessions.groups.put", { names: legacy });
-          if (!host.connection.isCurrent(scope)) {
+          if (!host.connection.isCurrent(scope) || !isCurrentLoad()) {
             return null;
           }
           settings = readSessionCustomGroups(put);
@@ -157,24 +151,19 @@ export function createSessionGroupCatalog(host: SessionGroupCatalogHost) {
       // The path-free catalog is independently useful to the sidebar. Defaults
       // readiness only gates group-target routes and must not erase those names.
       publishCatalog(settings, sectionOrder, "loading");
-      try {
-        const defaults = await scope.client.request(GROUPS_DEFAULTS_METHOD, {});
-        if (!host.connection.isCurrent(scope)) {
-          return null;
-        }
-        settings = mergeSessionGroupDefaults(settings, defaults);
-      } catch (error) {
-        return finishLoadFailure(scope, error, true);
+      const defaults = await scope.client.request(GROUPS_DEFAULTS_METHOD, {});
+      if (!host.connection.isCurrent(scope) || !isCurrentLoad()) {
+        return null;
       }
+      settings = mergeSessionGroupDefaults(settings, defaults);
       publishCatalog(settings, sectionOrder, "ready");
       return settings;
     } catch (error) {
-      // Gateways without feature metadata retain the legacy one-shot probe.
-      return finishLoadFailure(scope, error, advertised === true);
+      return finishLoadFailure(scope, error, isCurrentLoad);
     }
   };
 
-  /** Group consumers may probe once per connection; explicitly absent features never probe. */
+  /** Share catalog loads per connection; explicitly absent features never request it. */
   const load = async (): Promise<readonly SessionGroupSettings[] | null> => {
     const scope = host.connection.capture();
     if (!scope) {
@@ -194,16 +183,26 @@ export function createSessionGroupCatalog(host: SessionGroupCatalogHost) {
       publishCatalog([], [], "ready");
       return [];
     }
-    // Concurrent catalog changes settle best effort until the next invalidation or reconnect.
+    // Only the retained load may publish after a mutation or catalog invalidation.
     const promise: Promise<readonly SessionGroupSettings[] | null> = loadAttempt(
       scope,
-      advertised,
       () => pendingLoad === promise,
-    ).finally(() => {
-      if (pendingLoad === promise) {
-        pendingLoad = null;
-      }
-    });
+    )
+      .then((result) => {
+        // Bootstrap coalesces invalidations into this task. Start a successor only
+        // when no other consumer has already loaded or retained the replacement.
+        return host.connection.isCurrent(scope) &&
+          pendingLoad === null &&
+          loadedEpoch === -1 &&
+          defaultsStatus === "loading"
+          ? load()
+          : result;
+      })
+      .finally(() => {
+        if (pendingLoad === promise) {
+          pendingLoad = null;
+        }
+      });
     pendingLoad = promise;
     return promise;
   };

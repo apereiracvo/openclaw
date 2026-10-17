@@ -23,6 +23,7 @@ import { appendSessionTranscriptMessageByIdentity } from "openclaw/plugin-sdk/se
 import { withOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import sessionSharePlugin from "../../extensions/session-share/index.js";
+import { setRuntimeConfigSnapshot } from "../../src/config/runtime-snapshot.js";
 import {
   replaceSessionEntry,
   upsertSessionEntryCore,
@@ -38,6 +39,7 @@ import { openOpenClawStateDatabase } from "../../src/state/openclaw-state-db.js"
 import * as githubIdentities from "../../src/state/user-profile-github-identity.js";
 import { linkEmail, syncGitHubIdentity } from "../../src/state/user-profile-writes.worker.js";
 import { ensureProfileForEmail } from "../../src/state/user-profiles.js";
+import { requireNativeSqliteDatabase } from "../../src/test-utils/native-sqlite.js";
 import { trackSqliteStatementExecutions } from "../helpers/sqlite-statement-execution-counter.js";
 
 afterEach(() => vi.restoreAllMocks());
@@ -78,6 +80,7 @@ function commandFixture(groups: string[] = ["Team"]) {
   const config: OpenClawConfig = {
     plugins: { entries: { "session-share": { enabled: true, config: { share: { groups } } } } },
   };
+  setRuntimeConfigSnapshot(config);
   const runtime = createPluginRuntime();
   runtime.config.current = () => config;
   const commands = registerSessionShare(runtime, config).commands;
@@ -209,10 +212,14 @@ describe("session-share node commands", () => {
       await replaceSessionEntry(scope, entry);
       expect((await source.list()).sessions).toMatchObject([{ name: "Original" }]);
       const { db } = openOpenClawAgentDatabase({ agentId: "main" });
-      const reads = trackSqliteStatementExecutions(db, ["inventory"], (sql) =>
-        sql.includes('from "session_nodes" order by "session_key"') && sql.includes('"entry_json"')
-          ? "inventory"
-          : null,
+      const reads = trackSqliteStatementExecutions(
+        requireNativeSqliteDatabase(db),
+        ["inventory"],
+        (sql) =>
+          sql.includes('from "session_nodes" order by "session_key"') &&
+          sql.includes('"entry_json"')
+            ? "inventory"
+            : null,
       );
       try {
         expect((await source.list()).sessions).toMatchObject([{ name: "Original" }]);
@@ -270,12 +277,15 @@ describe("session-share node commands", () => {
         },
       );
       const { db } = openOpenClawAgentDatabase({ agentId: "main" });
-      const counter = trackSqliteStatementExecutions(db, ["transcript", "participants"], (sql) =>
-        /\bfrom\s+"?session_participants\b/i.test(sql)
-          ? "participants"
-          : /\btranscript_events\b/.test(sql)
-            ? "transcript"
-            : null,
+      const counter = trackSqliteStatementExecutions(
+        requireNativeSqliteDatabase(db),
+        ["transcript", "participants"],
+        (sql) =>
+          /\bfrom\s+"?session_participants\b/i.test(sql)
+            ? "participants"
+            : /\btranscript_events\b/.test(sql)
+              ? "transcript"
+              : null,
       );
       try {
         expect((await source.list({ limit: 1 })).sessions).toMatchObject([
@@ -599,7 +609,7 @@ describe("session-share node commands", () => {
         );
       }
       const counter = trackSqliteStatementExecutions(
-        openOpenClawStateDatabase().db,
+        requireNativeSqliteDatabase(openOpenClawStateDatabase().db),
         ["identities", "profiles"],
         (sql) =>
           /\bfrom\s+"?user_profile_identities\b/i.test(sql)
@@ -705,6 +715,7 @@ describe("session-share node commands", () => {
     "refuses a replaced physical source during %s identity preparation",
     async (operation) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        const fixture = commandFixture();
         const profile = ensureProfileForEmail("physical@example.test");
         const scope = { agentId: "main", sessionKey: "agent:main:physical", sessionId: "physical" };
         await upsertSessionEntryCore(scope, {
@@ -734,7 +745,6 @@ describe("session-share node commands", () => {
             return result;
           },
         );
-        const fixture = commandFixture();
         const pending = operation === "list" ? fixture.list() : fixture.read(scope.sessionKey);
         try {
           await Promise.race([
@@ -756,6 +766,7 @@ describe("session-share node commands", () => {
 
   it("reads real newest-first transcript rows with portable sender and revokes moved sessions", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const fixture = commandFixture();
       const profile = ensureProfileForEmail("source@example.test");
       const scope = { agentId: "main", sessionKey: "agent:main:shared", sessionId: "shared" };
       await upsertSessionEntryCore(scope, {
@@ -782,7 +793,6 @@ describe("session-share node commands", () => {
           timestamp: 2,
         },
       });
-      const fixture = commandFixture();
       const first = await fixture.read(scope.sessionKey, { limit: 1 });
       expect(first.items).toEqual([
         expect.objectContaining({ type: "agentMessage", text: "Shared answer" }),

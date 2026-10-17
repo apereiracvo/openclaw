@@ -30,12 +30,15 @@ import { runWithAgentToolSourceExecutionScope } from "../agent-tool-source-execu
 import { reserveChildAdmissionSlot } from "../child-admission.js";
 import { prepareNativeDelegatedToolPolicy } from "../delegated-tool-policy.js";
 import { resolveAgentIdentity } from "../identity.js";
-import { resolveSandboxRuntimeStatus } from "../sandbox/runtime-status.js";
+import {
+  resolveSandboxRuntimeStatus,
+  resolveSandboxRuntimeStatusAsync,
+} from "../sandbox/runtime-status.js";
 import { resolveSpawnAdmission } from "../spawn-plan.js";
 import { resolveSpawnedWorkspaceInheritance } from "../spawned-context.js";
 import { prepareSubagentSessionListReadCache } from "../subagents/registry/subagent-registry-state.js";
 import { registerSubagentRun } from "../subagents/registry/subagent-registry.js";
-import { getSubagentDepthFromSessionStore } from "../subagents/spawn/subagent-depth.js";
+import { getSubagentDepthFromSessionStoreInWorker } from "../subagents/spawn/subagent-depth.js";
 import { terminateAcceptedCollectorRun } from "../subagents/spawn/subagent-spawn-cleanup.js";
 import {
   callNativeSubagentGateway,
@@ -64,47 +67,15 @@ import {
   summarizeVisibleSessionSpawnError,
 } from "./sessions-spawn-visible-cleanup.js";
 import { resolveVisibleSessionOwner } from "./sessions-spawn-visible-owner.js";
-import { SessionsSpawnPlacementSchema } from "./sessions-spawn-visible.schema.js";
+import {
+  correctedVisibleSpawnCall,
+  SessionsSpawnPlacementSchema,
+} from "./sessions-spawn-visible.schema.js";
 
 type VisibleSessionsSpawnOptions = SessionsSpawnToolOptions & {
   onSpawnEffectsStart?: () => void;
   assertActive?: () => void;
 };
-
-function correctedVisibleSpawnCall(raw: Record<string, unknown>): string {
-  const corrected = Object.fromEntries(
-    [
-      "task",
-      "user",
-      "taskName",
-      "label",
-      "agentId",
-      "model",
-      "runTimeoutSeconds",
-      "cwd",
-      "expectsCompletionMessage",
-      "sandbox",
-      "context",
-      "placement",
-      "group",
-      "projectId",
-      "projectGitUrl",
-      "worktree",
-      "worktreeName",
-      "worktreeBaseRef",
-    ]
-      .filter((key) => raw[key] !== undefined)
-      .map((key) => [key, raw[key]]),
-  );
-  if (
-    readToolStringParam(raw, "worktreeName") ||
-    readToolStringParam(raw, "worktreeBaseRef") ||
-    (isRecord(raw.placement) && raw.placement.kind === "profile")
-  ) {
-    corrected.worktree = true;
-  }
-  return `sessions_spawn(${JSON.stringify({ ...corrected, runtime: "subagent", visible: true })})`;
-}
 
 export async function maybeSpawnVisibleSession(params: {
   raw: Record<string, unknown>;
@@ -268,7 +239,7 @@ export async function maybeSpawnVisibleSession(params: {
         });
   assertActive();
   const requesterEntry = controllerTarget.store[controllerTarget.canonicalKey];
-  const callerDepth = getSubagentDepthFromSessionStore(requesterKey, {
+  const callerDepth = await getSubagentDepthFromSessionStoreInWorker(requesterKey, {
     cfg,
     agentId: params.options?.requesterAgentIdOverride,
   });
@@ -301,6 +272,7 @@ export async function maybeSpawnVisibleSession(params: {
   const resolveAdmission = (pendingChildren = 0) =>
     resolveSpawnAdmission({
       cfg,
+      callerDepth,
       requesterSessionKey: requesterKey,
       requesterAgentId,
       targetAgentId,
@@ -334,7 +306,7 @@ export async function maybeSpawnVisibleSession(params: {
     cfg,
     runTimeoutSeconds: params.runTimeoutSeconds,
   });
-  const requesterRuntime = resolveSandboxRuntimeStatus({
+  const requesterRuntime = await resolveSandboxRuntimeStatusAsync({
     cfg,
     sessionKey: requesterKey,
     agentId: requesterAgentId,
@@ -522,6 +494,7 @@ export async function maybeSpawnVisibleSession(params: {
       throw error;
     }
     const childSessionKey = response.key?.trim();
+    const sessionId = response.sessionId?.trim();
     const cloudGatewayCall: InProcessGatewayCaller = (method, request, options) =>
       gatewayCall(method, request, { ...options, resolveGatewayContext });
     const cleanupGateway = resolveGatewayContext
@@ -546,13 +519,13 @@ export async function maybeSpawnVisibleSession(params: {
           }),
         cleanupGateway,
       );
-    if (placement && childSessionKey && response.sessionId) {
+    if (placement && childSessionKey && sessionId) {
       response = {
         ...response,
         ...(await startVisibleCloudSession({
           cfg,
           key: childSessionKey,
-          sessionId: response.sessionId,
+          sessionId,
           profileId: placement.profileId,
           os: placement.os,
           machineClass: placement.machineClass,
@@ -591,6 +564,7 @@ export async function maybeSpawnVisibleSession(params: {
       };
     }
     const runId = response.runId?.trim();
+    const lifecycleRevision = response.entry?.lifecycleRevision;
     const runError = response.runError
       ? summarizeVisibleSessionSpawnError(response.runError)
       : "Visible session run failed";
@@ -604,14 +578,14 @@ export async function maybeSpawnVisibleSession(params: {
       cleanupVisibleSpawnSession({
         callGateway: gatewayCall,
         childSessionKey,
-        expectedSessionId: response.sessionId,
-        expectedLifecycleRevision: response.entry?.lifecycleRevision,
+        expectedSessionId: sessionId,
+        expectedLifecycleRevision: lifecycleRevision,
       });
     if (placement && (response.runStarted !== true || !runId)) {
       return {
         status: "error",
         childSessionKey,
-        sessionId: response.sessionId,
+        sessionId,
         ...(runId ? { runId } : {}),
         initialTaskStatus: response.initialTaskStatus ?? "not-sent",
         ...(response.placement ? { placement: response.placement } : {}),
@@ -625,6 +599,15 @@ export async function maybeSpawnVisibleSession(params: {
         childSessionKey,
       };
     }
+    if (!sessionId) {
+      return {
+        status: "error",
+        childSessionKey,
+        runId,
+        error:
+          "Visible run cannot be registered because sessions.create did not return its sessionId. Child kept; inspect this child session and run before retrying. Do not spawn a replacement.",
+      };
+    }
     try {
       if (placement) {
         params.options?.assertActive?.();
@@ -634,6 +617,8 @@ export async function maybeSpawnVisibleSession(params: {
           runId,
           requesterTurnRunId: params.options?.requesterTurnRunId,
           childSessionKey,
+          childAgentId: targetAgentId,
+          sessionEntry: { sessionId, lifecycleRevision },
           controllerSessionKey: ownership.controllerSessionKey,
           requesterSessionKey: ownership.completionRequesterSessionKey,
           completionRequesterSessionId,
@@ -650,7 +635,6 @@ export async function maybeSpawnVisibleSession(params: {
           requesterDisplayKey: ownership.completionRequesterDisplayKey,
           task: params.task,
           taskName: params.taskName,
-          agentId: targetAgentId,
           requesterAgentId,
           cleanup: "keep",
           label: params.label || undefined,

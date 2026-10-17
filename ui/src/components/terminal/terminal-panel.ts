@@ -1,10 +1,9 @@
 import { buildControlUiFocusPath } from "@openclaw/session-url-contract";
-import { nothing } from "lit";
 import type { ApplicationContext } from "../../app/context.ts";
 import { terminalFontFamily } from "../../app/terminal-font.ts";
+import { renderSolidSnapshot } from "../../lib/dom/solid-snapshot.ts";
 import { openExternalUrlSafe } from "../../lib/open-external-url.ts";
-import { solidContent } from "../../lit/solid-content.tsx";
-import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
+import { SubscriptionsController } from "../../lib/subscriptions-controller.ts";
 import { DockLayoutController } from "../dock-layout-controller.ts";
 import { terminalPanelLayout, type DockPanelPlacement } from "../dock-panel-layout.ts";
 import { notifyPanelHostedTabsChanged } from "../panel-hosted-tabs.ts";
@@ -26,10 +25,13 @@ import type {
   TerminalPanelSessionTab,
   TerminalRouteTarget,
 } from "./terminal-panel-session-types.ts";
-import { terminalPanelHostedTabs } from "./terminal-panel-tabs.ts";
+import { terminalPanelTabIcon, terminalPanelHostedTabs } from "./terminal-panel-tabs.ts";
 import { TerminalPanelUploadController } from "./terminal-panel-upload.ts";
-import { TerminalPanelHostedActions, type TerminalPanelViewState } from "./terminal-panel-view.tsx";
+import type { TerminalPanelViewState } from "./terminal-panel-view.tsx";
 import { createIsolatedGhosttyTerminal } from "./terminal-runtime.ts";
+
+// Clone the SVG itself: insertion consumes a fragment and loses its replacement boundary.
+const hostedTabIcon = renderSolidSnapshot(terminalPanelTabIcon).firstElementChild!;
 
 type TerminalDock = Exclude<DockPanelPlacement, "left">;
 
@@ -237,7 +239,9 @@ export class TerminalPanelController extends SolidPanelController {
   }
 
   get hostedTabs() {
-    return terminalPanelHostedTabs(this.terminalSessions.tabs);
+    return terminalPanelHostedTabs(this.terminalSessions.tabs).map((tab) =>
+      Object.assign(tab, { icon: hostedTabIcon.cloneNode(true) }),
+    );
   }
 
   get activeHostedTabId(): string | null {
@@ -253,11 +257,10 @@ export class TerminalPanelController extends SolidPanelController {
     await this.updateComplete;
   }
 
-  get hostedActions() {
-    if (!this.embedded || !this.tabsInHeader) {
-      return nothing;
-    }
-    return solidContent(TerminalPanelHostedActions, { state: this.viewState });
+  hostedActionsContent: HTMLElement | undefined;
+
+  get hostedActions(): HTMLElement | undefined {
+    return this.embedded && this.tabsInHeader ? this.hostedActionsContent : undefined;
   }
 
   activateTerminalHost(): void {

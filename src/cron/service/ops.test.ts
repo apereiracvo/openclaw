@@ -8,13 +8,12 @@ import {
   runOpenClawStateWriteTransaction,
 } from "../../state/openclaw-state-db.js";
 import { withEnvAsync } from "../../test-utils/env.js";
+import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import { findCronRunForTests, readCronRunRecordsForTests } from "../run-history.test-support.js";
 import { createCronExecutionId } from "../run-id.js";
 import { setupCronServiceSuite, writeCronStoreSnapshot } from "../service.test-harness.js";
-import * as cronStoreModule from "../store.js";
 import { loadCronJobsStoreWithConfigJobs, loadCronStore } from "../store.js";
 import { cronStoreKey } from "../store/key.js";
-import * as runReceiptStore from "../store/run-receipt-store.js";
 import { inspectActiveCronRunReceipt } from "../store/run-receipt-store.test-support.js";
 import type { CronJob } from "../types.js";
 import { start, stop } from "./ops-lifecycle.js";
@@ -23,13 +22,8 @@ import { list } from "./ops-read.js";
 import { run } from "./ops-run.js";
 import { createOkIsolatedCronStateFactory } from "./ops.test-support.js";
 import * as taskRuns from "./run-history.js";
-import {
-  claimCronRecoveryReceipt,
-  observeCronRecoveryForTest,
-  recoverCronRunForTest,
-} from "./run-recovery.test-support.js";
+import { claimCronRecoveryReceipt } from "./run-recovery.test-support.js";
 import type { CronEvent } from "./state.js";
-import { runMissedJobs } from "./timer.test-support.js";
 
 const { logger, makeStorePath } = setupCronServiceSuite({
   prefix: "cron-service-ops-seam",
@@ -52,16 +46,6 @@ async function withStateDirForStorePath<T>(
     } finally {
       await closeOpenClawStateDatabaseAsync();
     }
-  });
-}
-
-function createTimedOutIsolatedCronState(params: { storePath: string; now: number }) {
-  return createCronServiceState({
-    storePath: params.storePath,
-    nowMs: () => params.now,
-    runIsolatedAgentJob: vi.fn(async () => {
-      throw new Error("cron: job execution timed out");
-    }),
   });
 }
 
@@ -126,26 +110,28 @@ async function writeDueIsolatedJobSnapshot(storePath: string, now: number) {
 function insertCronJobRow(storePath: string, job: CronJob) {
   const { state, ...jobConfig } = job;
   runOpenClawStateWriteTransaction(({ db }) => {
-    db.prepare(
-      `INSERT INTO cron_jobs (
+    requireNativeSqliteDatabase(db)
+      .prepare(
+        `INSERT INTO cron_jobs (
         store_key, job_id, declaration_key, name, description, enabled, payload_kind,
         job_json, state_json, updated_at
       ) VALUES (
         $storeKey, $jobId, $declarationKey, $name, $description, $enabled, $payloadKind,
         $jobJson, $stateJson, $updatedAt
       )`,
-    ).run({
-      $storeKey: path.resolve(storePath),
-      $jobId: job.id,
-      $declarationKey: job.declarationKey ?? null,
-      $name: job.name,
-      $description: job.description ?? null,
-      $enabled: job.enabled ? 1 : 0,
-      $payloadKind: job.payload.kind,
-      $jobJson: JSON.stringify(jobConfig),
-      $stateJson: JSON.stringify(state),
-      $updatedAt: job.updatedAtMs,
-    });
+      )
+      .run({
+        $storeKey: path.resolve(storePath),
+        $jobId: job.id,
+        $declarationKey: job.declarationKey ?? null,
+        $name: job.name,
+        $description: job.description ?? null,
+        $enabled: job.enabled ? 1 : 0,
+        $payloadKind: job.payload.kind,
+        $jobJson: JSON.stringify(jobConfig),
+        $stateJson: JSON.stringify(state),
+        $updatedAt: job.updatedAtMs,
+      });
   });
 }
 
@@ -218,24 +204,6 @@ function findCronTaskByBaseRunId(baseRunId: string) {
     findCronRunForTests(baseRunId) ??
     readCronRunRecordsForTests().find((task) => task.runId?.startsWith(`${baseRunId}:`))
   );
-}
-
-function createMissedIsolatedJob(now: number): CronJob {
-  return {
-    id: "startup-timeout",
-    name: "startup timeout",
-    enabled: true,
-    createdAtMs: now - 86_400_000,
-    updatedAtMs: now - 30 * 60_000,
-    schedule: { kind: "cron", expr: "0 * * * *", tz: "UTC" },
-    sessionTarget: "isolated",
-    wakeMode: "next-heartbeat",
-    payload: { kind: "agentTurn", message: "should timeout" },
-    sessionKey: "agent:main:main",
-    state: {
-      nextRunAtMs: now - 60_000,
-    },
-  };
 }
 
 describe("cron service ops seam coverage", () => {
@@ -316,61 +284,6 @@ describe("cron service ops seam coverage", () => {
     );
   });
 
-  it("preserves a foreign completion committed after recovery is proposed", async () => {
-    const { storePath } = await makeStorePath();
-    const now = Date.parse("2026-03-23T12:00:00.000Z");
-    const startedAt = now - 30_000;
-    const job = createInterruptedMainJob(now);
-    job.state.runningAtMs = startedAt;
-    await writeCronStoreSnapshot({ storePath, jobs: [job] });
-    const receipt = claimCronRecoveryReceipt(storePath, job, startedAt, "main");
-    const completedJob = structuredClone(job);
-    delete completedJob.state.runningAtMs;
-    completedJob.state.lastRunAtMs = startedAt;
-    completedJob.state.lastRunStatus = "ok";
-    completedJob.state.lastStatus = "ok";
-    completedJob.state.nextRunAtMs = now + 60_000;
-    const state = createCronServiceState({
-      storePath,
-      nowMs: () => now,
-      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-    });
-    const proposal = await observeCronRecoveryForTest(state, job.id, undefined, startedAt);
-    await cronStoreModule.saveCronJobsStore(
-      storePath,
-      { version: 1, jobs: [completedJob] },
-      {
-        transactionHooks: {
-          afterWrite: (db, receiptSchema) => {
-            runReceiptStore.finishCronRunReceiptInDatabase({
-              database: db,
-              receiptSchema,
-              handle: receipt,
-              status: "ok",
-              finishedAtMs: now,
-            });
-          },
-        },
-      },
-    );
-    runReceiptStore.releaseLocalCronRunReceiptOwnership(receipt);
-
-    expect(await recoverCronRunForTest(state, proposal)).toEqual({ kind: "superseded" });
-
-    await start(state);
-
-    const persisted = (await loadCronStore(storePath)).jobs[0];
-    expect(persisted?.state).toMatchObject({
-      lastRunAtMs: startedAt,
-      lastRunStatus: "ok",
-      lastStatus: "ok",
-    });
-    expect(persisted?.state.nextRunAtMs).toEqual(expect.any(Number));
-    expect(persisted?.state.runningAtMs).toBeUndefined();
-    expect(persisted?.state.lastError).toBeUndefined();
-    stop(state);
-  });
-
   it.each([
     { outcome: "restores", identity: "canonical receipt-keyed", receipt: true },
     {
@@ -439,9 +352,6 @@ describe("cron service ops seam coverage", () => {
           },
         });
 
-        if (receipt) {
-          runReceiptStore.releaseLocalCronRunReceiptOwnership(receipt);
-        }
         await start(state);
 
         expect(findCronRunForTests(taskRunId)).toMatchObject({
@@ -480,7 +390,7 @@ describe("cron service ops seam coverage", () => {
             expect(receiptRow).toEqual({
               status: "interrupted",
               finishedAtMs: now,
-              error: "cron: job interrupted because owner is unavailable",
+              error: "cron: job interrupted by gateway restart",
             });
           }
           expect(events.filter((event) => event.action === "finished")).toEqual([
@@ -631,75 +541,6 @@ describe("cron service ops seam coverage", () => {
     });
   });
 
-  it("persists successful script state from a manual run", async () => {
-    const { storePath } = await makeStorePath();
-    const now = Date.parse("2026-07-18T12:00:00.000Z");
-    const job: CronJob = {
-      id: "manual-script-state",
-      name: "manual script state",
-      enabled: true,
-      createdAtMs: now - 60_000,
-      updatedAtMs: now - 60_000,
-      schedule: { kind: "every", everyMs: 60_000, anchorMs: now - 60_000 },
-      sessionTarget: "main",
-      wakeMode: "next-heartbeat",
-      payload: { kind: "script", script: "return { state: { revision: 2 } }" },
-      state: { nextRunAtMs: now - 1, triggerState: { revision: 1 } },
-    };
-    await writeCronStoreSnapshot({ storePath, jobs: [job] });
-    const state = createCronServiceState({
-      storePath,
-      cronConfig: { triggers: { enabled: true } },
-      nowMs: () => now,
-      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-      runScriptJob: vi.fn(async () => ({
-        status: "ok" as const,
-        stateChanged: true,
-        state: { revision: 2 },
-      })),
-    });
-
-    await expect(run(state, job.id)).resolves.toEqual({ ok: true, ran: true });
-
-    const persisted = await loadCronStore(storePath);
-    expect(persisted.jobs[0]?.state.triggerState).toEqual({ revision: 2 });
-  });
-
-  it("records failed manual runs with cron outcome detail", async () => {
-    const { storePath } = await makeStorePath();
-    const now = Date.parse("2026-03-23T12:00:00.000Z");
-
-    await withStateDirForStorePath(storePath, async () => {
-      await writeDueIsolatedJobSnapshot(storePath, now);
-      const state = createCronServiceState({
-        storePath,
-        nowMs: () => now,
-        runIsolatedAgentJob: vi.fn(async () => ({
-          status: "error" as const,
-          error: "provider failed",
-          provider: "openai",
-          model: "gpt-test",
-        })),
-      });
-
-      await run(state, "isolated-timeout");
-
-      const task = findCronTaskByBaseRunId(`cron:isolated-timeout:${now}`);
-      expect(task).toMatchObject({
-        status: "failed",
-        error: "provider failed",
-        detail: {
-          kind: "cron-run",
-          status: "error",
-          provider: "openai",
-          model: "gpt-test",
-          runAtMs: now,
-          durationMs: 0,
-        },
-      });
-    });
-  });
-
   it("does not reschedule a manual lifecycle conflict after execution starts", async () => {
     const { storePath } = await makeStorePath();
     const now = Date.parse("2026-03-23T12:00:00.000Z");
@@ -763,31 +604,6 @@ describe("cron service ops seam coverage", () => {
     expect(updated.description).toBe("fixed");
     expect(updated.state.nextRunAtMs).toBeGreaterThan(0);
     expect(updated.state.nextRunAtMs).toBeGreaterThan(now);
-  });
-
-  it("records startup catch-up timeouts as timed_out in the shared task registry", async () => {
-    const { storePath } = await makeStorePath();
-    const now = Date.parse("2026-03-23T12:00:00.000Z");
-
-    await withStateDirForStorePath(storePath, async () => {
-      await writeCronStoreSnapshot({
-        storePath,
-        jobs: [createMissedIsolatedJob(now)],
-      });
-
-      const state = createTimedOutIsolatedCronState({
-        storePath,
-        now,
-      });
-
-      await runMissedJobs(state);
-
-      expectCronRun({
-        runId: `cron:startup-timeout:${now}`,
-        status: "timed_out",
-        jobId: "startup-timeout",
-      });
-    });
   });
 
   it("uses explicit lifecycle events instead of scheduled duplicates for the target job", async () => {

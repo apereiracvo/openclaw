@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import type { GatewayRequestContext } from "../../gateway/server-methods/types.js";
 import { resolveWorkerToolAuthority } from "../../gateway/worker-environments/worker-tool-authority.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
@@ -49,10 +50,6 @@ const codex = await loadBundledPluginFacade<{
 // mock-isolation: Dispatch consumes publication facts without starting discovery or credential work.
 vi.mock("../../gateway/github-publication-discovery.js", () => ({
   readGitHubPublicationFact: mocks.readGitHubPublicationFact,
-}));
-
-vi.mock("../delegation-capability.js", () => ({
-  resolveDelegationCapability: vi.fn(() => undefined),
 }));
 
 // mock-isolation: Dispatch fixtures provide an empty auth store and no credential database.
@@ -238,13 +235,17 @@ async function dispatchExecSession(execSession: ExecSessionDefaults) {
 describe("embedded run retry dispatch", () => {
   let admission: ReturnType<typeof prepareSystemAgentRunAdmission>;
   beforeEach(async () => {
+    setRuntimeConfigSnapshot({});
     mocks.runAttempt.mockReset().mockResolvedValue({ terminal: { kind: "ok" } });
     mocks.settleRequesterAfterSessionSpawns.mockReset();
     mocks.readGitHubPublicationFact.mockReset().mockReturnValue({ available: true });
     admission = prepareSystemAgentRunAdmission({}, "run-1", "main", "dispatch-test");
     admittedRunContext = await admission.admit("plugin-harness", "dispatch-test");
   });
-  afterEach(() => admission.close());
+  afterEach(() => {
+    admission.close();
+    clearRuntimeConfigSnapshot();
+  });
 
   it.each([
     {
@@ -365,14 +366,39 @@ describe("embedded run retry dispatch", () => {
   });
 
   it.each([
-    { contextTokens: 40_000, nativeModelOwned: true, sessionKey: "agent:main:session-1" },
-    { contextTokens: undefined, nativeModelOwned: true, sessionKey: "agent:main:session-1" },
-    { contextTokens: 2_000_000, nativeModelOwned: true, sessionKey: "agent:main:session-1" },
-    { contextTokens: 40_000, nativeModelOwned: false, sessionKey: "agent:main:session-1" },
-    { contextTokens: 40_000, nativeModelOwned: true, sessionKey: "agent:main:subagent:child" },
+    {
+      contextTokens: 40_000,
+      expectedBudget: 40_000,
+      nativeModelOwned: true,
+      sessionKey: "agent:main:session-1",
+    },
+    {
+      contextTokens: undefined,
+      expectedBudget: undefined,
+      nativeModelOwned: true,
+      sessionKey: "agent:main:session-1",
+    },
+    {
+      contextTokens: 2_000_000,
+      expectedBudget: 1_050_000,
+      nativeModelOwned: true,
+      sessionKey: "agent:main:session-1",
+    },
+    {
+      contextTokens: 40_000,
+      expectedBudget: 40_000,
+      nativeModelOwned: false,
+      sessionKey: "agent:main:session-1",
+    },
+    {
+      contextTokens: 40_000,
+      expectedBudget: 40_000,
+      nativeModelOwned: true,
+      sessionKey: "agent:main:subagent:child",
+    },
   ])(
     "forwards cap $contextTokens to Codex start/resume (native catalog: $nativeModelOwned, $sessionKey)",
-    async ({ contextTokens, nativeModelOwned, sessionKey }) => {
+    async ({ contextTokens, expectedBudget, nativeModelOwned, sessionKey }) => {
       const input = makeDispatchInput({}, createEmbeddedRunReplayState());
       input.runInput.resolvedSessionKey = sessionKey;
       const { runParams, provider, modelId } = input.runInput;
@@ -424,7 +450,8 @@ describe("embedded run retry dispatch", () => {
             appServer: codex.resolveCodexPromptSnapshotAppServerOptions(),
           });
 
-        expect(attempt.contextTokenBudget).toBe(nativeModelOwned ? undefined : contextTokens);
+        expect(attempt.contextTokenBudget).toBe(expectedBudget);
+        expect(attempt.authoredContextTokenCap).toBe(contextTokens);
         for (const request of [threadStartParams, threadResumeParams]) {
           if (contextTokens === undefined) {
             expect(request.config).not.toHaveProperty("model_context_window");
@@ -438,32 +465,29 @@ describe("embedded run retry dispatch", () => {
     },
   );
 
-  it.each(["openclaw"])(
-    "uses published GitHub availability for each admitted run and continuation (%s)",
-    async (harness) => {
-      const gateway = {} as GatewayRequestContext;
-      for (const continuation of [false, true]) {
-        if (continuation) {
-          admission.close();
-          admission = prepareSystemAgentRunAdmission({}, "run-1", "main", "dispatch-test");
-          admittedRunContext = await admission.admit("plugin-harness", "dispatch-test");
-        }
-        bindGatewayContextResolver(admittedRunContext, () => gateway);
-        const input = makeDispatchInput({}, createEmbeddedRunReplayState());
-        input.preparedRuntime.snapshot().agentHarness.id = harness;
-        input.preparedRuntime.snapshot().pluginHarnessOwnsTransport = harness !== "openclaw";
-        input.sessionPromptState.activePrompt.internal = continuation;
-        const { dispatchedAttempt } = await prepareAndDispatchEmbeddedRunAttempt(input);
-        const names = createOpenClawTools({
-          githubPublicationAvailable: dispatchedAttempt.preparedAttempt.githubPublicationAvailable,
-        }).map((tool) => tool.name);
-
-        expect(names).toContain("github_identity_status");
-        expect(names).toContain("github_publish");
+  it("uses published GitHub availability for each admitted run and continuation", async () => {
+    const gateway = {} as GatewayRequestContext;
+    for (const continuation of [false, true]) {
+      if (continuation) {
+        admission.close();
+        admission = prepareSystemAgentRunAdmission({}, "run-1", "main", "dispatch-test");
+        admittedRunContext = await admission.admit("plugin-harness", "dispatch-test");
       }
-      expect(mocks.readGitHubPublicationFact).toHaveBeenCalledTimes(2);
-    },
-  );
+      bindGatewayContextResolver(admittedRunContext, () => gateway);
+      const input = makeDispatchInput({}, createEmbeddedRunReplayState());
+      input.preparedRuntime.snapshot().agentHarness.id = "openclaw";
+      input.preparedRuntime.snapshot().pluginHarnessOwnsTransport = false;
+      input.sessionPromptState.activePrompt.internal = continuation;
+      const { dispatchedAttempt } = await prepareAndDispatchEmbeddedRunAttempt(input);
+      const names = createOpenClawTools({
+        githubPublicationAvailable: dispatchedAttempt.preparedAttempt.githubPublicationAvailable,
+      }).map((tool) => tool.name);
+
+      expect(names).toContain("github_identity_status");
+      expect(names).toContain("github_publish");
+    }
+    expect(mocks.readGitHubPublicationFact).toHaveBeenCalledTimes(2);
+  });
 
   it("reads the adopted session fact and retains identity help when publication is unavailable", async () => {
     const gateway = {} as GatewayRequestContext;
@@ -497,34 +521,31 @@ describe("embedded run retry dispatch", () => {
     });
   });
 
-  it.each([true])(
-    "retains accepted spawns for the logical owner after a late post-compaction abort (yielded: %s)",
-    async (yieldDetected) => {
-      const postCompactionAbortError = new Error("post-compaction loop detected");
-      const input = makeDispatchInput({}, createEmbeddedRunReplayState());
-      input.getPostCompactionAbortError = vi.fn(() => postCompactionAbortError);
-      const acceptedSessionSpawns = [
-        {
-          runId: "child-run",
-          childSessionKey: "agent:main:subagent:child",
-          expectsCompletionMessage: true,
-        },
-      ];
-      mocks.runAttempt.mockResolvedValueOnce({
-        terminal: { kind: "ok" },
-        agentHarnessId: "codex",
-        yieldDetected,
-        acceptedSessionSpawns,
-      });
+  it("retains accepted spawns for the logical owner after a late post-compaction abort", async () => {
+    const postCompactionAbortError = new Error("post-compaction loop detected");
+    const input = makeDispatchInput({}, createEmbeddedRunReplayState());
+    input.getPostCompactionAbortError = vi.fn(() => postCompactionAbortError);
+    const acceptedSessionSpawns = [
+      {
+        runId: "child-run",
+        childSessionKey: "agent:main:subagent:child",
+        expectsCompletionMessage: true,
+      },
+    ];
+    mocks.runAttempt.mockResolvedValueOnce({
+      terminal: { kind: "ok" },
+      agentHarnessId: "codex",
+      yieldDetected: true,
+      acceptedSessionSpawns,
+    });
 
-      await expect(prepareAndDispatchEmbeddedRunAttempt(input)).rejects.toBe(
-        postCompactionAbortError,
-      );
+    await expect(prepareAndDispatchEmbeddedRunAttempt(input)).rejects.toBe(
+      postCompactionAbortError,
+    );
 
-      expect(mergeAcceptedSessionSpawnsForRun(admittedRunContext.operationalRunInstance)).toEqual(
-        acceptedSessionSpawns,
-      );
-      expect(mocks.settleRequesterAfterSessionSpawns).not.toHaveBeenCalled();
-    },
-  );
+    expect(mergeAcceptedSessionSpawnsForRun(admittedRunContext.operationalRunInstance)).toEqual(
+      acceptedSessionSpawns,
+    );
+    expect(mocks.settleRequesterAfterSessionSpawns).not.toHaveBeenCalled();
+  });
 });

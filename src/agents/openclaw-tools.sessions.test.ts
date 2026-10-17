@@ -14,9 +14,14 @@ import { configureExecutionDecisionWorkSink } from "../audit/execution-decision-
 import type { ExecutionDecisionWork } from "../audit/execution-decision-work.types.js";
 import { createExecutionIdentityAdmissionToken } from "../audit/execution-identity-admission.js";
 import type { OpenClawConfig } from "../config/config.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import {
   listSessionParticipantsReadOnly,
+  persistSessionTranscriptTurn,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
 import {
@@ -120,6 +125,29 @@ async function seedSession(sessionKey: string, sessionId = sessionKey) {
   await upsertSessionEntryCore(
     { agentId: parseAgentSessionKey(sessionKey)!.agentId, sessionKey },
     { sessionId, updatedAt: 1 },
+  );
+}
+
+async function writeFinal(sessionKey: string, runId: string, text: string, sessionId = sessionKey) {
+  await persistSessionTranscriptTurn(
+    { agentId: parseAgentSessionKey(sessionKey)!.agentId, sessionKey, sessionId },
+    {
+      config: TEST_CONFIG,
+      runId,
+      expectedSessionId: sessionId,
+      touchSessionEntry: false,
+      updateMode: "none",
+      messages: [
+        {
+          message: {
+            role: "assistant",
+            phase: "final_answer",
+            stopReason: "stop",
+            content: [{ type: "text", text }],
+          },
+        },
+      ],
+    },
   );
 }
 
@@ -237,6 +265,7 @@ describe("sessions tools", () => {
     callGatewayMock.mockClear();
     embeddedRunsTesting.resetActiveEmbeddedRuns();
     installMessagingTestRegistry();
+    setRuntimeConfigSnapshot(TEST_CONFIG);
     await seedSession("agent:main:main");
   });
   afterEach(() =>
@@ -245,6 +274,7 @@ describe("sessions tools", () => {
       resetGatewayWorkAdmission,
       resetSystemEventsForTest,
       resetAdjustedParamsByToolCallIdForTests,
+      clearRuntimeConfigSnapshot,
     ),
   );
   afterAll(() =>
@@ -546,6 +576,7 @@ describe("sessions tools", () => {
       if (request.method === "agent.wait") {
         waitObserved = true;
         deliveredMessages.push(marker);
+        await writeFinal(sessionKey, "run-source-reply", marker, "source-session");
         return {
           runId: "run-source-reply",
           status: "ok",
@@ -565,7 +596,7 @@ describe("sessions tools", () => {
       }
       if (request.method === "chat.history") {
         return {
-          messages: waitObserved ? [{ role: "assistant", content: marker, timestamp: 20 }] : [],
+          messages: [],
         };
       }
       if (request.method === "send") {
@@ -707,7 +738,10 @@ describe("sessions tools", () => {
           return { runId: "inline-result", status: "accepted" };
         }
         if (request.method === "agent.wait") {
-          return { status: "ok", terminalReply: { disposition: "visible", text: "initial" } };
+          return {
+            status: "ok",
+            terminalReply: { disposition: "visible", text: "initial" },
+          };
         }
         return {};
       });

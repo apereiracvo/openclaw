@@ -17,6 +17,10 @@ import { drainFormattedSystemEvents } from "../auto-reply/reply/session-system-e
 import { initSessionState } from "../auto-reply/reply/session.js";
 import { getReplySystemEventContext } from "../auto-reply/reply/system-event-session-key.js";
 import type { OpenClawConfig } from "../config/config.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
 import { resolveMainSessionKey } from "../config/sessions.js";
 import { resolveInternalSessionEffectsIdentity } from "../config/sessions/internal-session-key.js";
 import {
@@ -39,6 +43,7 @@ import type { HeartbeatDeps } from "./heartbeat-runner.js";
 import {
   readSessionStoreForTest,
   seedSessionStore,
+  setHeartbeatSilentCompletion,
   setupTelegramHeartbeatPluginRuntimeForTests,
   withTempHeartbeatSandbox,
 } from "./heartbeat-runner.test-utils.js";
@@ -69,9 +74,11 @@ it("suppresses a routeless cron reminder on a WebChat session", async () => {
 });
 
 afterEach(() => {
+  clearRuntimeConfigSnapshot();
   vi.restoreAllMocks();
   resetSystemEventsForTest();
   resetHeartbeatEventsForTest();
+  clearRuntimeConfigSnapshot();
 });
 
 type ProjectionScenario = {
@@ -92,6 +99,7 @@ async function withProjectionScenario(
       messages: { visibleReplies: "message_tool" },
       session: { store: storePath },
     };
+    setRuntimeConfigSnapshot(cfg);
     const sessionKey = options.sessionKey ?? resolveMainSessionKey(cfg);
     const sessionId = "publication-boundary-session";
     await seedSessionStore(storePath, sessionKey, {
@@ -122,6 +130,7 @@ function runProjectionWake(
   getReplyFromConfig: HeartbeatDeps["getReplyFromConfig"],
   wake: "exec-event" | "manual" | "cron" = "exec-event",
 ) {
+  setRuntimeConfigSnapshot(scenario.cfg);
   return runHeartbeatOnce({
     cfg: scenario.cfg,
     agentId: "main",
@@ -348,22 +357,28 @@ it.each(["automatic", "message_tool"] as const)(
       enqueueSystemEvent("Exec completed (already-handled, code 0) :: Previously reported output", {
         sessionKey: scenario.sessionKey,
       });
-      const reply = vi.fn<NonNullable<HeartbeatDeps["getReplyFromConfig"]>>().mockResolvedValue(
-        visibleReplies === "automatic"
-          ? { text: "NO_REPLY" }
-          : createHeartbeatToolResponsePayload({
-              outcome: "done",
-              notify: false,
-              summary: "Result already handled; no new user-facing information.",
-            }),
-      );
+      const reply = vi
+        .fn<NonNullable<HeartbeatDeps["getReplyFromConfig"]>>()
+        .mockImplementation(async (_ctx, options) => {
+          if (visibleReplies === "automatic") {
+            setHeartbeatSilentCompletion(options);
+            return undefined;
+          }
+          return createHeartbeatToolResponsePayload({
+            outcome: "done",
+            notify: false,
+            summary: "Result already handled; no new user-facing information.",
+          });
+        });
 
       // The runner must offer silence and retire the event without publishing a recap.
       expect((await runProjectionWake(scenario, reply)).status).toBe("ran");
       const prompt = reply.mock.calls[0]?.[0].Body;
       expect(prompt).toContain("duplicate or superseded results");
       expect(prompt).toContain(
-        visibleReplies === "automatic" ? "reply NO_REPLY only" : "notify=false",
+        visibleReplies === "automatic"
+          ? "reply with exactly NO_REPLY as the entire final answer"
+          : "notify=false",
       );
       expect(await readProjectionMessages(scenario)).toEqual([]);
       expect(peekSystemEventEntries(scenario.sessionKey)).toEqual([]);

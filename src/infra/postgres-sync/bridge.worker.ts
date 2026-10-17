@@ -7,23 +7,18 @@ import type {
   PostgresErrorData,
 } from "./protocol.js";
 
-const { port, signal, url, schema }: BridgeWorkerData = workerData;
+const {
+  port,
+  signal,
+  url,
+  schema,
+  connectTimeoutMs,
+  lockTimeoutMs,
+  statementTimeoutMs,
+}: BridgeWorkerData = workerData;
 const control = new Int32Array(signal);
-const client = new pg.Client({
-  connectionString: url,
-  connectionTimeoutMillis: 15_000,
-  types: {
-    // Store decoders own JSON parsing, including malformed legacy payload handling.
-    getTypeParser: (oid, format) =>
-      (oid === pg.types.builtins.JSON || oid === pg.types.builtins.JSONB) && format !== "binary"
-        ? (value: string) => value
-        : pg.types.getTypeParser(oid, format),
-  },
-});
+let client: pg.Client;
 let connectionError: Error | undefined;
-client.on("error", (error) => {
-  connectionError = error;
-});
 process.once("exit", () => {
   Atomics.store(control, 1, 1);
   Atomics.notify(control, 1);
@@ -33,9 +28,29 @@ async function handleRequest(request: BridgeRequest) {
   let reply: BridgeReply;
   try {
     if (request.operation === "connect") {
+      // URL parsing can throw too; every connect failure must wake the waiting host.
+      client = new pg.Client({
+        connectionString: url,
+        connectionTimeoutMillis: connectTimeoutMs,
+        types: {
+          // Store decoders own JSON parsing, including malformed legacy payload handling.
+          getTypeParser: (oid, format) =>
+            (oid === pg.types.builtins.JSON || oid === pg.types.builtins.JSONB) &&
+            format !== "binary"
+              ? (value: string) => value
+              : pg.types.getTypeParser(oid, format),
+        },
+      });
+      client.on("error", (error) => {
+        connectionError = error;
+      });
       await client.connect();
       // Matches the pilot's SQLite WAL + synchronous=NORMAL durability tradeoff.
       await client.query("SET synchronous_commit = off");
+      await client.query(
+        "SELECT set_config('lock_timeout', $1, false), set_config('statement_timeout', $2, false)",
+        [`${lockTimeoutMs}ms`, `${statementTimeoutMs}ms`],
+      );
       await client.query(`SET search_path TO "${schema.replaceAll('"', '""')}"`);
       reply = { id: request.id, result: { rows: [], rowCount: 0, fields: [] } };
     } else if (request.operation === "close") {
@@ -67,11 +82,23 @@ async function handleRequest(request: BridgeRequest) {
     }
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));
+    const reported =
+      request.operation === "connect"
+        ? new Error(
+            `PostgreSQL connection failed: ${failure.message}. Check database.postgres.connection, network, and credentials.`,
+          )
+        : failure;
+    if (request.operation === "connect") {
+      reported.name = "PostgresConnectionError";
+    }
     const details: PostgresErrorData = {
-      name: failure.name,
-      message: failure.message,
-      stack: failure.stack,
+      name: reported.name,
+      message: reported.message,
+      stack: reported.stack,
     };
+    if (request.operation === "connect" && "code" in failure && typeof failure.code === "string") {
+      details.code = failure.code;
+    }
     if (error instanceof pg.DatabaseError) {
       Object.assign(details, {
         code: error.code,

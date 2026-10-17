@@ -25,10 +25,7 @@ import type {
 } from "../store/job-mutations.types.js";
 import { publishCronJobNames } from "../store/job-name.js";
 import { cronStoreKey } from "../store/key.js";
-import {
-  CronRunReceiptConflictError,
-  CronRunReceiptRevisionError,
-} from "../store/run-receipt-store.js";
+import { CronRunReceiptRevisionError } from "../store/run-receipt-store.js";
 import type { CronRuntimeMutationInputs } from "../store/runtime-worker.types.js";
 import { CronJobsStoreChangedError } from "../store/save-error.js";
 import type { CronJob, CronStoreFile } from "../types.js";
@@ -40,6 +37,18 @@ import { publishDurableNextRunChanges } from "./runtime-publication.js";
 import type { CronServiceState, DeferredCronNotifications } from "./state.js";
 
 const loadedCronStoreRevisions = new WeakMap<CronServiceState, { revision: number }>();
+
+/** Advance a complete resident store after its committed row postimages are installed. */
+export function noteLoadedCronStoreCommit(state: CronServiceState, observedRevision: number): void {
+  const storeKey = cronStoreKey(state.deps.storePath);
+  const current = getCronJobsStoreRevision(storeKey);
+  const loaded = loadedCronStoreRevisions.get(state)?.revision;
+  noteCronJobsStoreCommit(storeKey);
+  // A sibling publication during the worker await still requires a full reload.
+  if (loaded === observedRevision && current === observedRevision) {
+    loadedCronStoreRevisions.set(state, { revision: getCronJobsStoreRevision(storeKey) });
+  }
+}
 
 function warnInvalidPersistedCronJob(params: {
   state: CronServiceState;
@@ -171,6 +180,12 @@ export async function ensureLoaded(
       continue;
     }
     const hydrated = hydratedRaw;
+    const loadWarning = state.deps.describeJobLoadWarning?.(hydrated);
+    const loadWarningKey = `host:${hydrated.id}`;
+    if (loadWarning && !state.warnedInvalidPersistedJobKeys.has(loadWarningKey)) {
+      state.warnedInvalidPersistedJobKeys.add(loadWarningKey);
+      state.deps.log.warn({ jobId: hydrated.id, name: hydrated.name }, loadWarning);
+    }
     jobs.push(hydrated);
     durableNextRunAtMsByJobId.set(hydrated.id, hydrated.state.nextRunAtMs);
   }
@@ -253,10 +268,7 @@ async function persistQuarantinedJobs(
     });
     loadedCronStoreRevisions.set(state, committed);
   } catch (error) {
-    if (
-      error instanceof CronRunReceiptConflictError ||
-      error instanceof CronRunReceiptRevisionError
-    ) {
+    if (error instanceof CronRunReceiptRevisionError) {
       throw error;
     }
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -405,7 +417,7 @@ export async function persistCronJobMutation(params: {
     source.assertCurrent();
     if (
       params.agentId !== undefined &&
-      state.deps.isAgentAvailable?.(params.agentId, undefined, { deletionBlocked: false }) === false
+      state.deps.isAgentAvailable?.(params.agentId, { deletionBlocked: false }) === false
     ) {
       throw new Error(describeUnavailableCronAgent(params.agentId));
     }
@@ -468,12 +480,10 @@ export async function persistCronJobMutation(params: {
         loadedCronStoreRevisions.set(state, { revision: -1 });
       }
     },
-    onRolledBackMutation(refusal) {
-      // A foreign receipt owner can advance runtime rows without publishing in this process.
+    onRolledBackMutation() {
+      // Refresh after a refused write before preparing another mutation.
       loadedCronStoreRevisions.set(state, { revision: -1 });
-      throw refusal.kind === "receipt-conflict"
-        ? new CronRunReceiptConflictError(refusal.receipt)
-        : new CronJobsStoreChangedError(source.storeKey);
+      throw new CronJobsStoreChangedError(source.storeKey);
     },
   });
   await runPostPersistCronNotifications(state, notifications);

@@ -1,25 +1,188 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred, withinTest } from "../../test/helpers/promise.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
+import { formatSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.sqlite-entry.js";
 import { persistSessionTranscriptTurn } from "../config/sessions/session-accessor.transcript-turn.js";
+import { resolveSessionStorePathForScope } from "../config/sessions/session-store-path.js";
 import * as aggregation from "../infra/session-cost-usage-aggregation.js";
 import * as cacheRuntime from "../infra/session-cost-usage-cache-runtime.js";
 import { onSessionCostUsageUpdated } from "../infra/session-cost-usage-events.js";
 import { sessionChanges } from "../sessions/session-row-changes.js";
+import { buildUsageOverview } from "../shared/usage-overview.js";
 import type { SessionCostUsagePublication } from "../shared/usage-types.js";
 import {
   createAgentDatabaseInspectionRefusal,
   preparePendingAgentDatabase,
   recordAgentDatabaseAdmissions,
 } from "../state/agent-database-admission.js";
-import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.js";
+import {
+  closeOpenClawAgentDatabasesAsync,
+  resolveOpenClawAgentSqlitePath,
+} from "../state/openclaw-agent-db.js";
+import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import * as agentList from "./agent-list.js";
+import { loadCostUsageSummaryCached } from "./server-methods/usage-result-cache.js";
 import { startSessionCostUsageProjectionLifetime } from "./session-cost-usage-lifetime.js";
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+it("coalesces usage, flushes exact reads, and recovers deferred appends after restart", async ({
+  signal,
+}) => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const config = { agents: { entries: { main: {} } } };
+    setRuntimeConfigSnapshot(config);
+    const target = {
+      agentId: "main",
+      sessionKey: "agent:main:usage-coalescing",
+      sessionId: "usage-coalescing",
+    };
+    const timestamp = Date.parse("2026-09-18T12:00:00Z");
+    replaceSessionEntrySync(target, { sessionId: target.sessionId, updatedAt: timestamp });
+    const append = (role: string, tokens?: number, updateMode: "inline" | "file-only" = "inline") =>
+      persistSessionTranscriptTurn(target, {
+        messages: [
+          {
+            message: {
+              role,
+              content: "Synthetic usage",
+              timestamp,
+              ...(tokens === undefined
+                ? {}
+                : {
+                    usage: {
+                      input: tokens,
+                      output: 0,
+                      totalTokens: tokens,
+                      cost: { total: tokens / 100 },
+                    },
+                  }),
+            },
+          },
+        ],
+        updateMode,
+        touchSessionEntry: false,
+      });
+    await append("assistant", 10);
+    await aggregation.refreshCostUsageCacheForAgent({ config, agentId: target.agentId });
+    const roster = await agentList.listGatewayAgentsBasic(config);
+    const listAgents = vi
+      .spyOn(agentList, "listGatewayAgentsBasic")
+      .mockResolvedValue({ ...roster, agents: [] });
+    const refresh = vi.spyOn(aggregation, "refreshCostUsageCacheForAgent");
+    const lifetime = startSessionCostUsageProjectionLifetime({
+      getConfig: () => config,
+      warn: vi.fn(),
+    });
+    const sessions = [
+      {
+        key: target.sessionKey,
+        agentId: target.agentId,
+        instances: [
+          {
+            sessionId: target.sessionId,
+            sessionFile: formatSqliteSessionFileMarker({
+              ...target,
+              storePath: resolveSessionStorePathForScope(target, config),
+            }),
+          },
+        ],
+      },
+    ];
+    const overview = async () => {
+      const cached = await cacheRuntime.loadSessionCostSummariesFromCache({
+        config,
+        agentId: target.agentId,
+        sessions: sessions.flatMap((session) => session.instances),
+        requestRefresh: false,
+      });
+      return {
+        ...buildUsageOverview({
+          rows: sessions.map((session, index) => ({
+            key: session.key,
+            agentId: session.agentId,
+            usage: cached.summaries[index] ?? null,
+            computing: cached.summaries[index] ? undefined : true,
+          })),
+          options: {},
+          dayBucket: { mode: "utc-offset", utcOffsetMinutes: 0 },
+        }),
+        cacheStatus: cached.cacheStatus,
+      };
+    };
+    vi.useFakeTimers();
+    try {
+      const cost = () =>
+        loadCostUsageSummaryCached({
+          config,
+          agentId: target.agentId,
+          startMs: timestamp - 1,
+          endMs: timestamp + 1,
+        });
+      expect((await cost()).totals.totalTokens).toBe(10);
+      await append("user");
+      await append("system");
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(refresh).not.toHaveBeenCalled();
+
+      await append("assistant", 20);
+      await vi.advanceTimersByTimeAsync(50);
+      await append("assistant", 30);
+      expect(refresh).not.toHaveBeenCalled();
+      // The outer RPC memo must not hide an append waiting for its quiet period.
+      expect((await cost()).totals.totalTokens).toBe(60);
+      expect(await overview()).toMatchObject({
+        totals: { totalTokens: 60 },
+        aggregates: { messages: { user: 1, assistant: 3 } },
+        cacheStatus: { status: "fresh" },
+      });
+      expect(refresh).toHaveBeenCalledTimes(1);
+
+      // Invalidation-only publications also cover rewrites and compaction.
+      await append("assistant", 40, "file-only");
+      expect(await overview()).toMatchObject({
+        totals: { totalTokens: 100 },
+        cacheStatus: { status: "fresh" },
+      });
+      expect(refresh).toHaveBeenCalledTimes(2);
+
+      await append("assistant", 50);
+      await lifetime.stop();
+      expect(refresh).toHaveBeenCalledTimes(2);
+      vi.useRealTimers();
+      // Lose the dirty queue and worker caches as on process exit, keeping only
+      // the committed transcript and the older durable rollup.
+      await closeOpenClawAgentDatabasesAsync();
+      await closeOpenClawStateDatabaseAsync();
+      listAgents.mockRestore();
+      const recovered = createDeferred();
+      const offUsage = onSessionCostUsageUpdated(() => recovered.resolve());
+      const restarted = startSessionCostUsageProjectionLifetime({
+        getConfig: () => config,
+        warn: vi.fn(),
+      });
+      try {
+        await withinTest(recovered.promise, signal);
+        await refresh.mock.results.at(-1)?.value;
+        expect(await overview()).toMatchObject({
+          totals: { totalTokens: 150 },
+          cacheStatus: { status: "fresh" },
+        });
+      } finally {
+        offUsage();
+        await restarted.stop();
+      }
+    } finally {
+      await lifetime.stop();
+      vi.useRealTimers();
+    }
+  });
 });
 
 it("projects committed usage after startup preparation without borrowing its expired context", ({
@@ -37,6 +200,7 @@ it("projects committed usage after startup preparation without borrowing its exp
     replaceSessionEntrySync(target, { sessionId: target.sessionId, updatedAt: timestamp });
     const append = (tokens: number) =>
       persistSessionTranscriptTurn(target, {
+        config,
         messages: [
           {
             message: {

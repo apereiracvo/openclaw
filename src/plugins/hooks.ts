@@ -115,21 +115,6 @@ const DEFAULT_MODIFYING_HOOK_TIMEOUT_MS_BY_HOOK: Partial<Record<PluginHookName, 
   resolve_exec_env: 15_000,
 };
 
-function deepFreezeHookValue<T>(value: T, seen = new WeakSet<object>()): T {
-  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
-    return value;
-  }
-  const object = value as object;
-  if (seen.has(object)) {
-    return value;
-  }
-  seen.add(object);
-  for (const child of Object.values(object)) {
-    deepFreezeHookValue(child, seen);
-  }
-  return Object.freeze(value);
-}
-
 type HookEvent<K extends PluginHookName> = Parameters<PluginHookHandlerMap[K]>[0];
 type HookContext<K extends PluginHookName> = Parameters<PluginHookHandlerMap[K]>[1];
 type HookResult<K extends PluginHookName> = Exclude<
@@ -336,7 +321,8 @@ export function createHookRunner(
   const stickyTrue = (prev?: boolean, next?: boolean): true | undefined =>
     prev === true || next === true ? true : undefined;
 
-  const normalizeHookToolsAllow = (value: unknown): string[] | undefined => {
+  // Hook list overrides restrict what the run may use, so a malformed list closes it.
+  const normalizeHookList = (value: unknown): string[] | undefined => {
     if (value === undefined) {
       return undefined;
     }
@@ -344,13 +330,13 @@ export function createHookRunner(
   };
 
   const readHookToolsAllowRestrictions = (value: unknown): string[][] => {
-    const normalized = normalizeHookToolsAllow(value);
+    const normalized = normalizeHookList(value);
     if (normalized === undefined) {
       return [];
     }
     const attached = Array.isArray(value) ? readToolAllowlistIntersection(value) : undefined;
     return attached
-      ? attached.map((restriction) => normalizeHookToolsAllow(restriction) ?? [])
+      ? attached.map((restriction) => normalizeHookList(restriction) ?? [])
       : [normalized];
   };
 
@@ -555,7 +541,14 @@ export function createHookRunner(
         return { block: true };
       }
       const nextMessage = result.message;
-      return nextMessage ? { message: nextMessage } : undefined;
+      if (!nextMessage) {
+        return undefined;
+      }
+      // Reject non-messages without traversing payloads; the transcript owner validates content.
+      if (typeof nextMessage !== "object" || typeof nextMessage.role !== "string") {
+        throw new Error("the replacement is not a session message; the original message was kept");
+      }
+      return { message: nextMessage };
     } catch (err) {
       const msg = `[hooks] ${hookName} handler from ${hook.pluginId} failed: ${String(err)}`;
       if (shouldCatchHookErrors(hookName)) {
@@ -654,11 +647,6 @@ export function createHookRunner(
     <K extends ClaimingHookName>(hookName: K) =>
     (event: HookEvent<K>, ctx: HookContext<K>) =>
       runClaimingHook<K, HookResult<K>>(hookName, event, ctx);
-
-  const bindFrozenVoidHook =
-    <K extends PluginHookName>(hookName: K) =>
-    (event: HookEvent<K>, ctx: HookContext<K>) =>
-      runVoidHook(hookName, deepFreezeHookValue(structuredClone(event)), ctx);
 
   /**
    * Handlers are executed sequentially in priority order, and results are merged.
@@ -1103,7 +1091,7 @@ export function createHookRunner(
         // Keep the first defined override so higher-priority hooks win, including [].
         modelOverride: acc?.modelOverride ?? next.modelOverride,
         providerOverride: acc?.providerOverride ?? next.providerOverride,
-        fallbacksOverride: acc?.fallbacksOverride ?? next.fallbacksOverride,
+        fallbacksOverride: acc?.fallbacksOverride ?? normalizeHookList(next.fallbacksOverride),
       }),
     }),
     runAgentTurnPrepare: bindModifyingHook("agent_turn_prepare", {
@@ -1212,7 +1200,7 @@ export function createHookRunner(
     }),
     runCronReconciled: bindVoidHook("cron_reconciled"),
     runCronChanged: bindVoidHook("cron_changed"),
-    runSkillChanged: bindFrozenVoidHook("skill_changed"),
+    runSkillChanged: bindVoidHook("skill_changed"),
     runBeforeInstall: bindModifyingHook("before_install", {
       mergeResults: (acc, next) => {
         const findings = [...(acc?.findings ?? []), ...(next.findings ?? [])];

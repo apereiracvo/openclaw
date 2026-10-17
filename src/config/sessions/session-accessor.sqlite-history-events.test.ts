@@ -1,17 +1,19 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { createNestedToolActivity } from "../../sessions/nested-tool-activity.js";
 import {
   openOpenClawAgentDatabase,
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
+import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../runtime-snapshot.js";
 import { appendTranscriptEvent, persistSessionTranscriptTurn } from "./session-accessor.js";
 import { readTranscriptRawDelta } from "./session-accessor.sqlite-delta.js";
+import { readSessionTranscriptHistoryEventPage } from "./session-accessor.sqlite-history-events.js";
 import {
   readTranscriptDisplayDelta,
   readRecentSessionTranscriptHistoryEvents,
-  readSessionTranscriptHistoryEventPage,
-} from "./session-accessor.sqlite-history-events.js";
+} from "./session-accessor.sqlite-history-events.test-support.js";
 import {
   historyEventId,
   readSessionTranscriptHistoryEventCount,
@@ -40,8 +42,9 @@ function enforceSqliteVariableLimit(
   database: OpenClawAgentDatabase,
   limit = REGRESSION_SQLITE_VARIABLE_LIMIT,
 ): void {
-  const prepare = database.db.prepare.bind(database.db);
-  vi.spyOn(database.db, "prepare").mockImplementation((source) => {
+  const nativeDb = requireNativeSqliteDatabase(database.db);
+  const prepare = nativeDb.prepare.bind(nativeDb);
+  vi.spyOn(nativeDb, "prepare").mockImplementation((source) => {
     const variableCount = source.match(/\?/gu)?.length ?? 0;
     if (variableCount > limit) {
       throw new Error("too many SQL variables");
@@ -52,6 +55,15 @@ function enforceSqliteVariableLimit(
 
 describe("SQLite transcript history events", () => {
   const scope = useHistoryEventScope();
+  beforeEach(() => setRuntimeConfigSnapshot({}));
+  afterEach(() => clearRuntimeConfigSnapshot());
+
+  beforeEach(() => {
+    setRuntimeConfigSnapshot({});
+  });
+  afterEach(() => {
+    clearRuntimeConfigSnapshot();
+  });
 
   it("reads fresh generations and rows across empty and populated sessions", async () => {
     const limits = { maxMessages: 20, maxLines: 20, maxBytes: 64 * 1024 };

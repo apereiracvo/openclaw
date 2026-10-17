@@ -6,9 +6,14 @@ import { createConfigIO } from "../config/io.factory.js";
 import { patchConfigHealthEntryToStore } from "../config/io.health-state.js";
 import { promoteConfigSnapshotToLastKnownGood, readConfigFileSnapshot } from "../config/io.js";
 import { createConfigHealthFingerprint } from "../config/io.observe-state.js";
+import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
 import { writeOpenClawConfig } from "../config/test-helpers.js";
+import {
+  readDeferredPluginMigrations,
+  recordDeferredPluginMigrations,
+} from "../infra/deferred-plugin-migrations.js";
 import {
   clearNodeSqliteKyselyCacheForDatabase,
   executeSqliteQueryTakeFirstSync,
@@ -20,7 +25,7 @@ import { createUpdateRun, getUpdateRun } from "../infra/update-run-ledger.js";
 import { ABANDONED_UPDATE_RUN_MS } from "../infra/update-run-timeouts.js";
 import { resetLogger, setLoggerOverride } from "../logging/logger.js";
 import { loggingState } from "../logging/state.js";
-import { readPersistedInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
+import { readPersistedInstalledPluginIndexInstallRecordsAsync } from "../plugins/installed-plugin-index-records.js";
 import { seedInstalledPluginIndex } from "../plugins/test-helpers/installed-plugin-index.js";
 import { readConfigMachineState } from "../state/config-machine-state.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
@@ -229,6 +234,50 @@ describe("runDoctorConfigPreflight", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([false, true])(
+    "repairs empty install metadata with a pending retired plugin: %s",
+    async (pending) => {
+      await withDoctorConfigPreflightHome(async (home) => {
+        const config = {
+          gateway: { mode: "local" as const },
+          plugins: { enabled: false, entries: { wecom: { config: { retained: true } } } },
+        };
+        const configPath = await writeOpenClawConfig(home, {
+          ...config,
+          plugins: { ...config.plugins, installs: {} },
+        });
+        const original = await fs.readFile(configPath, "utf8");
+        const canonical = { source: "path" as const, installPath: path.join(home, "canonical") };
+        await seedInstalledPluginIndex({ existing: canonical }, { config });
+        if (pending) {
+          await recordDeferredPluginMigrations({
+            pending: [
+              {
+                pluginId: "wecom",
+                reason: "The migration owner is unavailable.",
+                command: "openclaw doctor --fix",
+                configPaths: [["plugins", "entries", "wecom", "config"]],
+              },
+            ],
+          });
+        }
+        const migrations = readDeferredPluginMigrations();
+
+        expect((await runDoctorConfigPreflight(configRepairOptions)).snapshot.valid).toBe(true);
+        expect(await fs.readFile(`${configPath}.bak`, "utf8")).toBe(original);
+        const repaired = JSON.parse(await fs.readFile(configPath, "utf8"));
+        expect(repaired.plugins).toEqual(config.plugins);
+        expect(await readPersistedInstalledPluginIndexInstallRecordsAsync()).toEqual({
+          existing: canonical,
+        });
+        expect((await runStartupConfigPreflight({ gateway: true })).snapshot.valid).toBe(true);
+        expect((await runStartupConfigPreflight({ gateway: true })).snapshot.valid).toBe(true);
+        expect(JSON.parse(await fs.readFile(configPath, "utf8")).plugins).toEqual(config.plugins);
+        expect(readDeferredPluginMigrations()).toEqual(migrations);
+      });
+    },
+  );
+
   it("refuses pre-July install records restored after an earlier Doctor pass completed", async () => {
     await withDoctorConfigPreflightHome(async (home) => {
       await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
@@ -254,7 +303,9 @@ describe("runDoctorConfigPreflight", () => {
 
         await expect(runDoctorConfigPreflight(options)).rejects.toThrow(/plugins\.installs/);
         expect(await fs.readFile(configPath, "utf8")).toBe(restored);
-        expect(readPersistedInstalledPluginIndexInstallRecords()).toEqual({ existing: canonical });
+        expect(await readPersistedInstalledPluginIndexInstallRecordsAsync()).toEqual({
+          existing: canonical,
+        });
         expect(await fs.readFile(`${configPath}.bak`, "utf8").catch(() => undefined)).toBe(
           backupBefore,
         );
@@ -612,6 +663,10 @@ describe("runDoctorConfigPreflight", () => {
           const scope = {
             agentId: "main",
             env: { ...process.env },
+            storePath: resolveSessionStorePathCore(undefined, {
+              agentId: "main",
+              env: process.env,
+            }),
             sessionKey: "agent:main:historical-directives",
             sessionId: "historical-directives",
           };
@@ -665,6 +720,7 @@ describe("runDoctorConfigPreflight", () => {
               message: {
                 ...historicalEvent.message,
                 content: [{ type: "text", text: "Historical answer" }],
+                display: true,
                 openclawDelivery: { replyToCurrent: true },
               },
             });

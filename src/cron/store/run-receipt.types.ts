@@ -51,17 +51,6 @@ export type CronRunReceiptCurrentFacts = {
   deletionBlocked: boolean;
 };
 
-export type CronRunReceiptOwnerObservation = Pick<
-  CronRunReceipt,
-  "receiptId" | "ownerPid" | "ownerStartTime" | "startedAtMs"
->;
-
-export type PreparedCronRunReceiptAdjudication = {
-  storeKey: string;
-  observed?: CronRunReceiptOwnerObservation;
-  observedStale: boolean;
-};
-
 export class CronRunReceiptRevisionError extends Error {
   constructor(
     readonly receiptId: string,

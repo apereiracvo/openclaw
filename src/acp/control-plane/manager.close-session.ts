@@ -186,7 +186,6 @@ export async function runManagerCloseSession(params: {
     });
   }
 
-  assertCurrentAcpActor(params.isCurrentActor(), sessionKey);
   assertCurrent();
   const metaCleared = Boolean(input.clearMeta);
   if (metaCleared) {

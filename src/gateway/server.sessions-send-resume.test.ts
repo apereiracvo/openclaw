@@ -5,8 +5,9 @@ import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { createOperationalRunInstanceRef } from "../agents/admitted-run-context.js";
-import { buildAgentRunTerminalReplySnapshot } from "../agents/agent-run-terminal-reply.js";
+import { prepareAgentRunTerminalReply } from "../agents/agent-run-terminal-reply.js";
 import type { AgentCommandGatewayIngressOpts } from "../agents/command/types.js";
+import { readSubagentRunAnnounceResult } from "../agents/subagents/announce/subagent-announce-output.js";
 import { subagentRuns } from "../agents/subagents/registry/subagent-registry-memory.js";
 import { mutateSubagentRuns } from "../agents/subagents/registry/subagent-registry-persistence.js";
 import { markSubagentRunPausedAfterYield } from "../agents/subagents/registry/subagent-registry-run-pause.js";
@@ -19,6 +20,7 @@ import { withGatewayToolCallerIdentity } from "../agents/tools/gateway-caller-co
 import { createSessionsSendTool } from "../agents/tools/sessions-send-tool.js";
 import { getRuntimeConfig } from "../config/config.js";
 import {
+  appendTranscriptMessage,
   listSessionPendingInputReceipts,
   listSessionPendingInputs,
 } from "../config/sessions/session-accessor.js";
@@ -113,6 +115,8 @@ async function arrangeAuthorityProof(name: string) {
   await registerSubagentRun({
     runId: previousRunId,
     childSessionKey: child,
+    childAgentId: "main",
+    sessionEntry: { sessionId },
     controllerSessionKey: parent,
     requesterSessionKey: parent,
     requesterDisplayKey: parent,
@@ -131,6 +135,7 @@ async function arrangeAuthorityProof(name: string) {
     await recorder.persistApproved();
     expect(recorder.hasPersisted()).toBe(true);
     const text = "Unauthorized child final effect.";
+    const { terminalReply } = prepareAgentRunTerminalReply({ rawText: text });
     emitAgentEvent({
       runId: expectDefined(command.runId, "resume execution run id"),
       stream: "lifecycle",
@@ -138,10 +143,10 @@ async function arrangeAuthorityProof(name: string) {
         phase: "end",
         startedAt: Date.now() - 1,
         endedAt: Date.now(),
-        terminalReply: buildAgentRunTerminalReplySnapshot({ visibleText: text, rawText: text }),
+        terminalReply,
       },
     });
-    return { payloads: [{ text, mediaUrl: null }], meta: { durationMs: 1 } };
+    return { payloads: [{ text, mediaUrl: null }], meta: { durationMs: 1, terminalReply } };
   });
   const send = (caller = parent, approvalSignal?: AbortSignal, mode?: "resume") => {
     const tool = createSessionsSendTool({
@@ -440,6 +445,8 @@ it.each(["explicit", "automatic"] as const)(
     const started = createDeferred();
     const announce = await mockSubagentAnnounce();
     testState.sessionStorePath = path.join(root, "sessions.json");
+    const text = `${"Completed child task detail. ".repeat(200)}Resumed child finished.`;
+    const { terminalReply } = prepareAgentRunTerminalReply({ rawText: text });
     try {
       await writeSessionStore({
         entries: {
@@ -458,6 +465,8 @@ it.each(["explicit", "automatic"] as const)(
       await registerSubagentRun({
         runId: previousRunId,
         childSessionKey: child,
+        childAgentId: "main",
+        sessionEntry: { sessionId: `resume-${mode}-child` },
         controllerSessionKey: parent,
         requesterSessionKey: parent,
         requesterDisplayKey: parent,
@@ -476,7 +485,22 @@ it.each(["explicit", "automatic"] as const)(
         expect(recorder.hasPersisted()).toBe(true);
         started.resolve();
         await release.promise;
-        const text = "Resumed child finished.";
+        await appendTranscriptMessage(
+          {
+            agentId: "main",
+            sessionKey: child,
+            sessionId: `resume-${mode}-child`,
+            storePath: testState.sessionStorePath!,
+          },
+          {
+            message: {
+              role: "assistant",
+              content: text,
+              stopReason: "stop",
+              __openclaw: { runId },
+            },
+          },
+        );
         emitAgentEvent({
           runId,
           stream: "lifecycle",
@@ -484,10 +508,10 @@ it.each(["explicit", "automatic"] as const)(
             phase: "end",
             startedAt: Date.now() - 1,
             endedAt: Date.now(),
-            terminalReply: buildAgentRunTerminalReplySnapshot({ visibleText: text, rawText: text }),
+            terminalReply,
           },
         });
-        return { payloads: [{ text, mediaUrl: null }], meta: { durationMs: 1 } };
+        return { payloads: [{ text, mediaUrl: null }], meta: { durationMs: 1, terminalReply } };
       });
       const tool = createSessionsSendTool({
         agentSessionKey: parent,
@@ -540,9 +564,16 @@ it.each(["explicit", "automatic"] as const)(
         expect.objectContaining({
           requesterSessionKey: parent,
           childSessionKey: child,
-          roundOneReply: "Resumed child finished.",
+          terminalReply,
         }),
       );
+      const completed = expectDefined(
+        [...subagentRuns.values()].find((run) => run.childSessionKey === child),
+        "completed resumed child",
+      );
+      const prepared = await readSubagentRunAnnounceResult(completed);
+      expect(prepared.text).toBe(text);
+      expect(prepared.isCurrent()).toBe(true);
       expect(agentCommandMock).toHaveBeenCalledTimes(1);
     } finally {
       release.resolve();

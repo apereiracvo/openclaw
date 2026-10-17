@@ -13,10 +13,11 @@ import { getSessionEntryAsync, resolveStorePath } from "openclaw/plugin-sdk/sess
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveCodexBindingAppServerConnection } from "./app-server/binding-connection.js";
 import type { CodexComputerUseSetupParams } from "./app-server/computer-use.js";
+import type { CodexPluginConfig } from "./app-server/config-contracts.js";
 import { isJsonObject, type JsonValue } from "./app-server/protocol.js";
 import {
   prepareCodexNativeExecutionBlock,
-  resolveCodexNativeSandboxBlock,
+  prepareCodexNativeSandboxBlock,
 } from "./app-server/sandbox-guard.js";
 import type {
   CodexAppServerBindingIdentity,
@@ -73,17 +74,18 @@ export async function resolveCodexNativeCommandSandboxBlock(
   block: string | undefined;
   assertCurrent: () => Promise<void>;
   source?: PreparedSessionSourceAssertion;
+  release: () => void;
 }> {
   if (
     isReadOnlyCodexGoalCommand(subcommand, args) ||
     returnsBeforeNativeCodexExecution(subcommand, args)
   ) {
-    return { block: undefined, async assertCurrent() {} };
+    return { block: undefined, async assertCurrent() {}, release() {} };
   }
   const sessionKey = ctx.sessionTarget?.sessionKey ?? ctx.sessionKey;
   const checksModelLock = ["bind", "resume", "detach", "unbind", "model"].includes(subcommand);
   if (!checksModelLock && !CODEX_NATIVE_EXECUTION_SUBCOMMANDS.has(subcommand)) {
-    return { block: undefined, async assertCurrent() {} };
+    return { block: undefined, async assertCurrent() {}, release() {} };
   }
   const agentId = ctx.sessionTarget?.agentId ?? resolveCodexConversationControlScope(ctx).agentId;
   const storePath =
@@ -102,34 +104,41 @@ export async function resolveCodexNativeCommandSandboxBlock(
       block: undefined,
       assertCurrent: modelCurrent?.assertCurrent ?? (async () => {}),
       source: modelCurrent?.source,
+      release: modelCurrent?.release ?? (() => {}),
     };
   }
-  if (isCodexCliNodeResumeBind(subcommand, args)) {
-    return {
-      block: resolveCodexNativeSandboxBlock({
-        config: ctx.config,
-        sessionKey: ctx.sessionKey,
-        sessionId: ctx.sessionId,
-        surface: `/${["codex", subcommand].join(" ")}`,
-      }),
-      assertCurrent: modelCurrent?.assertCurrent ?? (async () => {}),
-      source: modelCurrent?.source,
-    };
+  let execution: Awaited<ReturnType<typeof prepareCodexNativeExecutionBlock>>;
+  try {
+    const surface = `/${["codex", subcommand].join(" ")}`;
+    execution = isCodexCliNodeResumeBind(subcommand, args)
+      ? await prepareCodexNativeSandboxBlock({
+          config: ctx.config,
+          sessionKey: ctx.sessionKey,
+          sessionId: ctx.sessionId,
+          surface,
+        })
+      : await prepareCodexNativeExecutionBlock({
+          config: ctx.config,
+          agentId: ctx.agentId,
+          sessionKey,
+          sessionId: ctx.sessionId,
+          storePath,
+          surface,
+        });
+  } catch (error) {
+    modelCurrent?.release();
+    throw error;
   }
-  const execution = await prepareCodexNativeExecutionBlock({
-    config: ctx.config,
-    agentId: ctx.agentId,
-    sessionKey,
-    sessionId: ctx.sessionId,
-    storePath,
-    surface: `/${["codex", subcommand].join(" ")}`,
-  });
   return {
     block: execution.block,
     source: composeSessionEntryCommitGuards([modelCurrent?.source, execution.source]),
     assertCurrent: async () => {
       await modelCurrent?.assertCurrent();
       await execution.assertCurrent();
+    },
+    release: () => {
+      modelCurrent?.release();
+      execution.release();
     },
   };
 }
@@ -148,7 +157,7 @@ export function returnsBeforeNativeCodexExecution(
 ): boolean {
   switch (subcommand) {
     case "bind":
-      return parseBindArgs([...args]).help === true;
+      return parseBindArgs(args).help === true;
     case "resume":
       return returnsBeforeNativeCodexResume(args);
     case "steer":
@@ -176,12 +185,12 @@ function isCodexCliNodeResumeBind(subcommand: string, args: readonly string[]): 
   if (subcommand !== "resume") {
     return false;
   }
-  const parsed = parseResumeArgs([...args]);
+  const parsed = parseResumeArgs(args);
   return Boolean(parsed.host && parsed.threadId && parsed.bindHere === true && !parsed.help);
 }
 
 function returnsBeforeNativeCodexResume(args: readonly string[]): boolean {
-  const parsed = parseResumeArgs([...args]);
+  const parsed = parseResumeArgs(args);
   if (parsed.help || !parsed.threadId) {
     return true;
   }
@@ -191,7 +200,7 @@ function returnsBeforeNativeCodexResume(args: readonly string[]): boolean {
 export async function handleComputerUseCommand(
   deps: CodexCommandDeps,
   ctx: PluginCommandContext,
-  pluginConfig: unknown,
+  pluginConfig: CodexPluginConfig | undefined,
   args: string[],
 ): Promise<string> {
   const parsed = parseComputerUseArgs(args);
@@ -229,12 +238,13 @@ export async function handleComputerUseCommand(
 export async function handleNativeGoal(
   deps: CodexCommandDeps,
   ctx: PluginCommandContext,
-  pluginConfig: unknown,
+  pluginConfig: CodexPluginConfig | undefined,
   args: string[],
 ): Promise<string> {
   const action = (args[0] ?? "status").toLowerCase();
   const objective = args.slice(1).join(" ").trim();
   const authority = await resolvePreparedCodexCommandAuthority(deps, ctx);
+  using _ = { [Symbol.dispose]: authority.release };
   const { target, binding } = authority;
   if (!target) {
     return "Cannot manage the Codex goal because this command has no stable binding identity.";
@@ -346,6 +356,7 @@ export async function controlConversationTurn(
   message: string,
 ): Promise<string> {
   const authority = await resolvePreparedCodexCommandAuthority(deps, ctx);
+  using _ = { [Symbol.dispose]: authority.release };
   const { target, binding } = authority;
   if (!target) {
     return `Cannot ${command} Codex because this command did not include a stable binding identity.`;
@@ -377,6 +388,7 @@ export async function setConversationModel(
     return MODEL_SELECTION_LOCKED_MESSAGE;
   }
   const authority = await resolvePreparedCodexCommandAuthority(deps, ctx);
+  using _ = { [Symbol.dispose]: authority.release };
   const { target, binding } = authority;
   if (!target) {
     return "Cannot set Codex model because this command did not include a stable binding identity.";
@@ -432,6 +444,7 @@ export async function setConversationPreference(
     return usage;
   }
   const authority = await resolvePreparedCodexCommandAuthority(deps, ctx);
+  using _ = { [Symbol.dispose]: authority.release };
   const { target, binding } = authority;
   if (kind === "fast") {
     if (!target) {
@@ -491,7 +504,7 @@ export async function setConversationPreference(
 export async function startThreadAction(
   deps: CodexCommandDeps,
   ctx: PluginCommandContext,
-  pluginConfig: unknown,
+  pluginConfig: CodexPluginConfig | undefined,
   kind: "compact" | "review",
   args: string[],
 ): Promise<string> {
@@ -499,6 +512,7 @@ export async function startThreadAction(
     return `Usage: /codex ${kind}`;
   }
   const authority = await resolvePreparedCodexCommandAuthority(deps, ctx);
+  using _ = { [Symbol.dispose]: authority.release };
   const { target, binding } = authority;
   if (!target) {
     return `Cannot start Codex ${kind === "compact" ? "compaction" : "review"} because this command did not include a stable binding identity.`;
