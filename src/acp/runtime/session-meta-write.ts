@@ -5,6 +5,7 @@ import { captureMaintenanceConfigAsyncReader } from "../../config/sessions/store
 import { mergeSessionEntry, type SessionEntry } from "../../config/sessions/types.js";
 import { readDatabasePathIdentitySync } from "../../infra/sqlite-worker-identity.js";
 import { isIncognitoSessionKey } from "../../routing/session-key.js";
+import { toAgentExecutionConstraints } from "../../state/openclaw-agent-execution-scope.js";
 import {
   captureOpenClawAgentDatabaseExecution,
   supportsOpenClawAgentDatabaseExecution,
@@ -16,11 +17,11 @@ import { buildAcpDatabaseSessionKey } from "./session-meta-keys.js";
 import { upsertMemoryAcpSessionMeta } from "./session-meta-memory.js";
 import { captureAcpSessionReadContext } from "./session-meta-read-context.js";
 import { resolveSessionStorePathForAcp } from "./session-meta-store.js";
-import { withAcpSessionMetaWriteLock } from "./session-meta-write-lock.js";
 import {
   prepareAcpSessionMutation,
   commitAcpSessionMutation,
 } from "./session-meta-worker-mutation.js";
+import { withAcpSessionMetaWriteLock } from "./session-meta-write-lock.js";
 import { upsertAcpSessionMetaForMaintenance } from "./session-meta-write.native.js";
 import type { AcpSessionMutationParams } from "./session-meta-write.types.js";
 
@@ -130,16 +131,7 @@ async function persistAcpSessionMeta(
       const updatedAt = params.now?.() ?? Date.now();
       const execution = captureOpenClawAgentDatabaseExecution(
         options,
-        identity.key.startsWith("file:")
-          ? {
-              expectedIdentity: {
-                kind: "file",
-                physicalIdentity: identity.key.slice(5),
-                nativeLocation: identity.canonicalPath,
-                birthtime: identity.birthtime,
-              },
-            }
-          : { expectedCreationIdentity: identity },
+        toAgentExecutionConstraints(identity),
       );
       const assertCurrent = () => {
         captured.assertCurrent();

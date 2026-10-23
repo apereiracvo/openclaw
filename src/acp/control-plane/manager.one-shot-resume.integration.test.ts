@@ -6,6 +6,10 @@ import { createTestAdmittedRunContext } from "../../agents/admitted-run-context.
 import type { AgentToolGatewayRequestCaller } from "../../agents/tools/in-process-gateway.js";
 import { createSessionsSendTool } from "../../agents/tools/sessions-send-tool.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../config/runtime-snapshot.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { SessionAcpMeta } from "../../config/sessions/types.js";
 import { listSessionStateEventsSince } from "../../sessions/session-state-events.js";
@@ -116,6 +120,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearRuntimeConfigSnapshot();
   resetAcpActiveTurnsForTests();
   closeOpenClawAgentDatabasesForTest();
   closeOpenClawStateDatabaseForTest();
@@ -133,8 +138,10 @@ describe("ACP one-shot cross-owner resume integration", () => {
         const protocolSessionId = "wire-session-1";
         const openClawSessionId = "openclaw-child-session";
         const parentSessionId = "openclaw-parent-session";
+        const storePath = path.join(root, "agents", "codex", "sessions", "sessions.json");
         const cfg = {
-          session: { mainKey: "main", scope: "per-sender" },
+          agents: { list: [{ id: "codex", default: true }] },
+          session: { store: storePath, mainKey: "main", scope: "per-sender" },
           tools: {
             sessions: { visibility: "tree" },
             agentToAgent: { enabled: true },
@@ -150,12 +157,13 @@ describe("ACP one-shot cross-owner resume integration", () => {
           },
         } as OpenClawConfig;
 
+        setRuntimeConfigSnapshot(cfg);
         await replaceSessionEntry(
-          { agentId: "codex", sessionKey: parentSessionKey },
+          { agentId: "codex", storePath, sessionKey: parentSessionKey },
           { sessionId: parentSessionId, updatedAt: Date.now() },
         );
         await replaceSessionEntry(
-          { agentId: "codex", sessionKey },
+          { agentId: "codex", storePath, sessionKey },
           {
             sessionId: openClawSessionId,
             updatedAt: Date.now(),
@@ -390,16 +398,19 @@ describe("ACP one-shot cross-owner resume integration", () => {
         const sessionKey = "agent:codex:acp:fenced-resume-child";
         const parentSessionKey = "agent:codex:main";
         const parentSessionId = "fenced-parent-session";
+        const storePath = path.join(root, "agents", "codex", "sessions", "sessions.json");
         const cfg = {
-          session: {},
+          agents: { list: [{ id: "codex", default: true }] },
+          session: { store: storePath },
           tools: { sessions: { visibility: "tree" }, agentToAgent: { enabled: true } },
         } as OpenClawConfig;
+        setRuntimeConfigSnapshot(cfg);
         await replaceSessionEntry(
-          { agentId: "codex", sessionKey: parentSessionKey },
+          { agentId: "codex", storePath, sessionKey: parentSessionKey },
           { sessionId: parentSessionId, updatedAt: Date.now() },
         );
         await replaceSessionEntry(
-          { agentId: "codex", sessionKey },
+          { agentId: "codex", storePath, sessionKey },
           {
             sessionId: "new-incarnation",
             updatedAt: Date.now(),

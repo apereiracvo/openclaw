@@ -1,4 +1,3 @@
-import path from "node:path";
 import { resolveRealpathOrAbsolute } from "../../../infra/boundary-path.js";
 import { isEmbeddedMode } from "../../../infra/embedded-mode.js";
 import { buildBootstrapBudgetState, buildBootstrapInjectionStats } from "../../bootstrap-budget.js";
@@ -8,12 +7,13 @@ import {
   resolveBootstrapFilesForRun,
   resolveContextInjectionMode,
 } from "../../bootstrap-files.js";
-import { isHeartbeatLifecycleRunKind } from "../../bootstrap-mode.js";
 import {
   isPrimaryBootstrapRun,
   resolveWorkspaceBootstrapRouting,
 } from "../../bootstrap-routing.js";
 import { buildBootstrapContextForFiles } from "../../embedded-agent-helpers/bootstrap.js";
+import type { EmbeddedContextFile } from "../../embedded-agent-helpers/context-file.js";
+import { isUnreadableWorkspaceBootstrapFile } from "../../workspace-bootstrap-read.js";
 import {
   DEFAULT_AGENTS_FILENAME,
   DEFAULT_BOOTSTRAP_FILENAME,
@@ -22,7 +22,6 @@ import {
   type WorkspaceBootstrapFile,
 } from "../../workspace.js";
 import { log } from "../logger.js";
-import { resolveAttemptBootstrapContext } from "./attempt-context-engine-helpers.js";
 import { remapInjectedContextFilesToWorkspace } from "./attempt-setup.js";
 import type { EmbeddedAttemptSetup } from "./attempt-setup.js";
 import type { EmbeddedRunAttemptBase, EmbeddedRunAttemptParams } from "./types.js";
@@ -90,7 +89,6 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
   const shouldProbeContinuationSkip =
     !suppressAmbientContext &&
     contextInjectionMode === "continuation-skip" &&
-    !isHeartbeatLifecycleRunKind(attempt.bootstrapContextRunKind) &&
     (await hasCompletedBootstrapTurnForAttempt());
   let preloadedBootstrapFiles: WorkspaceBootstrapFile[] | undefined;
   let bootstrapRouting =
@@ -107,56 +105,57 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
   }
   bootstrapRouting ??= await resolveBootstrapRouting(preloadedBootstrapFiles);
   const bootstrapMode = bootstrapRouting.bootstrapMode;
-  const {
-    bootstrapFiles: hookAdjustedBootstrapFiles,
-    contextFiles: resolvedContextFiles,
-    shouldRecordCompletedBootstrapTurn,
-  } = await resolveAttemptBootstrapContext({
-    // Raw probes and isolated finalization must not load AGENTS/BOOTSTRAP
-    // context even though finalization preserves the settled transcript.
-    contextInjectionMode: suppressAmbientContext ? "never" : contextInjectionMode,
-    bootstrapContextMode: attempt.bootstrapContextMode,
-    bootstrapContextRunKind: attempt.bootstrapContextRunKind ?? "default",
-    bootstrapMode,
-    deliversCompleteWorkspaceContext: bootstrapRouting.deliversCompleteWorkspaceContext,
-    hasCompletedBootstrapTurn: hasCompletedBootstrapTurnForAttempt,
-    resolveBootstrapContextForRun: async () => {
-      const bootstrapFiles =
-        preloadedBootstrapFiles ?? (await resolveWorkspaceBootstrapFiles(bootstrapWorkspaceDir));
-      // `executionAgentsRootDir` is creation-validated registered-project provenance
-      // (sessions.create canonicalized and containment-checked the spawned cwd for this
-      // project), so that root layers even when it is not the run workspace. Without it
-      // the layer falls back to the run workspace, so a projectless spawned cwd that
-      // became the run workspace (#162308) still layers its AGENTS.md; layering is
-      // skipped only when the execution root resolves to the bootstrap workspace.
-      const executionAgentsRoot = attempt.executionAgentsRootDir ?? params.setup.resolvedWorkspace;
-      const executionAgentsPath = path.join(
-        path.resolve(executionAgentsRoot),
-        DEFAULT_AGENTS_FILENAME,
-      );
-      // The layer is provenance-derived rather than run-policy-derived, so it reads
-      // exactly one root file. The run resolver would instead read the project's
-      // SOUL/MEMORY/BOOTSTRAP/USER, classify memory, open writable setup state, fire
-      // `agent:bootstrap` hooks, and evict the sessionKey-keyed snapshot the agent
-      // workspace owns, all to discard everything but this AGENTS.md.
-      const executionProjectFiles =
-        resolveRealpathOrAbsolute(bootstrapWorkspaceDir) ===
+  // Raw probes and isolated finalization must not load AGENTS/BOOTSTRAP
+  // context even though finalization preserves the settled transcript.
+  const effectiveContextInjectionMode = suppressAmbientContext ? "never" : contextInjectionMode;
+  const bootstrapContextMode = attempt.bootstrapContextMode;
+  const bootstrapContextRunKind = attempt.bootstrapContextRunKind ?? "default";
+  const deliversCompleteWorkspaceContext = bootstrapRouting.deliversCompleteWorkspaceContext;
+  const isContinuationTurn =
+    bootstrapMode !== "full" &&
+    effectiveContextInjectionMode === "continuation-skip" &&
+    (await hasCompletedBootstrapTurnForAttempt());
+  const shouldSkipBootstrapInjection =
+    effectiveContextInjectionMode === "never" || isContinuationTurn;
+  let hookAdjustedBootstrapFiles: WorkspaceBootstrapFile[] = [];
+  let resolvedContextFiles: EmbeddedContextFile[] = [];
+  if (!shouldSkipBootstrapInjection) {
+    const bootstrapFiles =
+      preloadedBootstrapFiles ?? (await resolveWorkspaceBootstrapFiles(bootstrapWorkspaceDir));
+    // Only the creation-validated project root may add instructions. Neither the
+    // run workspace nor an arbitrary cwd supplies selected-project provenance.
+    const executionAgentsRoot = attempt.executionAgentsRootDir;
+    const executionProjectFiles: WorkspaceBootstrapFile[] = [];
+    if (
+      executionAgentsRoot &&
+      resolveRealpathOrAbsolute(bootstrapWorkspaceDir) !==
         resolveRealpathOrAbsolute(executionAgentsRoot)
-          ? []
-          : (
-              await loadWorkspaceBootstrapFiles(executionAgentsRoot, [DEFAULT_AGENTS_FILENAME])
-            ).filter((file) => !file.missing && path.resolve(file.path) === executionAgentsPath);
-      const layeredBootstrapFiles = [...bootstrapFiles, ...executionProjectFiles];
-      return {
-        bootstrapFiles: layeredBootstrapFiles,
-        contextFiles: buildBootstrapContextForFiles(layeredBootstrapFiles, {
-          config: attempt.config,
-          agentId: params.setup.sessionAgentId,
-          warn: bootstrapWarn,
-        }),
-      };
-    },
-  });
+    ) {
+      // The full resolver would load private project files, run bootstrap hooks
+      // and replace the agent workspace's session snapshot. Keep load diagnostics.
+      const files = await loadWorkspaceBootstrapFiles(executionAgentsRoot, [
+        DEFAULT_AGENTS_FILENAME,
+      ]);
+      for (const file of files) {
+        file.origin = { kind: "execution-project", rootPath: executionAgentsRoot };
+      }
+      executionProjectFiles.push(...files);
+    }
+    hookAdjustedBootstrapFiles = [...bootstrapFiles, ...executionProjectFiles];
+    resolvedContextFiles = buildBootstrapContextForFiles(hookAdjustedBootstrapFiles, {
+      config: attempt.config,
+      agentId: params.setup.sessionAgentId,
+      warn: bootstrapWarn,
+    });
+  }
+  // Check both workspace layers after loading: an unreadable file must be retried next turn.
+  const shouldRecordCompletedBootstrapTurn =
+    !shouldSkipBootstrapInjection &&
+    bootstrapContextMode !== "lightweight" &&
+    bootstrapContextRunKind !== "cron" &&
+    deliversCompleteWorkspaceContext &&
+    !hookAdjustedBootstrapFiles.some(isUnreadableWorkspaceBootstrapFile) &&
+    (bootstrapMode === "full" || effectiveContextInjectionMode === "continuation-skip");
   params.setup.prepStages?.mark("bootstrap-context");
   const injectedContextFiles = bootstrapRouting.includeBootstrapInSystemContext
     ? resolvedContextFiles

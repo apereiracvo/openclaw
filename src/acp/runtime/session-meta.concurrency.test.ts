@@ -3,6 +3,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../config/runtime-snapshot.js";
+import {
   patchSessionEntryWithKey,
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
@@ -10,6 +14,8 @@ import type { SessionEntry } from "../../config/sessions/types.js";
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { withTestDir } from "../../test-helpers/temp-dir.js";
+import { buildAcpDatabaseSessionKey } from "./session-meta-keys.js";
+import { resolveSessionStorePathForAcp } from "./session-meta-store.js";
 import { withAcpSessionMetaWriteLock } from "./session-meta-write-lock.js";
 import { readAcpSessionMetaAsync, upsertAcpSessionMeta } from "./session-meta.js";
 
@@ -65,24 +71,41 @@ async function seedAcpSessionEntry(params: {
 
 describe("ACP session metadata write serialization", () => {
   afterEach(() => {
+    clearRuntimeConfigSnapshot();
     closeOpenClawAgentDatabasesForTest();
     closeOpenClawStateDatabaseForTest();
   });
 
-  it("serializes same-session mutations across the full asynchronous persistence interval", async () => {
+  it("serializes supported main aliases across the full asynchronous persistence interval", async () => {
     await withTestDir({ prefix: "openclaw-acp-meta-serialization-" }, async (dir) => {
       const storePath = path.join(dir, "sessions.json");
       const databasePath = path.join(dir, "state", "openclaw.sqlite");
-      const cfg = { session: { store: storePath } } as OpenClawConfig;
-      const sessionKey = "agent:codex:acp:serialized";
+      const cfg: OpenClawConfig = {
+        agents: { ownership: "explicit", entries: { codex: {} } },
+        session: { store: storePath, mainKey: "work" },
+      };
+      setRuntimeConfigSnapshot(cfg);
+      const sessionKey = "agent:codex:work";
+      const aliasSessionKey = "main";
+      const scope = { cfg, databasePath, agentId: ACP_AGENT_ID };
+      const canonical = resolveSessionStorePathForAcp({ ...scope, sessionKey });
+      const alias = resolveSessionStorePathForAcp({ ...scope, sessionKey: aliasSessionKey });
+      expect(canonical).toMatchObject({
+        agentId: ACP_AGENT_ID,
+        storePath,
+        storeSessionKey: sessionKey,
+      });
+      expect(alias).toEqual(canonical);
+      expect(buildAcpDatabaseSessionKey(alias.storeSessionKey, alias.agentId)).toBe(
+        "@acp:v1:WyJjb2RleCIsImFnZW50OmNvZGV4OndvcmsiXQ",
+      );
       await seedAcpSessionEntry({
         storePath,
         sessionKey,
         entry: { sessionId: "sess-serialized", updatedAt: 1 },
       });
       await upsertAcpSessionMeta({
-        cfg,
-        databasePath,
+        ...scope,
         sessionKey,
         mutate: () => ({
           backend: "acpx",
@@ -97,37 +120,59 @@ describe("ACP session metadata write serialization", () => {
       const writer = await holdSessionEntryWriter({ storePath, sessionKey });
       const mutationOrder: string[] = [];
       const firstEvaluated = deferred<void>();
+      let firstSettled = false;
       const first = upsertAcpSessionMeta({
-        cfg,
-        databasePath,
-        sessionKey,
+        ...scope,
+        sessionKey: aliasSessionKey,
         mutate: (current) => {
           mutationOrder.push("first");
           firstEvaluated.resolve();
           return { ...current!, lastActivityAt: current!.lastActivityAt + 1 };
         },
+      }).then((result) => {
+        firstSettled = true;
+        return result;
       });
-      await firstEvaluated.promise;
-      const second = upsertAcpSessionMeta({
-        cfg,
-        databasePath,
-        sessionKey,
-        mutate: (current) => {
-          mutationOrder.push("second");
-          expect(current?.lastActivityAt).toBe(2);
-          return { ...current!, lastActivityAt: current!.lastActivityAt + 1 };
-        },
-      });
-      await Promise.resolve();
-      expect(mutationOrder).toEqual(["first"]);
-
-      writer.release();
-      await Promise.all([writer.settled, first, second]);
+      let second: ReturnType<typeof upsertAcpSessionMeta> | undefined;
+      try {
+        await Promise.race([firstEvaluated.promise, first]);
+        second = upsertAcpSessionMeta({
+          ...scope,
+          sessionKey,
+          mutate: (current) => {
+            mutationOrder.push("second");
+            expect(firstSettled).toBe(true);
+            expect(current?.lastActivityAt).toBe(2);
+            expect(current?.state).toBe("running");
+            return { ...current!, state: "idle", lastActivityAt: current!.lastActivityAt + 1 };
+          },
+        });
+        // The real entry writer holds the first operation after its read/decision.
+        expect(await readAcpSessionMetaAsync({ ...scope, sessionKey })).toMatchObject({
+          lastActivityAt: 1,
+          state: "running",
+        });
+        expect(mutationOrder).toEqual(["first"]);
+      } finally {
+        writer.release();
+        await Promise.allSettled([writer.settled, first, second]);
+      }
+      await writer.settled;
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      expect(firstResult?.acp).toMatchObject({ lastActivityAt: 2, state: "running" });
+      expect(secondResult?.acp).toMatchObject({ lastActivityAt: 3, state: "idle" });
 
       expect(mutationOrder).toEqual(["first", "second"]);
-      expect((await readAcpSessionMetaAsync({ cfg, databasePath, sessionKey }))?.lastActivityAt).toBe(
-        3,
-      );
+      expect(await readAcpSessionMetaAsync({ ...scope, sessionKey })).toMatchObject({
+        lastActivityAt: 3,
+        state: "idle",
+      });
+      expect(
+        await readAcpSessionMetaAsync({ ...scope, sessionKey: aliasSessionKey }),
+      ).toMatchObject({
+        lastActivityAt: 3,
+        state: "idle",
+      });
     });
   });
 

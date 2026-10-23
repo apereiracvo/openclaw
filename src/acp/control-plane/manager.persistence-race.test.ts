@@ -183,17 +183,17 @@ describe("AcpSessionManager production persistence race", () => {
             reason: "oneshot-continuation-persistence-rejected",
           });
           expect(manager.getObservabilitySnapshot().runtimeCache.activeSessions).toBe(0);
-          expect(await actualSessionMeta.readAcpSessionMetaAsync({ cfg, sessionKey })).toMatchObject(
-            {
-              backend: "persisted-backend",
-              runtimeSessionName: "generation-b",
-              identity: {
-                acpxRecordId: "record-b",
-                acpxSessionId: "session-b",
-                sessionResumeReady: false,
-              },
+          expect(
+            await actualSessionMeta.readAcpSessionMetaAsync({ cfg, sessionKey }),
+          ).toMatchObject({
+            backend: "persisted-backend",
+            runtimeSessionName: "generation-b",
+            identity: {
+              acpxRecordId: "record-b",
+              acpxSessionId: "session-b",
+              sessionResumeReady: false,
             },
-          );
+          });
         } finally {
           releaseEnsure.resolve();
           closeOpenClawAgentDatabasesForTest();
@@ -350,16 +350,16 @@ describe("AcpSessionManager production persistence race", () => {
           expect(readinessApplied).toBe(0);
           expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
           expect(runtimeState.runTurn).toHaveBeenCalledOnce();
-          expect(await actualSessionMeta.readAcpSessionMetaAsync({ cfg, sessionKey })).toMatchObject(
-            {
-              runtimeSessionName: "generation-b",
-              identity: {
-                acpxRecordId: "record-b",
-                acpxSessionId: "session-b",
-                sessionResumeReady: false,
-              },
+          expect(
+            await actualSessionMeta.readAcpSessionMetaAsync({ cfg, sessionKey }),
+          ).toMatchObject({
+            runtimeSessionName: "generation-b",
+            identity: {
+              acpxRecordId: "record-b",
+              acpxSessionId: "session-b",
+              sessionResumeReady: false,
             },
-          );
+          });
         } finally {
           releaseWriter.resolve();
           await heldWriter;

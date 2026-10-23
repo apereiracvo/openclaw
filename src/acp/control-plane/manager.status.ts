@@ -62,7 +62,7 @@ export async function runManagerGetSessionStatus(params: {
   }
   const {
     runtime,
-    handle: ensuredHandle,
+    handle,
     meta: initialMeta,
   } = await params.ensureRuntimeHandle({
     assertActive: params.assertActive,
@@ -73,7 +73,6 @@ export async function runManagerGetSessionStatus(params: {
     isCurrentActor,
     intent: "observation",
   });
-  let handle = ensuredHandle;
   params.assertActive?.();
   const capabilities = await resolveManagerRuntimeCapabilities({ runtime, handle });
   assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
@@ -106,21 +105,19 @@ export async function runManagerGetSessionStatus(params: {
     failOnStatusError: true,
     isCurrentActor,
   });
-  handle = reconciledSession.handle;
   const meta = reconciledSession.meta;
-  runtimeStatus = reconciledSession.runtimeStatus;
   const identity = resolveSessionIdentityFromMeta(meta);
   return {
     sessionKey: params.sessionKey,
     agentId: params.agentId,
-    backend: handle.backend || meta.backend,
+    backend: reconciledSession.handle.backend || meta.backend,
     agent: meta.agent,
     ...(identity ? { identity } : {}),
     state: meta.state,
     mode: meta.mode,
     runtimeOptions: resolveRuntimeOptionsFromMeta(meta),
     capabilities,
-    runtimeStatus,
+    runtimeStatus: reconciledSession.runtimeStatus,
     lastActivityAt: meta.lastActivityAt,
     lastError: meta.lastError,
   };

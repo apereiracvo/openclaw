@@ -2,7 +2,6 @@ import type {
   AcpRuntime,
   AcpRuntimeEvent,
   AcpRuntimeTurnInput,
-  AcpRuntimeTurnResult,
 } from "@openclaw/acp-core/runtime/types";
 import { runWithAgentToolSourceExecutionScope } from "../../agents/agent-tool-source-execution-guard.js";
 import type { SessionSourceAssertion } from "../../config/sessions/session-source-authority.js";
@@ -31,7 +30,8 @@ class AcpTurnStreamTerminalError extends Error {
   }
 }
 
-function throwAcpTurnStreamFailure(error: unknown, outcome: AcpTurnStreamOutcome): never {
+/** Retains backend terminal evidence when stream processing or deferred publication fails. */
+export function throwAcpTurnStreamFailure(error: unknown, outcome: AcpTurnStreamOutcome): never {
   if (error instanceof AcpTurnStreamTerminalError) {
     throw error;
   }
@@ -124,44 +124,9 @@ async function consumeAcpTurnEvents(params: {
   }
 }
 
-function errorFromTurnResult(result: Extract<AcpRuntimeTurnResult, { status: "failed" }>) {
-  return new AcpRuntimeError(
-    normalizeAcpErrorCode(result.error.code),
-    normalizeText(result.error.message) || "ACP turn failed before completion.",
-    result.error.detailCode ? { detailCode: result.error.detailCode } : undefined,
-  );
-}
-
 function waitForQueuedEvents(): Promise<"pending"> {
   return new Promise((resolve) => {
     setTimeout(() => resolve("pending"), 0);
-  });
-}
-
-async function notifyTerminalResult(params: {
-  result: AcpRuntimeTurnResult;
-  eventGate: AcpTurnEventGate;
-  onEvent?: (event: AcpRuntimeEvent) => Promise<void> | void;
-}): Promise<void> {
-  if (!params.eventGate.open) {
-    return;
-  }
-  if (params.result.status === "completed" || params.result.status === "cancelled") {
-    await params.onEvent?.({
-      type: "done",
-      status: params.result.status,
-      ...(params.result.stopReason ? { stopReason: params.result.stopReason } : {}),
-    });
-    return;
-  }
-  await params.onEvent?.({
-    type: "error",
-    code: normalizeAcpErrorCode(params.result.error.code),
-    ...(params.result.error.detailCode ? { detailCode: params.result.error.detailCode } : {}),
-    message: normalizeText(params.result.error.message) || "ACP turn failed before completion.",
-    ...(params.result.error.retryable === undefined
-      ? {}
-      : { retryable: params.result.error.retryable }),
   });
 }
 
@@ -328,11 +293,24 @@ export async function consumeAcpTurnStream(params: {
       await turn.closeStream({ reason: `turn-result-${result.status}` }).catch(() => {});
     }
     try {
-      await notifyTerminalResult({
-        result,
-        eventGate: params.eventGate,
-        onEvent: params.onEvent,
-      });
+      const { eventGate, onEvent } = params;
+      if (eventGate.open) {
+        if (result.status === "completed" || result.status === "cancelled") {
+          await onEvent?.({
+            type: "done",
+            status: result.status,
+            ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+          });
+        } else {
+          await onEvent?.({
+            type: "error",
+            code: normalizeAcpErrorCode(result.error.code),
+            ...(result.error.detailCode ? { detailCode: result.error.detailCode } : {}),
+            message: normalizeText(result.error.message) || "ACP turn failed before completion.",
+            ...(result.error.retryable === undefined ? {} : { retryable: result.error.retryable }),
+          });
+        }
+      }
     } catch (error) {
       if (result.status === "completed" || result.status === "cancelled") {
         throwAcpTurnStreamFailure(error, {
@@ -343,7 +321,11 @@ export async function consumeAcpTurnStream(params: {
       throw error;
     }
     if (result.status === "failed") {
-      throw errorFromTurnResult(result);
+      throw new AcpRuntimeError(
+        normalizeAcpErrorCode(result.error.code),
+        normalizeText(result.error.message) || "ACP turn failed before completion.",
+        result.error.detailCode ? { detailCode: result.error.detailCode } : undefined,
+      );
     }
     return {
       sawOutput: eventOutcome.sawOutput,

@@ -1,4 +1,3 @@
-/** Backend failover helpers for ACP session initialization and turn execution. */
 import type { AcpRuntimeErrorCode } from "../runtime/errors.js";
 import { normalizeText } from "./runtime-options.js";
 
@@ -21,11 +20,9 @@ export function resolveBackendCandidatePlan(params: {
   const configuredPrimaryBackend = normalizeText(params.configuredPrimaryBackend);
   const resolvedPrimaryBackend = normalizeText(params.resolvedPrimaryBackend);
   const pinnedBackend = normalizeText(params.pinnedBackend);
-  const fallbackBackends = Array.isArray(params.fallbackBackends)
-    ? params.fallbackBackends
-        .map((backend) => normalizeText(backend))
-        .filter((backend): backend is string => backend != null)
-    : [];
+  const fallbackBackends = (params.fallbackBackends ?? [])
+    .map((backend) => normalizeText(backend))
+    .filter((backend): backend is string => backend != null);
   return {
     // Exact one-shot continuation belongs to one persisted backend. Including any fallback here
     // could silently turn an unavailable conversation into a different backend conversation.

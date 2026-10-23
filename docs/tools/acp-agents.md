@@ -32,7 +32,7 @@ existing OpenClaw channel conversations, use
 | You want to...                                                                                  | Use this                              | Notes                                                                                                                                                                       |
 | ----------------------------------------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Bind or control Codex in the current conversation                                               | `/codex bind`, `/codex threads`       | Native Codex app-server path when the `codex` plugin is enabled: bound chat replies, image forwarding, model/fast/permissions, stop, and steer. ACP is an explicit fallback |
-| Run Claude Code, Gemini CLI, explicit Codex ACP, or another external harness _through_ OpenClaw | This page                             | Chat-bound sessions, `/acp spawn`, `sessions_spawn({ runtime: "acp" })`, background tasks, runtime controls                                                                 |
+| Run Claude Code, Gemini CLI, explicit Codex ACP, or another external harness _through_ OpenClaw | This page                             | Chat-bound sessions, `/acp spawn`, `sessions_spawn({ runtime: "acp" })`, background runs, runtime controls                                                                 |
 | Expose an OpenClaw Gateway session _as_ an ACP server for an editor or client                   | [`openclaw acp`](/cli/acp)            | Bridge mode: an IDE/client speaks ACP to OpenClaw over stdio/WebSocket                                                                                                      |
 | Use a local AI CLI such as Claude Code as an agent's model runtime                              | [CLI Backends](/gateway/cli-backends) | Not ACP: Gateway tools only through the MCP bridge, no ACP controls, no harness runtime                                                                                     |
 
@@ -51,35 +51,37 @@ job. Open the page that matches your task.
 | [ACP agents controls](/tools/acp-agents/controls)               | You need the `/acp` command reference and runtime option mapping.          |
 | [ACP agents troubleshooting](/tools/acp-agents/troubleshooting) | You hit an ACP error message and need the likely cause and fix.            |
 
-### Verified resumable one-shot lifecycle
+<a id="verified-resumable-one-shot-lifecycle" />
 
-This branch ships a verified resumable one-shot lifecycle for parent-owned ACP
-sessions, governed by these rules:
+### Resumable parent-owned one-shot lifecycle
 
-- Spawn creates or resumes an ACP runtime session, records ACP metadata in the
-  OpenClaw session store, and creates a background task when the run is
-  parent-owned.
-- Parent-owned ACP sessions are treated as background work even when the
-  runtime session is persistent; completion and cross-surface delivery go
-  through the parent task notifier rather than acting like a normal
-  user-facing chat session.
-- Task maintenance retains a completed parent-owned one-shot only when its
-  persisted identity proves that the exact backend session supports resume and
-  the completed turn committed resume readiness. The owning parent can then
-  continue the same child with `sessions_send`; completion remains task-owned,
-  so each follow-up produces one parent-visible completion.
-- Legacy or otherwise unverified one-shots fail closed and are cleaned up.
-  OpenClaw does not create a fresh session, retry without the resume id, or
-  switch backends when an explicit continuation cannot resume its exact target.
-- Verified resume metadata survives runtime-handle cache loss and reconstructs
-  from persisted state after a new manager starts, preserving the child key,
-  ACP session id, backend, and working directory. This restart path is covered
-  by isolated automated state tests; production restart verification remains an
-  operator-controlled post-promotion check.
-- Stale persistent ACP sessions without an active conversation binding are
-  closed so they cannot be silently resumed after the owning task is done or
-  its task record is gone. See
-  [the runbook lifecycle details](/tools/acp-agents/runbook#lifecycle-details).
+Parent-owned ACP runs use native session/controller completion, not the retired
+Tasks ledger or notifier. One-shot runtime-handle cleanup is separate from the
+persisted identity used for continuation.
+
+- The owning parent can use `sessions_send` to continue the same completed
+  child only when its authoritative persisted ACP identity is resolved, proves
+  exact-session resume support, and records completed-turn resume readiness.
+  An active turn or another admitted follow-up blocks continuation.
+- The ACP manager checks the current session identity and authority when
+  resuming and committing readiness. Final status reconciliation and durable
+  readiness for that identity generation precede public successful completion.
+- Continuation uses the persisted backend and exact resume id. An explicit
+  one-shot continuation failure does not retry without that id, create a fresh
+  conversation, or fall back to another backend. Missing or unverified metadata
+  is refused rather than inferred from an old runtime handle.
+- Runtime-handle cache loss does not itself authorize a fresh session. An
+  admitted continuation reconstructs from persisted ACP metadata, preserving
+  the child key, resume identity, backend, and working directory.
+- Each accepted owning-parent follow-up uses the native completion path;
+  `sessions_send` suppresses the additional peer A2A announce for that path.
+  The control plane closes one-shot runtime handles after settlement without
+  depending on a Tasks record.
+
+See [lifecycle details](/tools/acp-agents/runbook#lifecycle-details) and
+[the delivery model](/tools/acp-agents/delivery#parent-owned-one-shot-acp-sessions).
+These lifecycle rules are not evidence of a live harness or production restart
+check.
 
 ## ACP versus sub-agents
 
@@ -106,7 +108,7 @@ For Claude Code through ACP, the stack is:
 4. Claude-side runtime/session machinery.
 
 ACP Claude is a **harness session** with ACP controls, session resume,
-background-task tracking, and optional conversation/thread binding.
+native completion delivery, and optional conversation/thread binding.
 
 CLI backends are a separate path: the local CLI runs normal agent turns as the
 model runtime, without ACP controls. See [CLI Backends](/gateway/cli-backends).

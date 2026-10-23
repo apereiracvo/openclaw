@@ -1,8 +1,13 @@
-/** Tests exact one-shot resume reconstruction and terminal readiness fencing. */
 import { describe, expect, it, vi } from "vitest";
+/** Tests exact one-shot resume reconstruction and terminal readiness fencing. */
+import { createDeferred, awaitGateBeforeSettlement } from "../../../test/helpers/promise.js";
 import { listSessionStateEventsSince } from "../../sessions/session-state-events.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { isAcpTurnActive } from "./active-turns.js";
+import {
+  installStatefulSession,
+  resumableOneShotMeta,
+} from "./manager.one-shot-resume.test-support.js";
 import {
   AcpRuntimeError,
   AcpSessionManager,
@@ -11,201 +16,175 @@ import {
   hoisted,
   installAcpSessionManagerTestLifecycle,
   readySessionMeta,
+  runtimeTurn,
   type OpenClawConfig,
   type SessionAcpMeta,
 } from "./manager.test-helpers.js";
 
-type PersistObservation = {
-  failOnError?: boolean;
-  skipMaintenance?: boolean;
-  takeCacheOwnership?: boolean;
-  next: SessionAcpMeta;
-};
-
-function resumableOneShotMeta(overrides: Partial<SessionAcpMeta> = {}): SessionAcpMeta {
-  return readySessionMeta({
-    backend: "persisted-backend",
-    runtimeSessionName: "persisted-runtime",
-    mode: "oneshot",
-    runtimeOptions: { cwd: "/workspace/persisted" },
-    cwd: "/workspace/legacy",
-    identity: {
-      state: "resolved",
-      source: "status",
-      acpxRecordId: "persisted-record",
-      acpxSessionId: "persisted-acp-id",
-      agentSessionId: "legacy-agent-id",
-      sessionResumeSupported: true,
-      sessionResumeReady: true,
-      lastUpdatedAt: 1,
-    },
-    ...overrides,
-  });
-}
-
-function installStatefulSession(params: {
-  sessionKey: string;
-  initialMeta: SessionAcpMeta;
-  parentSessionKey?: string;
-  onPersist?: (observation: PersistObservation) => void;
-  beforeMutate?: (options: {
-    failOnError?: boolean;
-    skipMaintenance?: boolean;
-    takeCacheOwnership?: boolean;
-    current: SessionAcpMeta;
-  }) => SessionAcpMeta | undefined;
-}) {
-  let currentMeta = params.initialMeta;
-  const childEntry = {
-    sessionId: "child-session",
-    updatedAt: 1,
-    ...(params.parentSessionKey ? { spawnedBy: params.parentSessionKey } : {}),
-  };
-  hoisted.readAcpSessionEntryMock.mockImplementation((inputUnknown: unknown) => {
-    const sessionKey = (inputUnknown as { sessionKey?: string }).sessionKey;
-    if (sessionKey === params.sessionKey) {
-      return {
-        sessionKey,
-        storeSessionKey: sessionKey,
-        entry: childEntry,
-        acp: currentMeta,
-      };
-    }
-    if (sessionKey === params.parentSessionKey) {
-      return {
-        sessionKey,
-        storeSessionKey: sessionKey,
-        entry: { sessionId: "parent-session", updatedAt: 1 },
-      };
-    }
-    return null;
-  });
-  hoisted.upsertAcpSessionMetaMock.mockImplementation(async (inputUnknown: unknown) => {
-    const input = inputUnknown as {
-      failOnError?: boolean;
-      skipMaintenance?: boolean;
-      takeCacheOwnership?: boolean;
-      mutate: (
-        current: SessionAcpMeta | undefined,
-        entry: { acp?: SessionAcpMeta } | undefined,
-      ) => SessionAcpMeta | null | undefined;
-    };
-    currentMeta =
-      params.beforeMutate?.({
-        failOnError: input.failOnError,
-        skipMaintenance: input.skipMaintenance,
-        takeCacheOwnership: input.takeCacheOwnership,
-        current: currentMeta,
-      }) ?? currentMeta;
-    const next = input.mutate(currentMeta, { ...childEntry, acp: currentMeta });
-    if (next && next !== currentMeta) {
-      params.onPersist?.({
-        failOnError: input.failOnError,
-        skipMaintenance: input.skipMaintenance,
-        takeCacheOwnership: input.takeCacheOwnership,
-        next,
-      });
-      currentMeta = next;
-    }
-    return { ...childEntry, acp: currentMeta };
-  });
-  return {
-    get currentMeta() {
-      return currentMeta;
-    },
-  };
-}
-
 describe("AcpSessionManager one-shot resume", () => {
   installAcpSessionManagerTestLifecycle();
 
-  it("commits readiness before liveness release, idle, and close", async () => {
-    await withOpenClawTestState(
-      { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
-      async () => {
-        const sessionKey = "agent:codex:acp:terminal-readiness";
-        const parentSessionKey = "agent:main:main";
-        const runtimeState = createRuntime();
-        const order: string[] = [];
-        runtimeState.ensureSession.mockImplementation(async (input) => ({
-          sessionKey: input.sessionKey,
-          backend: "persisted-backend",
-          runtimeSessionName: "fresh-runtime",
-          cwd: "/workspace/persisted",
-          acpxRecordId: "fresh-record",
-          backendSessionId: "fresh-acp-id",
-          sessionResumeSupported: true,
-        }));
-        runtimeState.runTurn.mockImplementation(async function* () {
-          order.push("terminal-result");
-          yield { type: "done" as const };
-        });
-        runtimeState.getStatus.mockImplementation(async () => {
-          order.push("final-status");
-          return {
-            summary: "status=alive",
+  it.each(["legacy", "preferred"] as const)(
+    "commits readiness before completion, liveness release, idle, and close (%s)",
+    async (api) => {
+      await withOpenClawTestState(
+        { layout: "state-only", prefix: "openclaw-acp-one-shot-resume-" },
+        async () => {
+          const sessionKey = "agent:codex:acp:terminal-readiness";
+          const parentSessionKey = "agent:main:main";
+          const runtimeState = createRuntime();
+          const order: string[] = [];
+          const statusEntered = createDeferred();
+          const releaseStatus = createDeferred();
+          const readinessEntered = createDeferred();
+          const releaseReadiness = createDeferred();
+          const onEvent =
+            vi.fn<NonNullable<Parameters<AcpSessionManager["runTurn"]>[0]["onEvent"]>>();
+          runtimeState.ensureSession.mockImplementation(async (input) => ({
+            sessionKey: input.sessionKey,
+            backend: "persisted-backend",
+            runtimeSessionName: "fresh-runtime",
+            cwd: "/workspace/persisted",
             acpxRecordId: "fresh-record",
             backendSessionId: "fresh-acp-id",
             sessionResumeSupported: true,
-          };
-        });
-        runtimeState.close.mockImplementation(async () => {
-          order.push("close");
-        });
-        hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
-          id: "persisted-backend",
-          runtime: runtimeState.runtime,
-        });
-        const manager = new AcpSessionManager();
-        let managerWriteIndex = 0;
-        const persisted = installStatefulSession({
-          sessionKey,
-          parentSessionKey,
-          initialMeta: readySessionMeta({
-            backend: "persisted-backend",
-            runtimeSessionName: "fresh-runtime",
-            mode: "oneshot",
-            runtimeOptions: { cwd: "/workspace/persisted" },
-          }),
-          onPersist: (observation) => {
-            if (observation.skipMaintenance && observation.takeCacheOwnership) {
-              if (managerWriteIndex === 1) {
-                order.push("readiness");
-                expect(observation.next.identity?.sessionResumeReady).toBe(true);
-                expect(isAcpTurnActive(sessionKey)).toBe(true);
-                expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
-              } else if (managerWriteIndex === 2) {
-                order.push("idle");
-                expect(observation.next.state).toBe("idle");
-                expect(isAcpTurnActive(sessionKey)).toBe(false);
-                expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
+          }));
+          runtimeState.runTurn.mockImplementation(async function* () {
+            order.push("terminal-result");
+            yield { type: "done" as const };
+          });
+          if (api === "preferred") {
+            runtimeState.runtime.startTurn = vi.fn<
+              NonNullable<typeof runtimeState.runtime.startTurn>
+            >((input) => runtimeTurn(input.requestId, { events: runtimeState.runTurn(input) }));
+          }
+          runtimeState.getStatus.mockImplementation(async () => {
+            order.push("final-status");
+            statusEntered.resolve();
+            await releaseStatus.promise;
+            return {
+              summary: "status=alive",
+              acpxRecordId: "fresh-record",
+              backendSessionId: "fresh-acp-id",
+              sessionResumeSupported: true,
+            };
+          });
+          runtimeState.close.mockImplementation(async () => {
+            order.push("close");
+          });
+          hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+            id: "persisted-backend",
+            runtime: runtimeState.runtime,
+          });
+          const manager = new AcpSessionManager();
+          let managerWriteIndex = 0;
+          const persisted = installStatefulSession({
+            sessionKey,
+            parentSessionKey,
+            initialMeta: readySessionMeta({
+              backend: "persisted-backend",
+              runtimeSessionName: "fresh-runtime",
+              mode: "oneshot",
+              runtimeOptions: { cwd: "/workspace/persisted" },
+            }),
+            onPersist: (observation) => {
+              if (observation.skipMaintenance && observation.takeCacheOwnership) {
+                if (managerWriteIndex === 1) {
+                  order.push("readiness");
+                  expect(observation.next.identity?.sessionResumeReady).toBe(true);
+                  expect(isAcpTurnActive(sessionKey)).toBe(true);
+                  expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
+                } else if (managerWriteIndex === 2) {
+                  order.push("idle");
+                  expect(observation.next.state).toBe("idle");
+                  expect(isAcpTurnActive(sessionKey)).toBe(false);
+                  expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
+                }
+                managerWriteIndex += 1;
               }
-              managerWriteIndex += 1;
+            },
+          });
+
+          onEvent.mockImplementation(() => {
+            expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
+            order.push("completed-event");
+          });
+          const persist = hoisted.upsertAcpSessionMetaMock.getMockImplementation();
+          hoisted.upsertAcpSessionMetaMock.mockImplementation(async (input) => {
+            if (input.skipMaintenance && input.takeCacheOwnership) {
+              const next = input.mutate(persisted.currentMeta, { acp: persisted.currentMeta });
+              if (
+                next?.identity?.sessionResumeReady === true &&
+                !persisted.currentMeta.identity?.sessionResumeReady
+              ) {
+                readinessEntered.resolve();
+                await releaseReadiness.promise;
+              }
             }
-          },
-        });
+            if (!persist) {
+              throw new Error("stateful persistence mock missing");
+            }
+            return await persist(input);
+          });
+          const run = manager.runTurn({
+            onEvent,
+            provenance: "system",
+            cfg: { acp: { ...baseCfg.acp, backend: "persisted-backend" } },
+            sessionKey,
+            text: "complete once",
+            mode: "prompt",
+            requestId: "terminal-readiness-run",
+          });
 
-        await manager.runTurn({
-          provenance: "system",
-          cfg: { acp: { ...baseCfg.acp, backend: "persisted-backend" } },
-          sessionKey,
-          text: "complete once",
-          mode: "prompt",
-          requestId: "terminal-readiness-run",
-        });
-
-        expect(order).toEqual(["terminal-result", "final-status", "readiness", "idle", "close"]);
-        expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
-        expect(runtimeState.getStatus).toHaveBeenCalledOnce();
-        expect(managerWriteIndex).toBe(3);
-        expect(
-          (await listSessionStateEventsSince(sessionKey, "codex", 0, 20)).events.filter(
-            (event) => event.runId === "terminal-readiness-run" && event.kind === "run_completed",
-          ),
-        ).toHaveLength(1);
-      },
-    );
-  }, 300_000);
+          try {
+            await awaitGateBeforeSettlement(
+              statusEntered.promise,
+              run,
+              "final status was not reached",
+            );
+            expect(onEvent).not.toHaveBeenCalled();
+            expect(manager.getObservabilitySnapshot().turns.completed).toBe(0);
+            releaseStatus.resolve();
+            await awaitGateBeforeSettlement(
+              readinessEntered.promise,
+              run,
+              "readiness was not reached",
+            );
+            expect(onEvent).not.toHaveBeenCalled();
+            expect(persisted.currentMeta.identity?.sessionResumeReady).not.toBe(true);
+            expect(manager.getObservabilitySnapshot().turns.completed).toBe(0);
+            releaseReadiness.resolve();
+            await run;
+          } finally {
+            releaseStatus.resolve();
+            releaseReadiness.resolve();
+            await run;
+          }
+          expect(onEvent).toHaveBeenCalledOnce();
+          expect(onEvent).toHaveBeenCalledWith(
+            expect.objectContaining({ type: "done", status: "completed" }),
+          );
+          expect(order).toEqual([
+            "terminal-result",
+            "final-status",
+            "readiness",
+            "completed-event",
+            "idle",
+            "close",
+          ]);
+          expect(persisted.currentMeta.identity?.sessionResumeReady).toBe(true);
+          expect(runtimeState.getStatus).toHaveBeenCalledOnce();
+          expect(managerWriteIndex).toBe(3);
+          expect(
+            (await listSessionStateEventsSince(sessionKey, "codex", 0, 20)).events.filter(
+              (event) => event.runId === "terminal-readiness-run" && event.kind === "run_completed",
+            ),
+          ).toHaveLength(1);
+        },
+      );
+    },
+    300_000,
+  );
 
   it("reconstructs two follow-ups from durable id, backend, cwd, and child key", async () => {
     const sessionKey = "agent:codex:acp:reconstructed-child";
@@ -722,12 +701,19 @@ describe("AcpSessionManager one-shot resume", () => {
         const runtimeState = createRuntime();
         const order: string[] = [];
         const manager = new AcpSessionManager();
-        installStatefulSession({
+        let committedIdle: SessionAcpMeta | undefined;
+        const persisted = installStatefulSession({
           sessionKey,
           parentSessionKey: "agent:main:main",
           initialMeta: readySessionMeta({ mode: "oneshot" }),
           onPersist: (observation) => {
-            if (observation.next.state === "idle") {
+            if (
+              observation.skipMaintenance &&
+              observation.takeCacheOwnership &&
+              observation.next.state === "idle"
+            ) {
+              expect(order).toEqual(["producer-finished"]);
+              committedIdle = observation.next;
               order.push("idle");
               expect(isAcpTurnActive(sessionKey)).toBe(true);
               expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
@@ -735,9 +721,22 @@ describe("AcpSessionManager one-shot resume", () => {
           },
         });
         runtimeState.runTurn.mockImplementation(async function* () {
-          yield { type: "done" as const, status: "cancelled" as const };
+          try {
+            yield { type: "done" as const, status: "cancelled" as const };
+          } finally {
+            order.push("producer-finished");
+          }
         });
-        runtimeState.close.mockImplementation(async () => {
+        runtimeState.close.mockImplementation(async ({ handle }) => {
+          // The observer precedes fixture commit; read the owned store at close.
+          expect(committedIdle).toBeDefined();
+          expect(persisted.currentMeta).toMatchObject({
+            state: "idle",
+            backend: handle.backend,
+            runtimeSessionName: handle.runtimeSessionName,
+            lastActivityAt: committedIdle?.lastActivityAt,
+          });
+          expect(order).toEqual(["producer-finished", "idle"]);
           order.push("close");
           expect(isAcpTurnActive(sessionKey)).toBe(true);
           expect(manager.getObservabilitySnapshot().turns.active).toBe(1);
@@ -756,7 +755,11 @@ describe("AcpSessionManager one-shot resume", () => {
           requestId: "cancelled-liveness-order",
         });
 
-        expect(order).toEqual(["idle", "idle", "close"]);
+        // Terminal projection is a separate owner, not another manager idle commit.
+        expect(order).toEqual(["producer-finished", "idle", "close"]);
+        expect(runtimeState.runTurn).toHaveBeenCalledOnce();
+        expect(runtimeState.close).toHaveBeenCalledOnce();
+        expect(persisted.currentMeta.state).toBe("idle");
         expect(isAcpTurnActive(sessionKey)).toBe(false);
         expect(manager.getObservabilitySnapshot().turns.active).toBe(0);
       },
@@ -823,6 +826,7 @@ describe("AcpSessionManager one-shot resume", () => {
       async () => {
         const sessionKey = "agent:codex:acp:readiness-write-failure";
         const runtimeState = createRuntime();
+        const onEvent = vi.fn();
         let readinessAttempts = 0;
         let managerWriteCount = 0;
         const persisted = installStatefulSession({
@@ -885,6 +889,7 @@ describe("AcpSessionManager one-shot resume", () => {
 
         await expect(
           manager.runTurn({
+            onEvent,
             provenance: "system",
             cfg: {
               acp: {
@@ -900,6 +905,7 @@ describe("AcpSessionManager one-shot resume", () => {
           }),
         ).rejects.toMatchObject({ code: "ACP_TURN_FAILED" });
 
+        expect(onEvent).not.toHaveBeenCalled();
         expect(readinessAttempts).toBe(1);
         expect(runtimeState.runTurn).toHaveBeenCalledOnce();
         expect(runtimeState.ensureSession).toHaveBeenCalledOnce();
@@ -915,133 +921,4 @@ describe("AcpSessionManager one-shot resume", () => {
       },
     );
   }, 300_000);
-
-  it("fails closed on final status error without committing readiness", async () => {
-    const sessionKey = "agent:codex:acp:status-error";
-    const runtimeState = createRuntime();
-    const managerStateWrites: SessionAcpMeta["state"][] = [];
-    installStatefulSession({
-      sessionKey,
-      initialMeta: readySessionMeta({
-        backend: "primary-backend",
-        runtimeSessionName: "runtime",
-        mode: "oneshot",
-      }),
-      onPersist: (observation) => {
-        if (observation.skipMaintenance && observation.takeCacheOwnership) {
-          managerStateWrites.push(observation.next.state);
-        }
-      },
-    });
-    runtimeState.ensureSession.mockImplementation(async (input) => ({
-      sessionKey: input.sessionKey,
-      backend: "primary-backend",
-      runtimeSessionName: "runtime",
-      backendSessionId: "acp-id",
-      sessionResumeSupported: true,
-    }));
-    runtimeState.getStatus.mockRejectedValue(new Error("status unavailable"));
-    hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
-      id: "primary-backend",
-      runtime: runtimeState.runtime,
-    });
-    const manager = new AcpSessionManager();
-
-    await expect(
-      manager.runTurn({
-        provenance: "system",
-        cfg: {
-          acp: {
-            ...baseCfg.acp,
-            backend: "primary-backend",
-            fallbacks: ["fallback-backend"],
-          },
-        },
-        sessionKey,
-        text: "status error",
-        mode: "prompt",
-        requestId: "status-error",
-      }),
-    ).rejects.toMatchObject({ code: "ACP_TURN_FAILED" });
-
-    expect(managerStateWrites).toEqual(["running", "error"]);
-    expect(runtimeState.runTurn).toHaveBeenCalledOnce();
-    expect(runtimeState.getStatus).toHaveBeenCalledOnce();
-    expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
-    expect(manager.getObservabilitySnapshot().turns).toMatchObject({ completed: 0, failed: 1 });
-  });
-
-  it("bounds a hung final status read and does not retry completed work", async () => {
-    vi.useFakeTimers();
-    try {
-      const sessionKey = "agent:codex:acp:status-timeout";
-      const runtimeState = createRuntime();
-      const managerStateWrites: SessionAcpMeta["state"][] = [];
-      installStatefulSession({
-        sessionKey,
-        initialMeta: readySessionMeta({
-          backend: "primary-backend",
-          runtimeSessionName: "runtime",
-          mode: "oneshot",
-        }),
-        onPersist: (observation) => {
-          if (observation.skipMaintenance && observation.takeCacheOwnership) {
-            managerStateWrites.push(observation.next.state);
-          }
-        },
-      });
-      runtimeState.ensureSession.mockImplementation(async (input) => ({
-        sessionKey: input.sessionKey,
-        backend: "primary-backend",
-        runtimeSessionName: "runtime",
-        backendSessionId: "acp-id",
-        sessionResumeSupported: true,
-      }));
-      runtimeState.getStatus.mockImplementation(
-        async ({ signal }) =>
-          await new Promise((_, reject) => {
-            signal?.addEventListener("abort", () => reject(new Error("status aborted")), {
-              once: true,
-            });
-          }),
-      );
-      hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
-        id: "primary-backend",
-        runtime: runtimeState.runtime,
-      });
-      const manager = new AcpSessionManager();
-      const observed = manager
-        .runTurn({
-          provenance: "system",
-          cfg: {
-            acp: {
-              ...baseCfg.acp,
-              backend: "primary-backend",
-              fallbacks: ["fallback-backend"],
-            },
-          },
-          sessionKey,
-          text: "status timeout",
-          mode: "prompt",
-          requestId: "status-timeout",
-        })
-        .then(
-          () => undefined,
-          (error: unknown) => error,
-        );
-
-      await vi.advanceTimersByTimeAsync(5_100);
-      await expect(observed).resolves.toMatchObject({
-        code: "ACP_TURN_FAILED",
-        detailCode: "FINAL_STATUS_TIMEOUT",
-      });
-      expect(managerStateWrites).toEqual(["running", "error"]);
-      expect(runtimeState.runTurn).toHaveBeenCalledOnce();
-      expect(runtimeState.getStatus).toHaveBeenCalledOnce();
-      expect(hoisted.requireAcpRuntimeBackendMock).toHaveBeenCalledOnce();
-      expect(manager.getObservabilitySnapshot().turns).toMatchObject({ completed: 0, failed: 1 });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
 });
