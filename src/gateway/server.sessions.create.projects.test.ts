@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
-import { afterAll, afterEach, beforeAll, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { captureMethodCall } from "../../test/helpers/capture-method-call.js";
 import {
   fixtureReceiptClientSource,
@@ -11,6 +11,7 @@ import {
 } from "../../test/helpers/fixture-receipts.js";
 import { withinTest } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { createNestedGitEnv } from "../../test/helpers/temp-repo.js";
 import { requireGit } from "../agents/worktrees/git.js";
 import { createManagedWorktreeOwnerPolicy } from "../agents/worktrees/owner-protection.js";
 import { getRegistryWorktree } from "../agents/worktrees/registry.test-support.js";
@@ -69,6 +70,16 @@ vi.mock("../projects/project-clone.js", async (importOriginal) => {
 vi.mock("./project-github-identity.js", () => ({
   prepareGatewayProjectGitHubIdentity: projectCloneMocks.prepareIdentity,
 }));
+
+// Runtime Git also belongs to the temporary repositories, not the runner checkout.
+beforeEach(() => {
+  const nestedEnv = createNestedGitEnv();
+  for (const key of Object.keys(process.env)) {
+    if (!(key in nestedEnv)) {
+      vi.stubEnv(key, undefined);
+    }
+  }
+});
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const directoryLinkType = process.platform === "win32" ? "junction" : "dir";

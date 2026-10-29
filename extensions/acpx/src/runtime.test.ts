@@ -24,6 +24,7 @@ import {
   makeTurn,
   observeLaunch,
   runtimeCommand,
+  type TestSessionStore,
 } from "./runtime.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);

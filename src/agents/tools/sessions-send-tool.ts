@@ -289,9 +289,8 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         concealResolutionError: resolutionAccess.allowed ? undefined : resolutionAccess.error,
         callGateway: gatewayCall,
       });
-      const unresolvedDisplayKey = sessionKey;
       if (!visibleSession.ok) {
-        return sendFailure(visibleSession.status, visibleSession.error, unresolvedDisplayKey);
+        return sendFailure(visibleSession.status, visibleSession.error, sessionKey);
       }
       let resolvedKey = visibleSession.key;
       const displayKey = visibleSession.displayKey;
@@ -314,7 +313,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         return sendFailure(
           "forbidden",
           "Session ownership could not be verified because its fixed-store owner retired.",
-          unresolvedDisplayKey,
+          sessionKey,
         );
       }
       const resolvedTargetOwner =
@@ -329,7 +328,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         return sendFailure(
           "forbidden",
           `Session belongs to agent "${persistedTargetOwner.agentId}", not "${normalizeAgentId(resolvedTargetOwner)}".`,
-          unresolvedDisplayKey,
+          sessionKey,
         );
       }
       const targetAgentId =
@@ -342,7 +341,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         return sendFailure(
           "forbidden",
           "Session ownership could not be verified. Upgrade the gateway or use an agent-prefixed session key.",
-          unresolvedDisplayKey,
+          sessionKey,
         );
       }
       resolvedKey = resolveSessionStoreKey({
@@ -365,7 +364,6 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         requesterSessionEntry,
       );
       const timeoutMs = finiteSecondsToTimerSafeMilliseconds(timeoutSeconds) ?? 0;
-      const replyTimeoutMs = timeoutSeconds === 0 ? 30_000 : timeoutMs;
       const runId = opts?.idempotencyKey ?? crypto.randomUUID();
       const sameSession = requesterSessionKey === resolvedKey && targetAgentId === requesterAgentId;
       // Fire-and-forget self-send remains a channel-delivery path. A synchronous
@@ -374,7 +372,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         return sendFailure(
           "error",
           "sessions_send cannot target the calling session; use your own reply instead",
-          unresolvedDisplayKey,
+          sessionKey,
           runId,
         );
       }
@@ -385,7 +383,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         return sendFailure(
           "error",
           "sessions_send cannot target a thread session for inter-agent coordination. Use the parent channel session key instead, or enable tools.sessions.allowThreadTargets.",
-          unresolvedDisplayKey,
+          sessionKey,
         );
       }
       const authorizationTargetKey =
@@ -415,13 +413,16 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
           access.status,
           formatSessionToolAccessDenial(access, {
             action: "send",
-            targetSessionKey: unresolvedDisplayKey,
+            targetSessionKey: sessionKey,
           }),
-          unresolvedDisplayKey,
+          sessionKey,
         );
       }
       const expectedSessionId = opts?.expectedTargetSessionId ?? access.expectedSessionId;
-      if (mode === "notify" && expectedSessionId) {
+      // A durable parent's binding is not temporary, but explicit invocation ceilings remain.
+      const persistentChildAccess =
+        access.basis === "parent-lineage" && opts?.expectedTargetSessionId === undefined;
+      if (mode === "notify" && expectedSessionId && !persistentChildAccess) {
         return sendFailure(
           "forbidden",
           "Notifications cannot outlive an exact-session access grant. Use steer or followup.",
@@ -460,7 +461,6 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
             sourceTool: "sessions_send",
             ...(requesterIsSubagent ? { sourceRole: "subagent" as const } : {}),
           };
-          let dispatchMessage = annotateInterSessionPromptText(message, inputProvenance);
           const readTargetAcpMeta = () =>
             readSessionsSendTargetAcpMeta(
               cfg,
@@ -470,11 +470,11 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
             );
           // An absent target is created during communication preparation; read its metadata then.
           let targetAcpMeta = targetSessionEntry ? await readTargetAcpMeta() : undefined;
-          dispatchMessage = prepareSessionsSendRecoveryMessage(
+          const dispatchMessage = prepareSessionsSendRecoveryMessage(
             targetSession.canonicalKey,
             targetSessionEntry,
             targetAcpMeta,
-            dispatchMessage,
+            annotateInterSessionPromptText(message, inputProvenance),
           );
           const source = {
             agentId: requesterSession.agentId,
@@ -502,6 +502,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
                 watch: params.watch === true,
                 requesterOwned: visibleSession.requesterOwned,
                 authorizationTargetSessionKey: authorizationTargetKey,
+                controllerOnly: access.basis === "live-controller",
                 expectedSessionId,
               },
               assertSourceCurrent: opts?.assertSourceCurrent,
@@ -602,7 +603,6 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
               return acpFollowup.result;
             }
             try {
-              const ownChild = targetSessionEntry?.spawnedBy === requesterSession.canonicalKey;
               const startParams: Parameters<typeof dispatchSessionsSendFollowup>[0] = {
                 cfg,
                 admissionConfig: communication.admissionConfig,
@@ -658,7 +658,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
                   targetSessionKey: resolvedKey,
                   targetAgentId,
                   displayKey,
-                  replyTimeoutMs,
+                  replyTimeoutMs: timeoutSeconds === 0 ? 30_000 : timeoutMs,
                   requesterSessionKey,
                   requesterAgentId,
                   requesterOrigin,
@@ -668,9 +668,9 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
               const { start, completion, registryCompletion, watchField } =
                 await dispatchSessionsSendFollowup(startParams, replyContext, {
                   message,
-                  ownChild,
+                  ownChild: targetSessionEntry?.spawnedBy === requesterSession.canonicalKey,
                   nativeChild: !targetAcpMeta,
-                  claimRequesterTurnCompletion: timeoutSeconds === 0,
+                  persistentChildAccess,
                   requesterSessionKey: requesterSession.canonicalKey,
                   requesterAgentId,
                   requesterTurnRunId: opts?.requesterTurnRunId,
@@ -685,6 +685,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
                 start,
                 completion,
                 registryCompletion,
+                requesterTurnRunId: opts?.requesterTurnRunId,
                 watchField,
                 replyContext,
                 targetSession,

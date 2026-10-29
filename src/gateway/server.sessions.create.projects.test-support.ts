@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { expect } from "vitest";
+import { createNestedGitEnv } from "../../test/helpers/temp-repo.js";
 import { managedWorktrees } from "../agents/worktrees/service.js";
 import { withTimeout } from "../infra/fs-safe.js";
 import {
@@ -17,11 +18,16 @@ import { waitForChatAbortControllerRemoval } from "./chat-abort-lifecycle-intern
 import type { directSessionReq } from "./test/server-sessions.test-helpers.js";
 
 const execFileAsync = promisify(execFile);
-const git = (repo: string, ...args: string[]) => execFileAsync("git", ["-C", repo, ...args]);
+const git = (repo: string, ...args: string[]) =>
+  execFileAsync("git", ["-C", repo, ...args], { env: createNestedGitEnv() });
 
 async function addWorkspaceOrigin(workspace: string): Promise<void> {
   const remote = `${workspace}.git`;
-  await execFileAsync("git", ["clone", "--bare", workspace, remote]);
+  await execFileAsync("git", ["clone", "--bare", workspace, remote], { env: createNestedGitEnv() });
+  expect((await git(remote, "rev-parse", "--is-bare-repository")).stdout.trim()).toBe("true");
+  expect((await git(remote, "rev-parse", "--absolute-git-dir")).stdout.trim()).toBe(
+    await fs.realpath(remote),
+  );
   await git(workspace, "remote", "add", "origin", remote);
   await git(workspace, "fetch", "origin");
   await git(workspace, "remote", "set-head", "origin", "main");
@@ -38,6 +44,12 @@ export async function copyGitWorkspace(template: string, root: string): Promise<
       mode: fsConstants.COPYFILE_FICLONE,
     });
   }
+  expect((await git(workspace, "rev-parse", "--show-toplevel")).stdout.trim()).toBe(
+    await fs.realpath(workspace),
+  );
+  expect((await git(workspace, "rev-parse", "--absolute-git-dir")).stdout.trim()).toBe(
+    await fs.realpath(path.join(workspace, ".git")),
+  );
   await git(workspace, "remote", "set-url", "origin", `${workspace}.git`);
   return await fs.realpath(workspace);
 }
@@ -80,11 +92,20 @@ export async function initializeRepository(root: string, name: string, readme = 
   const repo = path.join(root, name);
   await fs.mkdir(repo, { recursive: true });
   await git(repo, "init", "-b", "main");
+  expect((await git(repo, "rev-parse", "--show-toplevel")).stdout.trim()).toBe(
+    await fs.realpath(repo),
+  );
+  expect((await git(repo, "rev-parse", "--absolute-git-dir")).stdout.trim()).toBe(
+    await fs.realpath(path.join(repo, ".git")),
+  );
   await git(repo, "config", "user.name", "OpenClaw Tests");
   await git(repo, "config", "user.email", "tests@openclaw.invalid");
   await fs.writeFile(path.join(repo, "README.md"), readme);
   await git(repo, "add", "README.md");
   await git(repo, "commit", "-m", "initial");
+  expect((await git(repo, "rev-parse", "--verify", "HEAD^{commit}")).stdout.trim()).toMatch(
+    /^[0-9a-f]{40}$/,
+  );
   await addWorkspaceOrigin(repo);
   return await fs.realpath(repo);
 }

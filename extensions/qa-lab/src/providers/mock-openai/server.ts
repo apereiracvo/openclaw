@@ -29,6 +29,7 @@ import {
   isCanonicalCompactionRetryWriteResult,
   QA_COMPACTION_RETRY_FINAL_MARKER,
 } from "./mock-openai-assistant-text.js";
+import { planAutomationScenarioTurn } from "./mock-openai-automation-turns.js";
 import {
   type ResponsesInputItem,
   type StreamEvent,
@@ -119,9 +120,6 @@ import {
   extractEmbeddingInputTexts,
   buildDeterministicEmbedding,
 } from "./mock-openai-contracts.js";
-import { planCronBlockedOutcomeTurn } from "./mock-openai-cron-blocked-outcome.js";
-import { planCronFailureRepairTurn } from "./mock-openai-cron-failure-repair.js";
-import { planCronSendContinueTurn } from "./mock-openai-cron-send-continue.js";
 import {
   extractExactReplyDirective,
   extractExactMarkerDirective,
@@ -185,7 +183,7 @@ import {
   buildSlackOwnedRequesterEvents,
   readSlackProgressTurn,
 } from "./mock-openai-slack-requester.js";
-import { resolveMockSubagentHandoff } from "./mock-openai-subagent-completion.js";
+import * as mockSubagent from "./mock-openai-subagent-completion.js";
 import {
   QA_CODE_MODE_TARGET_MARKER,
   encodeCodeModeTarget,
@@ -535,22 +533,14 @@ async function buildResponsesPayload(
   }
   const compactionRetryScenarioActive =
     scenarioState.compactionRetryActive || hasCompactionRetryMarker;
-  const cronFailureRepairTurn = planCronFailureRepairTurn(prompt, input);
-  if (cronFailureRepairTurn) {
-    return cronFailureRepairTurn;
-  }
-  const cronSendContinueTurn = planCronSendContinueTurn({
+  const automationScenarioTurn = planAutomationScenarioTurn({
     prompt,
     input,
     body: toolDeclarationBody,
     buildToolCall: buildToolCallEventsWithArgs,
   });
-  if (cronSendContinueTurn) {
-    return cronSendContinueTurn;
-  }
-  const cronBlockedOutcomeTurn = planCronBlockedOutcomeTurn(prompt);
-  if (cronBlockedOutcomeTurn) {
-    return cronBlockedOutcomeTurn;
+  if (automationScenarioTurn) {
+    return automationScenarioTurn;
   }
   // The queued followup carries the stalled prompt in transcript history, so
   // current-turn dispatch must win before the persistent recovery fixture.
@@ -882,7 +872,7 @@ async function buildResponsesPayload(
   const terminalCompletionCase = terminalTurn?.caseName;
   const current = terminalTurn?.text ?? "";
   if (terminalCompletionCase && terminalTurn?.kind === "settled") {
-    return buildAssistantEvents("Completion processed.");
+    return buildAssistantEvents(mockSubagent.resolveMockSettledReply(terminalCompletionCase));
   }
   if (terminalCompletionCase === "private") {
     const nonce = QA_SUBAGENT_PRIVATE_RESULT_RE.exec(current)?.[0];
@@ -947,9 +937,7 @@ async function buildResponsesPayload(
       }
       return buildAssistantEvents(visibleRepresentation);
     }
-    // Empty output exercises direct fallback. Exact NO_REPLY is intentional
-    // silence and must not be used as a missing-answer fixture.
-    return buildAssistantEvents("");
+    return buildAssistantEvents("The child run ended. Report its outcome to the requester.");
   }
   const terminalWorkerCase = terminalTurn?.kind === "worker" ? terminalTurn.caseName : undefined;
   if (terminalWorkerCase) {
@@ -1951,7 +1939,7 @@ async function buildResponsesPayload(
       return buildToolCallEventsWithArgs("read", { path: "FOLLOWTHROUGH_NOTE.md" });
     }
   }
-  const handoff = resolveMockSubagentHandoff({
+  const handoff = mockSubagent.resolveMockSubagentHandoff({
     input,
     body,
     state: scenarioState,

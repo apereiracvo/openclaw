@@ -20,6 +20,13 @@ afterEach(() => vi.restoreAllMocks());
 const addedTempDirs = useAutoCleanupTempDirTracker(afterEach);
 const contextFile = (filePath: string, content: unknown) =>
   expect.objectContaining({ path: filePath, content });
+const instructions = (workspace: string, content: unknown) =>
+  contextFile(path.join(workspace, "AGENTS.md"), content);
+const noInjection = {
+  contextFiles: [],
+  bootstrapInjectionStats: [],
+  shouldRecordCompletedBootstrapTurn: false,
+};
 
 async function makeWorkspace(label: string, files: Record<string, string> = {}): Promise<string> {
   const workspace = await fs.realpath(addedTempDirs.make(`openclaw-${label}-`));
@@ -90,6 +97,8 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
       expect(result).toMatchObject({
         bootstrapMode,
         shouldRecordCompletedBootstrapTurn: completion,
+        // Pending setup must not add a commit policy to ordinary workspace edits.
+        workspaceNotes: [],
       });
       expect(result.contextFiles.some((file) => file.content === "Workspace instructions")).toBe(
         injected,
@@ -132,10 +141,8 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
       });
 
       expect(result).toMatchObject({
+        ...noInjection,
         bootstrapMode: "limited",
-        contextFiles: [],
-        bootstrapInjectionStats: [],
-        shouldRecordCompletedBootstrapTurn: false,
       });
     });
   });
@@ -151,11 +158,7 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
         attempt: kind === "settled" ? { operation: "settled-tool-finalization" } : {},
       });
 
-      expect(result).toMatchObject({
-        contextFiles: [],
-        bootstrapInjectionStats: [],
-        shouldRecordCompletedBootstrapTurn: false,
-      });
+      expect(result).toMatchObject(noInjection);
     },
   );
 
@@ -192,10 +195,9 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
         origin: { kind: "execution-project", rootPath: sessionWorkspace },
       },
     ]);
-    expect(result.contextFiles[executionAgentsIndex]).toMatchObject({
-      path: path.join(sessionWorkspace, "AGENTS.md"),
-      content: "Execution project context",
-    });
+    expect(result.contextFiles[executionAgentsIndex]).toEqual(
+      instructions(sessionWorkspace, "Execution project context"),
+    );
     expect(result.contextFiles).toContainEqual(
       contextFile(path.join(agentWorkspace, "SOUL.md"), "Canonical agent soul"),
     );
@@ -269,6 +271,15 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
     for (const name of ["SOUL.md", "MEMORY.md", "BOOTSTRAP.md", "USER.md"]) {
       await fs.writeFile(path.join(projectRoot, name), `Project ${name} leaked to hooks`);
     }
+    const readContents: string[] = [];
+    const readBootstrapFile = workspaceBootstrapRead.readWorkspaceBootstrapFile;
+    vi.spyOn(workspaceBootstrapRead, "readWorkspaceBootstrapFile").mockImplementation(
+      async (fd) => {
+        const content = await readBootstrapFile(fd);
+        readContents.push(content);
+        return content;
+      },
+    );
     const hookEvents: { workspaceDir: string; contents: string }[] = [];
     const handler = (event: { context: unknown }) => {
       const context = event.context as AgentBootstrapHookContext;
@@ -294,8 +305,10 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
 
     // Exactly the agent-workspace pass: no second event scoped to the project root.
     expect(hookEvents.map((entry) => entry.workspaceDir)).toEqual([agentWorkspace]);
+    expect(readContents).toContain("Selected project instructions");
     for (const name of ["SOUL.md", "MEMORY.md", "BOOTSTRAP.md", "USER.md"]) {
       expect(hookEvents[0]!.contents).not.toContain(`Project ${name} leaked to hooks`);
+      expect(readContents).not.toContain(`Project ${name} leaked to hooks`);
     }
   });
 
@@ -458,10 +471,7 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
       return;
     }
     expect(result.contextFiles).toContainEqual(
-      contextFile(
-        path.join(sessionWorkspace, "AGENTS.md"),
-        expect.stringMatching(/^\[UNREADABLE: File exceeds/),
-      ),
+      instructions(sessionWorkspace, expect.stringMatching(/^\[UNREADABLE: File exceeds/)),
     );
 
     await fs.writeFile(path.join(sessionWorkspace, "AGENTS.md"), "Recovered instructions");
@@ -484,9 +494,7 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
       effectiveWorkspace: promptWorkspace,
     });
 
-    expect(result.contextFiles).toContainEqual(
-      contextFile(path.join(promptWorkspace, "AGENTS.md"), agents),
-    );
+    expect(result.contextFiles).toContainEqual(instructions(promptWorkspace, agents));
     expect(result.bootstrapInjectionStats).toContainEqual(
       expect.objectContaining({
         path: path.join(workspace, "AGENTS.md"),

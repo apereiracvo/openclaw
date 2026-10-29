@@ -57,14 +57,14 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     workspaceDir: bootstrapWorkspaceDir,
     warn: (message) => log.warn(message),
   });
-  const resolveWorkspaceBootstrapFiles = (workspaceDir: string) =>
+  const resolveWorkspaceBootstrapFiles = () =>
     resolveBootstrapFilesForRun({
       bootstrapUserProfileId: attempt.bootstrapUserProfileId,
       config: attempt.config,
       sessionKey: attempt.sessionKey,
       sessionId: attempt.sessionId,
       chatType: attempt.chatType,
-      workspaceDir,
+      workspaceDir: bootstrapWorkspaceDir,
       agentId: params.setup.sessionAgentId,
       warn: bootstrapWarn,
       contextMode: attempt.bootstrapContextMode,
@@ -100,7 +100,7 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     contextInjectionMode !== "never" &&
     (bootstrapRouting === undefined || bootstrapRouting.bootstrapMode === "full")
   ) {
-    preloadedBootstrapFiles = await resolveWorkspaceBootstrapFiles(bootstrapWorkspaceDir);
+    preloadedBootstrapFiles = await resolveWorkspaceBootstrapFiles();
     bootstrapRouting = await resolveBootstrapRouting(preloadedBootstrapFiles);
   }
   bootstrapRouting ??= await resolveBootstrapRouting(preloadedBootstrapFiles);
@@ -120,8 +120,7 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
   let hookAdjustedBootstrapFiles: WorkspaceBootstrapFile[] = [];
   let resolvedContextFiles: EmbeddedContextFile[] = [];
   if (!shouldSkipBootstrapInjection) {
-    const bootstrapFiles =
-      preloadedBootstrapFiles ?? (await resolveWorkspaceBootstrapFiles(bootstrapWorkspaceDir));
+    const bootstrapFiles = preloadedBootstrapFiles ?? (await resolveWorkspaceBootstrapFiles());
     // Only the creation-validated project root may add instructions. Neither the
     // run workspace nor an arbitrary cwd supplies selected-project provenance.
     const executionAgentsRoot = attempt.executionAgentsRootDir;
@@ -185,13 +184,6 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     previousSignature: attempt.bootstrapPromptWarningSignature,
   });
   const workspaceNotes: string[] = [];
-  if (
-    hookAdjustedBootstrapFiles.some(
-      (file) => file.name === DEFAULT_BOOTSTRAP_FILENAME && !file.missing,
-    )
-  ) {
-    workspaceNotes.push("Reminder: commit your changes in this workspace after edits.");
-  }
   if (isEmbeddedMode()) {
     workspaceNotes.push(
       "Running in local embedded mode (no gateway). Most tools work locally. Gateway-dependent tools (canvas, nodes, cron, message, sessions_send, sessions_spawn, gateway) are unavailable. Subagent kill/steer require a gateway. Do not attempt to read gateway-specific files such as sessions.json, gateway.log, or gateway.pid.",
