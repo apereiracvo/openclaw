@@ -3,6 +3,7 @@ import path from "node:path";
 import type { AcpRuntime } from "@openclaw/acp-core/runtime/types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestAdmittedRunContext } from "../../agents/admitted-run-context.test-support.js";
+import { observeSessionSendContinuations } from "../../agents/openclaw-tools.sessions-timeout.test-support.js";
 import type { AgentToolGatewayRequestCaller } from "../../agents/tools/in-process-gateway.js";
 import { createSessionsSendTool } from "../../agents/tools/sessions-send-tool.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -28,6 +29,8 @@ import {
 } from "../runtime/session-meta.js";
 import { resetAcpActiveTurnsForTests } from "./active-turns.test-support.js";
 import { AcpSessionManager, testing as managerTesting } from "./manager.js";
+
+const continuations = observeSessionSendContinuations();
 
 const baseCfg = {
   acp: { enabled: true, backend: "acpx", dispatch: { enabled: true } },
@@ -119,7 +122,8 @@ beforeEach(() => {
   vi.useRealTimers();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await continuations.settle();
   clearRuntimeConfigSnapshot();
   resetAcpActiveTurnsForTests();
   closeOpenClawAgentDatabasesForTest();
@@ -223,6 +227,8 @@ describe("ACP one-shot cross-owner resume integration", () => {
         });
 
         const gatewayCalls: Array<{ method?: string; params?: Record<string, unknown> }> = [];
+        const completedRuns = new Set<string>();
+        const observedRuns: string[] = [];
         const dispatchThroughGateway: AgentToolGatewayRequestCaller = async <T>(
           request: GatewayRequest,
         ) => {
@@ -238,6 +244,12 @@ describe("ACP one-shot cross-owner resume integration", () => {
               expect(query.spawnedBy).toBe(parentSessionKey);
             }
             return { agentId: "codex", key: sessionKey } as T;
+          }
+          if (request.method === "agent.wait") {
+            const runId = String(recorded.params?.runId);
+            expect(completedRuns.has(runId)).toBe(true);
+            observedRuns.push(runId);
+            return { runId, status: "ok", terminalReply: { disposition: "empty" } } as T;
           }
           if (request.method !== "agent") {
             throw new Error(`unexpected gateway method ${request.method ?? "<missing>"}`);
@@ -264,6 +276,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
             mode: "prompt",
             requestId,
           });
+          completedRuns.add(requestId);
           return { runId: requestId, status: "accepted", acceptedAt: 2_000 } as T;
         };
 
@@ -289,7 +302,7 @@ describe("ACP one-shot cross-owner resume integration", () => {
             runId: toolCallId,
             status: expectedStatus,
             sessionKey,
-            ...(expectedStatus === "accepted" ? { delivery: { status: "skipped" } } : {}),
+            ...(expectedStatus === "accepted" ? { delivery: { status: "pending" } } : {}),
           });
           return result;
         };
@@ -316,6 +329,21 @@ describe("ACP one-shot cross-owner resume integration", () => {
             ),
           ).toHaveLength(1);
         }
+        await continuations.settle();
+        expect(observedRuns).toEqual(["integrated-followup-1", "integrated-followup-2"]);
+        console.info(
+          "QA_MANAGER_CALLS",
+          gatewayCalls.map(({ method, params }) => ({
+            method,
+            target: params?.sessionKey,
+            runId: params?.runId ?? params?.idempotencyKey,
+            provenance: params?.inputProvenance,
+            phase:
+              method === "agent.wait"
+                ? "settled-empty-observation"
+                : "child-dispatch-or-resolution",
+          })),
+        );
         expect(gatewayCalls.filter((call) => call.method === "agent")).toHaveLength(2);
         expect(
           gatewayCalls.filter(

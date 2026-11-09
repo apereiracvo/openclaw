@@ -1,5 +1,6 @@
 import { resolveRealpathOrAbsolute } from "../../../infra/boundary-path.js";
 import { isEmbeddedMode } from "../../../infra/embedded-mode.js";
+import { resolveUserPath } from "../../../utils.js";
 import { buildBootstrapBudgetState, buildBootstrapInjectionStats } from "../../bootstrap-budget.js";
 import {
   hasCompletedBootstrapTurn,
@@ -13,7 +14,9 @@ import {
 } from "../../bootstrap-routing.js";
 import { buildBootstrapContextForFiles } from "../../embedded-agent-helpers/bootstrap.js";
 import type { EmbeddedContextFile } from "../../embedded-agent-helpers/context-file.js";
+import { resolveEffectiveToolFsWorkspaceOnly } from "../../tool-fs-policy.js";
 import { isUnreadableWorkspaceBootstrapFile } from "../../workspace-bootstrap-read.js";
+import { resolveRunBootstrapWorkspaceDir } from "../../workspace-run.js";
 import {
   DEFAULT_AGENTS_FILENAME,
   DEFAULT_BOOTSTRAP_FILENAME,
@@ -39,9 +42,11 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
   isRawModelRun: boolean;
 }) {
   const { attempt } = params;
-  const bootstrapWorkspaceDir = attempt.bootstrapWorkspaceDir ?? params.setup.resolvedWorkspace;
-  // The selected session workspace owns execution. Agent bootstrap identity stays
-  // in the configured workspace; execution project instructions layer after it.
+  const bootstrapWorkspaceDir = resolveRunBootstrapWorkspaceDir({
+    ...attempt,
+    workspaceDir: params.setup.resolvedWorkspace,
+    agentId: params.setup.sessionAgentId,
+  });
   const bootstrapPromptWorkspaceDir =
     bootstrapWorkspaceDir === params.setup.resolvedWorkspace
       ? params.setup.effectiveWorkspace
@@ -125,8 +130,18 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     // run workspace nor an arbitrary cwd supplies selected-project provenance.
     const executionAgentsRoot = attempt.executionAgentsRootDir;
     const executionProjectFiles: WorkspaceBootstrapFile[] = [];
+    // Confinement owns all reads; a recorded root must match before layering.
+    // Rootless unconstrained runs retain their existing selected instructions.
     if (
-      executionAgentsRoot &&
+      executionAgentsRoot?.trim() &&
+      !attempt.requireWorkspaceOnly &&
+      !resolveEffectiveToolFsWorkspaceOnly({
+        cfg: attempt.config,
+        agentId: params.setup.sessionAgentId,
+      }) &&
+      (attempt.sessionRoot === undefined ||
+        (attempt.sessionRoot.trim() &&
+          resolveUserPath(attempt.sessionRoot) === resolveUserPath(executionAgentsRoot))) &&
       resolveRealpathOrAbsolute(bootstrapWorkspaceDir) !==
         resolveRealpathOrAbsolute(executionAgentsRoot)
     ) {

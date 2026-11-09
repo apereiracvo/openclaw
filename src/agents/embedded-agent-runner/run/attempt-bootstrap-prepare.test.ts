@@ -10,6 +10,8 @@ import { FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE } from "../../bootstrap-files.js";
 import { SessionManager } from "../../sessions/session-manager.js";
 import * as workspaceBootstrapRead from "../../workspace-bootstrap-read.js";
 import { MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES } from "../../workspace-bootstrap-read.js";
+import * as workspacePersonalBootstrap from "../../workspace-personal-bootstrap.js";
+import * as workspaceStateRead from "../../workspace-state-read.js";
 import { loadWorkspaceBootstrapFiles, DEFAULT_AGENTS_FILENAME } from "../../workspace.js";
 import { prepareEmbeddedAttemptBootstrap } from "./attempt-bootstrap-prepare.js";
 import { createAttemptSetupFixture } from "./attempt-setup.test-support.js";
@@ -43,6 +45,7 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
     options: {
       contextInjection?: "always" | "continuation-skip" | "never";
       effectiveWorkspace?: string;
+      sessionAgentId?: string;
       isRawModelRun?: boolean;
       attempt?: Partial<EmbeddedRunAttemptParams>;
     } = {},
@@ -64,6 +67,7 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
       setup: createAttemptSetupFixture({
         effectiveWorkspace: options.effectiveWorkspace ?? sessionWorkspace,
         resolvedWorkspace: sessionWorkspace,
+        ...(options.sessionAgentId !== undefined ? { sessionAgentId: options.sessionAgentId } : {}),
       }),
       hasReadTool: true,
       isRawModelRun: options.isRawModelRun ?? false,
@@ -445,6 +449,239 @@ describe("prepareEmbeddedAttemptBootstrap", () => {
     expect(result.bootstrapInjectionStats).toContainEqual(
       expect.objectContaining({ path: path.join(projectRoot, "AGENTS.md") }),
     );
+  });
+
+  it("keeps joint recorded-project bootstrap private to its explicit configured agent", async () => {
+    // Input composition only: public creation and durable provenance derivation are
+    // exercised separately, not authenticated or invented by this helper fixture.
+    const canonical = await makeWorkspace("joint-agent", {
+      "AGENTS.md": "Canonical instructions",
+      "SOUL.md": "Canonical soul",
+      "USER.md": "Canonical user",
+      "MEMORY.md": "Canonical memory",
+    });
+    const project = await makeWorkspace("joint-project", {
+      "AGENTS.md": "Selected instructions",
+      "SOUL.md": "SELECTED PRIVATE SOUL",
+      "USER.md": "SELECTED PRIVATE USER",
+      "MEMORY.md": "SELECTED PRIVATE MEMORY",
+      "BOOTSTRAP.md": "SELECTED PRIVATE SETUP",
+    });
+    const readContents: string[] = [];
+    const read = workspaceBootstrapRead.readWorkspaceBootstrapFile;
+    vi.spyOn(workspaceBootstrapRead, "readWorkspaceBootstrapFile").mockImplementation(
+      async (fd) => {
+        const content = await read(fd);
+        readContents.push(content);
+        return content;
+      },
+    );
+    // Observe real setup/personal preparation entry without replacing either owner.
+    const setupRead = vi.spyOn(workspaceStateRead, "readCanonicalWorkspaceStateSnapshot");
+    const personalRead = vi.spyOn(workspacePersonalBootstrap, "loadPersonalUserBootstrapFile");
+    const hookRoots: string[] = [];
+    const handler = (event: { context: unknown }) => {
+      hookRoots.push((event.context as AgentBootstrapHookContext).workspaceDir);
+    };
+    registerInternalHook("agent:bootstrap", handler);
+    try {
+      const result = await prepare(canonical, project, {
+        sessionAgentId: "helper",
+        attempt: {
+          sessionKey: "agent:helper:joint-project",
+          cwd: project,
+          sessionRoot: project,
+          executionAgentsRootDir: project,
+          config: { agents: { entries: { helper: { workspace: canonical } } } },
+        },
+      });
+      expect(result.contextFiles).toContainEqual(instructions(canonical, "Canonical instructions"));
+      expect(result.contextFiles).toContainEqual(instructions(project, "Selected instructions"));
+      for (const [name, content] of [
+        ["SOUL.md", "Canonical soul"],
+        ["USER.md", "Canonical user"],
+        ["MEMORY.md", "Canonical memory"],
+      ] as const) {
+        expect(readContents).toContain(content);
+        expect(result.contextFiles).not.toContainEqual(
+          expect.objectContaining({ path: path.join(project, name) }),
+        );
+      }
+      expect(result.contextFiles).toContainEqual(
+        contextFile(path.join(canonical, "SOUL.md"), "Canonical soul"),
+      );
+      expect(readContents.filter((content) => content === "Selected instructions")).toHaveLength(1);
+      expect(readContents.join("\n")).not.toContain("SELECTED PRIVATE");
+      expect(
+        result.contextFiles.filter((file) => file.path === path.join(project, "AGENTS.md")),
+      ).toHaveLength(1);
+      const projectIndex = result.contextFiles.findIndex(
+        (file) => file.path === path.join(project, "AGENTS.md"),
+      );
+      expect(projectIndex).toBeGreaterThan(
+        result.contextFiles.findLastIndex((file) => file.path.startsWith(canonical + path.sep)),
+      );
+      expect(
+        result.bootstrapInjectionStats.filter((file) => file.name === "AGENTS.md"),
+      ).toMatchObject([
+        {
+          path: path.join(canonical, "AGENTS.md"),
+          rawChars: 22,
+          injectedChars: 22,
+          truncated: false,
+          origin: { kind: "agent-workspace", rootPath: canonical },
+        },
+        {
+          path: path.join(project, "AGENTS.md"),
+          rawChars: 21,
+          injectedChars: 21,
+          truncated: false,
+          origin: { kind: "execution-project", rootPath: project },
+        },
+      ]);
+      expect(setupRead.mock.calls.length).toBeGreaterThan(0);
+      expect(setupRead.mock.calls.every(([root]) => root === canonical)).toBe(true);
+      expect(personalRead.mock.calls.map(([root]) => root)).toEqual([canonical]);
+      expect(hookRoots).toEqual([canonical]);
+    } finally {
+      unregisterInternalHook("agent:bootstrap", handler);
+    }
+  });
+
+  it.each([
+    "explicit confinement",
+    "global confinement",
+    "agent confinement",
+    "confined outside layer",
+    "confined rootless layer",
+    "mismatched root",
+    "absent selected fact",
+    "missing owner",
+    "no roster",
+    "unconfigured owner",
+    "alias spelling",
+  ] as const)("retains recorded-root bootstrap for joint %s", async (kind) => {
+    const canonical = await makeWorkspace("joint-negative-agent", {
+      "AGENTS.md": "CANONICAL MUST STAY OUT",
+    });
+    const recorded = await makeWorkspace("joint-negative-root", {
+      "AGENTS.md": "Recorded instructions",
+      "SOUL.md": "Recorded soul",
+    });
+    const outside = await makeWorkspace("joint-negative-outside", {
+      "AGENTS.md": "OUTSIDE MUST STAY OUT",
+    });
+    let selected = kind === "mismatched root" || kind.startsWith("confined") ? outside : recorded;
+    if (kind === "alias spelling") {
+      selected = path.join(outside, "root-alias");
+      await fs.symlink(recorded, selected, "dir");
+    }
+    const readContents: string[] = [];
+    const read = workspaceBootstrapRead.readWorkspaceBootstrapFile;
+    vi.spyOn(workspaceBootstrapRead, "readWorkspaceBootstrapFile").mockImplementation(
+      async (fd) => {
+        const content = await read(fd);
+        readContents.push(content);
+        return content;
+      },
+    );
+    const result = await prepare(canonical, recorded, {
+      sessionAgentId: kind === "missing owner" ? "" : "helper",
+      attempt: {
+        sessionKey: "agent:helper:joint-negative",
+        cwd: outside,
+        sessionRoot: kind === "confined rootless layer" ? undefined : recorded,
+        executionAgentsRootDir: kind === "absent selected fact" ? undefined : selected,
+        requireWorkspaceOnly:
+          kind === "explicit confinement" || kind.startsWith("confined") ? true : undefined,
+        config: {
+          agents:
+            kind === "no roster"
+              ? { defaults: { workspace: canonical } }
+              : {
+                  entries: {
+                    [kind === "unconfigured owner" ? "other" : "helper"]: {
+                      workspace: canonical,
+                      ...(kind === "agent confinement"
+                        ? { tools: { fs: { workspaceOnly: true } } }
+                        : {}),
+                    },
+                  },
+                },
+          ...(kind === "global confinement" ? { tools: { fs: { workspaceOnly: true } } } : {}),
+        },
+      },
+    });
+    expect(result.contextFiles).toContainEqual(instructions(recorded, "Recorded instructions"));
+    expect(result.contextFiles).toContainEqual(
+      contextFile(path.join(recorded, "SOUL.md"), "Recorded soul"),
+    );
+    expect(result.contextFiles.every((file) => file.path.startsWith(recorded + path.sep))).toBe(
+      true,
+    );
+    expect(readContents.filter((content) => content === "Recorded instructions")).toHaveLength(1);
+    expect(readContents.join("\n")).not.toContain("MUST STAY OUT");
+    expect(
+      result.bootstrapInjectionStats.some((file) => file.origin?.kind === "execution-project"),
+    ).toBe(false);
+  });
+
+  it.each(["present", "missing", "symlink"] as const)(
+    "keeps a rooted worktree's bootstrap inside its checkout (%s)",
+    async (agents) => {
+      const shared = await makeWorkspace("shared", {
+        "AGENTS.md": "SHARED INSTRUCTIONS MUST NOT LEAK",
+        "SOUL.md": "SHARED SOUL MUST NOT LEAK",
+      });
+      const worktree = await makeWorkspace("worktree", {
+        ...(agents === "present" ? { "AGENTS.md": "Branch instructions" } : {}),
+        "SOUL.md": "Branch soul",
+      });
+      if (agents === "symlink") {
+        await fs.symlink(path.join(shared, "AGENTS.md"), path.join(worktree, "AGENTS.md"));
+      }
+      const result = await prepare(shared, agents === "missing" ? shared : worktree, {
+        attempt: {
+          sessionRoot: worktree,
+          requireWorkspaceOnly: true,
+          cwd: path.join(worktree, "..", path.basename(shared)),
+        },
+      });
+
+      expect(result.contextFiles).toContainEqual(
+        contextFile(path.join(worktree, "SOUL.md"), "Branch soul"),
+      );
+      expect(
+        result.contextFiles.every((file) => file.path.startsWith(`${worktree}${path.sep}`)),
+      ).toBe(true);
+      expect(JSON.stringify(result)).not.toContain("MUST NOT LEAK");
+      expect(result.contextFiles).toContainEqual(
+        instructions(
+          worktree,
+          agents === "present"
+            ? "Branch instructions"
+            : expect.stringContaining("[MISSING] Expected at:"),
+        ),
+      );
+      expect(
+        result.bootstrapInjectionStats.find((file) => file.name === "AGENTS.md")?.missing,
+      ).toBe(agents !== "present");
+    },
+  );
+
+  it("uses task bootstrap when workspaceOnly is configured without a recorded root", async () => {
+    const shared = await makeWorkspace("shared", { "AGENTS.md": "Shared instructions" });
+    const task = await makeWorkspace("task", { "AGENTS.md": "Task instructions" });
+    const result = await prepare(shared, task, {
+      attempt: {
+        config: {
+          agents: { entries: { main: { workspace: shared } } },
+          tools: { fs: { workspaceOnly: true } },
+        },
+      },
+    });
+    expect(result.contextFiles).toContainEqual(instructions(task, "Task instructions"));
+    expect(result.contextFiles).not.toContainEqual(instructions(shared, "Shared instructions"));
   });
 
   it.each(["none", "full"])("withholds completion for unreadable AGENTS.md (%s)", async (mode) => {

@@ -1,0 +1,6 @@
+5356
+# Frozen T: 87c57b41c5906fc25205aaf18363d37750f07b2a; exact own literal-LF net regression growth: +5346.
+# Preserve deployed custom integration regressions and current guard-compliant tests/helpers; not new coverage quota.
+# Alejandro explicitly approved exactly 10 inherited frozen-T test lines on 2026-11-09.
+# Total credit: own growth 5346 + approved inherited debt 10 = 5356; zero extra headroom.
+# Reason must accompany any future authorized PR/squash body; no publication approval implied.

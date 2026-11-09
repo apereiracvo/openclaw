@@ -1,4 +1,5 @@
-import { isRequesterParentOfBackgroundAcpSession } from "@openclaw/acp-core/session-interaction-mode";
+import { isParentOwnedBackgroundAcpSession } from "@openclaw/acp-core/session-interaction-mode";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   isAcpTurnActive,
   releaseAcpTurnAdmission,
@@ -71,10 +72,15 @@ export function prepareSessionsSendAcpFollowup(params: {
       }),
     };
   }
+  const requesterParentKey = normalizeOptionalString(requesterSessionKey);
   const parentOwnsOneShot =
-    isRequesterParentOfBackgroundAcpSession(
+    isParentOwnedBackgroundAcpSession(
       targetSessionEntry ? { ...targetSessionEntry, acp: targetAcpMeta } : undefined,
-      requesterSessionKey,
+    ) &&
+    Boolean(
+      requesterParentKey &&
+      (requesterParentKey === normalizeOptionalString(targetSessionEntry?.spawnedBy) ||
+        requesterParentKey === normalizeOptionalString(targetSessionEntry?.parentSessionKey)),
     ) &&
     (targetAcpMeta?.mode === "oneshot" || targetSessionEntry?.acp?.mode === "oneshot");
   const acpFollowupAdmission = {

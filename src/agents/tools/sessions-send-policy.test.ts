@@ -184,7 +184,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
         backend: "acpx",
         agent: "worker",
         runtimeSessionName: "synthetic-acp-child",
-        mode: "oneshot",
+        mode: "persistent",
         state: "idle",
         lastActivityAt: 1,
       }),
@@ -506,7 +506,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
     ["owned native child", nativeChildKey, "automatic", true],
     ["another parent's native child", otherChildKey, "automatic", false],
     ["ordinary peer", workerKey, "message_tool_only", true],
-    ["ACP child", acpChildKey, "message_tool_only", true],
+    ["persistent ACP child", acpChildKey, "message_tool_only", true],
   ] as const)(
     "retains the result path for a fresh input to %s",
     async (_name, sessionKey, mode, allowed) => {
@@ -516,7 +516,10 @@ describe("sessions_send directed policy at the tool boundary", () => {
         expectNoDispatch();
         return;
       }
-      expect(result.details).toMatchObject({ status: "ok", reply: replyText });
+      expect(result.details, JSON.stringify(result.details)).toMatchObject({
+        status: "ok",
+        reply: replyText,
+      });
       expect(gatewayParams()).toMatchObject({
         sessionKey,
         deliver: false,

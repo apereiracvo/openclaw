@@ -14,7 +14,9 @@ import {
   resolveSessionAgentId,
   resolveAgentWorkspaceDir,
 } from "./agent-scope.js";
+import type { AgentRunExecutionContext } from "./command/execution-context.types.js";
 import { sanitizeForPromptLiteral } from "./sanitize-for-prompt.js";
+import { resolveEffectiveToolFsWorkspaceOnly } from "./tool-fs-policy.js";
 
 type WorkspaceFallbackReason = "missing" | "blank" | "invalid_type";
 
@@ -29,6 +31,33 @@ export type ResolveRunWorkspaceResult = {
 /** Redacts a run/session identifier for logs and prompts. */
 export function redactRunIdentifier(value: string | undefined): string {
   return redactIdentifier(value, { len: 12 });
+}
+
+/** Recorded roots own bootstrap unless an unconstrained selected project layers on its agent. */
+export function resolveRunBootstrapWorkspaceDir(
+  params: Parameters<typeof resolveRootedRunRuntimeWorkspace>[0] &
+    Pick<AgentRunExecutionContext, "executionAgentsRootDir">,
+  fallback = params.bootstrapWorkspaceDir ?? params.workspaceDir,
+): string {
+  const confined =
+    params.requireWorkspaceOnly ||
+    resolveEffectiveToolFsWorkspaceOnly({ cfg: params.config, agentId: params.agentId });
+  const agentId = params.agentId?.trim();
+  if (
+    !confined &&
+    agentId &&
+    params.config &&
+    hasAgentRosterProperty(params.config) &&
+    resolveAgentConfig(params.config, agentId) &&
+    params.executionAgentsRootDir?.trim() &&
+    params.sessionRoot?.trim() &&
+    resolveUserPath(params.executionAgentsRootDir) === resolveUserPath(params.sessionRoot)
+  ) {
+    // Creation-derived project instructions layer separately; private bootstrap stays with
+    // the configured agent. Matching roots do not grant authority or override confinement.
+    return resolveUserPath(resolveAgentWorkspaceDir(params.config, agentId));
+  }
+  return resolveUserPath(params.sessionRoot ?? (confined ? params.workspaceDir : fallback));
 }
 
 export function resolveRunWorkspaceDir(params: {
@@ -91,21 +120,15 @@ export function resolveRunWorkspaceDir(params: {
 }
 
 /** Rooted execution borrows plugin facts only from its agent's canonical bootstrap workspace. */
-export function resolveRootedRunRuntimeWorkspace(params: {
-  workspaceDir: string;
-  bootstrapWorkspaceDir?: string;
-  sessionKey?: string;
-  agentId?: string;
-  config?: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-  requireWorkspaceOnly?: boolean;
-  sessionRoot?: string;
-}): ResolveRunWorkspaceResult | undefined {
-  if (
-    !params.bootstrapWorkspaceDir?.trim() ||
-    !params.config ||
-    !hasAgentRosterProperty(params.config)
-  ) {
+export function resolveRootedRunRuntimeWorkspace(
+  params: Parameters<typeof resolveRunWorkspaceDir>[0] & {
+    workspaceDir: string;
+    bootstrapWorkspaceDir?: string;
+    requireWorkspaceOnly?: boolean;
+    sessionRoot?: string;
+  },
+): ResolveRunWorkspaceResult | undefined {
+  if (!params.bootstrapWorkspaceDir?.trim() || !hasAgentRosterProperty(params.config)) {
     return undefined;
   }
   const bootstrap = resolveRunWorkspaceDir({
@@ -124,14 +147,10 @@ export function resolveRootedRunRuntimeWorkspace(params: {
 }
 
 /** Resolves the agent's canonical workspace for a run that executes somewhere else. */
-export function resolveCanonicalRunRuntimeWorkspace(params: {
-  workspaceDir: string;
-  sessionKey?: string;
-  agentId?: string;
-  config?: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-}): ResolveRunWorkspaceResult | undefined {
-  if (!params.config || !hasAgentRosterProperty(params.config)) {
+export function resolveCanonicalRunRuntimeWorkspace(
+  params: Parameters<typeof resolveRunWorkspaceDir>[0] & { workspaceDir: string },
+): ResolveRunWorkspaceResult | undefined {
+  if (!hasAgentRosterProperty(params.config)) {
     return undefined;
   }
   const { fallbackReason: _fallbackReason, ...canonical } = resolveRunWorkspaceDir({

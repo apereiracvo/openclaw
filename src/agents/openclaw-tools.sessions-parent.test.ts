@@ -312,16 +312,38 @@ describe("sessions tools parent completion and ACP follow-up", () => {
       parentKey: requesterKey,
       acp,
     });
+    let completion: SessionFollowupCompletion | undefined;
+    let acceptedRunId: string | undefined;
+    let releaseActive: (() => void) | undefined;
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: unknown };
       calls.push(request);
       if (request.method === "agent") {
-        const admissionId = (request.params as { idempotencyKey?: string } | undefined)
-          ?.idempotencyKey;
-        markAcpTurnActive(targetKey, admissionId);
-        return { runId: "run-acp-followup", status: "accepted", acceptedAt: 2_000 };
+        const params = agentParams(request);
+        expect(params.sessionKey).toBe(targetKey);
+        const runId = params.idempotencyKey;
+        if (!runId) {
+          throw new Error("ACP fixture requires the actual admitted run ID");
+        }
+        const followup = readFollowupRequest(runId, targetKey);
+        if (!followup) {
+          throw new Error("ACP fixture requires retained original requester custody");
+        }
+        completion = SessionFollowupCompletion.bind(followup);
+        followup.completion = completion;
+        completion.markAccepted(runId);
+        acceptedRunId = runId;
+        releaseActive = markAcpTurnActive(targetKey, runId);
+        return { runId, status: "accepted", acceptedAt: 2_000 };
       }
-      return {};
+      if (request.method === "sessions.resolve") {
+        expect((request.params as { key?: string }).key).toBe(targetKey);
+        return { key: targetKey, agentId: "main" };
+      }
+      if (request.method === "sessions.describe") {
+        return {};
+      }
+      throw new Error(`unexpected ACP fixture method ${request.method}`);
     });
 
     const tool = getSessionTool("sessions_send", {
@@ -330,18 +352,24 @@ describe("sessions tools parent completion and ACP follow-up", () => {
       isAcpTurnActive: () => false,
       readAcpSessionMetaAsync: async () => acp,
     });
-    const result = await tool.execute("call-acp-followup", {
-      sessionKey: targetKey,
-      message: "continue the same conversation",
-      timeoutSeconds: 15,
-    });
+    const result = await withPluginRuntimeGatewayRequestScope(
+      createSessionsSendGatewayScope(),
+      () =>
+        withGatewayToolCallerIdentity(createSessionsSendTestCaller(requesterKey), () =>
+          tool.execute("call-acp-followup", {
+            sessionKey: targetKey,
+            message: "continue the same conversation",
+            timeoutSeconds: 15,
+          }),
+        ),
+    );
 
     const details = sessionsSendDetails(result.details);
-    expect(details).toMatchObject({
-      runId: "run-acp-followup",
+    expect(details, JSON.stringify(details)).toMatchObject({
+      runId: acceptedRunId,
       status: "accepted",
       sessionKey: targetKey,
-      delivery: { status: "skipped" },
+      delivery: { status: "pending" },
     });
     const dispatches = calls.filter((call) => call.method === "agent");
     expect(dispatches).toHaveLength(1);
@@ -357,6 +385,27 @@ describe("sessions tools parent completion and ACP follow-up", () => {
     expect(calls.some((call) => call.method === "chat.history")).toBe(false);
     expect(calls.some((call) => call.method === "agent.wait")).toBe(false);
     expect(calls.some((call) => call.method === "send")).toBe(false);
+    expect(completion).toBeDefined();
+    expect(acceptedRunId).toBeTruthy();
+    if (!completion || !acceptedRunId) {
+      throw new Error("Missing owned ACP completion");
+    }
+    await completion.settle(acceptedRunId, {
+      status: "ok",
+      terminalReply: { disposition: "empty" },
+    });
+    completion.finishExecution(acceptedRunId);
+    releaseActive?.();
+    await continuations.settle();
+    expect(calls.filter((call) => call.method === "agent")).toHaveLength(1);
+    expect(calls.some((call) => call.method === "agent.wait")).toBe(false);
+    console.info("QA_PARENT_COMPLETION", {
+      runId: acceptedRunId,
+      disposition: "empty",
+      childDispatches: 1,
+      waits: 0,
+    });
+    completion.close();
     clearAcpTurnActive(targetKey);
     resetAcpActiveTurnsForTests();
   });

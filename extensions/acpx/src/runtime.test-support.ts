@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import type {
   AcpxRuntime as UpstreamRuntime,
   AcpSessionRecord,
@@ -6,7 +9,7 @@ import type {
   AcpProcessLaunch,
 } from "acpx/runtime";
 import { vi } from "vitest";
-import type { AcpRuntime, AcpRuntimeTurn } from "../runtime-api.js";
+import type { AcpRuntime, AcpRuntimeTurn, AcpRuntimeEvent } from "../runtime-api.js";
 import { splitCommandParts, type AcpxAgentCommand } from "./command-line.js";
 import {
   mockAcpxProcessSystem,
@@ -218,4 +221,129 @@ export function makeLeasedRuntime(
     },
     { openclawProcessCleanup: cleanup },
   );
+}
+
+type FakeAcpWireRequest = {
+  method: string;
+  params: Record<string, unknown>;
+  pid: number;
+};
+
+export async function writeFakeResumeAgent(params: {
+  logPath: string;
+  wrapperPath: string;
+}): Promise<void> {
+  const sdkUrl = pathToFileURL(
+    createRequire(import.meta.url).resolve("@agentclientprotocol/sdk"),
+  ).href;
+  await fs.writeFile(
+    params.wrapperPath,
+    `#!/usr/bin/env node
+import fs from "node:fs";
+import { Readable, Writable } from "node:stream";
+import {
+  agent,
+  PROTOCOL_VERSION,
+  RequestError,
+  ndJsonStream,
+} from ${JSON.stringify(sdkUrl)};
+
+const logPath = ${JSON.stringify(params.logPath)};
+const log = (method, params = {}) => {
+  fs.appendFileSync(logPath, JSON.stringify({ method, params, pid: process.pid }) + "\\n");
+};
+
+class FakeResumeAgent {
+  initialize(params) {
+    log("initialize", params);
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      authMethods: [],
+      agentCapabilities: {
+        loadSession: false,
+        sessionCapabilities: { resume: {}, close: {} },
+      },
+    };
+  }
+  authenticate(params) {
+    log("authenticate", params);
+    return {};
+  }
+  newSession(params) {
+    log("session/new", params);
+    return { sessionId: "fresh-" + process.pid };
+  }
+  resumeSession(params) {
+    log("session/resume", params);
+    if (params.sessionId === "missing-target") {
+      throw RequestError.resourceNotFound(params.sessionId);
+    }
+    return {};
+  }
+  prompt(params) {
+    log("session/prompt", params);
+    return { stopReason: "end_turn" };
+  }
+  cancel(params) {
+    log("session/cancel", params);
+  }
+  closeSession(params) {
+    log("session/close", params);
+    return {};
+  }
+}
+
+const stream = ndJsonStream(
+  Writable.toWeb(process.stdout),
+  Readable.toWeb(process.stdin),
+);
+const handler = new FakeResumeAgent();
+const connection = agent()
+  .onRequest("initialize", ({ params }) => handler.initialize(params))
+  .onRequest("authenticate", ({ params }) => handler.authenticate(params))
+  .onRequest("session/new", ({ params }) => handler.newSession(params))
+  .onRequest("session/resume", ({ params }) => handler.resumeSession(params))
+  .onRequest("session/prompt", ({ params }) => handler.prompt(params))
+  .onRequest("session/close", ({ params }) => handler.closeSession(params))
+  .onNotification("session/cancel", ({ params }) => handler.cancel(params))
+  .connect(stream);
+void connection;
+`,
+    { mode: 0o755 },
+  );
+}
+
+export async function readFakeAcpWireRequests(logPath: string): Promise<FakeAcpWireRequest[]> {
+  const contents = await fs.readFile(logPath, "utf8").catch(() => "");
+  return contents
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as FakeAcpWireRequest);
+}
+
+export function makeRecordStore(): {
+  records: Map<string, Record<string, unknown>>;
+  store: TestSessionStore;
+} {
+  const records = new Map<string, Record<string, unknown>>();
+  return {
+    records,
+    store: {
+      load: vi.fn(async (recordId: string) => {
+        const record = records.get(recordId);
+        return record ? structuredClone(record) : undefined;
+      }),
+      save: vi.fn(async (record) => {
+        records.set(String(record.acpxRecordId), structuredClone(record));
+      }),
+    },
+  };
+}
+
+export async function collectEvents(source: AsyncIterable<AcpRuntimeEvent>) {
+  const collected: AcpRuntimeEvent[] = [];
+  for await (const event of source) {
+    collected.push(event);
+  }
+  return collected;
 }

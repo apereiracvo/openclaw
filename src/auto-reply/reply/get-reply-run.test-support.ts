@@ -1,5 +1,5 @@
 import path from "node:path";
-import { vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
@@ -11,6 +11,7 @@ import {
   closeOpenClawAgentDatabasesForTest,
 } from "../../state/openclaw-agent-db.js";
 import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
+import type { runReplyAgent } from "./agent-runner-run.js";
 import type { runPreparedReply } from "./get-reply-run.js";
 import { finalizeInboundContextForSdk } from "./inbound-context.js";
 import { createModelSelectionStateFixture } from "./model-selection.test-support.js";
@@ -224,5 +225,135 @@ export function preparedTarget(sessionId: string) {
     sessionKey: "session-key",
     incarnation: sessionId,
     agentId: "default",
+  });
+}
+
+export function registerPreparedReplyWorkspaceCases({
+  runPrepared,
+  requireRunReplyAgentCall,
+}: {
+  runPrepared: (
+    overrides?: Partial<Parameters<typeof runPreparedReply>[0]>,
+  ) => ReturnType<typeof runPreparedReply>;
+  requireRunReplyAgentCall: () => Parameters<typeof runReplyAgent>[0];
+}) {
+  it.each([
+    { name: "initial", storedCwd: undefined, expected: "/tmp/session-repo" },
+    { name: "replaced", storedCwd: "/tmp/current-repo", expected: "/tmp/current-repo" },
+    { name: "cleared", storedCwd: null, expected: "/tmp/agent-repo" },
+  ])("uses the $name admitted session cwd for execution", async ({ storedCwd, expected }) => {
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-1",
+      updatedAt: 1,
+      spawnedCwd: "/tmp/session-repo",
+      spawnedBy: "agent:default:main",
+    };
+    await runPrepared({
+      cfg: {
+        agents: {
+          defaults: { cwd: "/tmp/default-repo" },
+          entries: { default: { cwd: "/tmp/agent-repo" } },
+        },
+      },
+      sessionEntry,
+      sessionStore:
+        storedCwd !== undefined
+          ? { "session-key": { ...sessionEntry, spawnedCwd: storedCwd ?? undefined } }
+          : undefined,
+    });
+
+    expect(requireRunReplyAgentCall().followupRun.run.cwd).toBe(expected);
+  });
+
+  // A project root may only layer project instructions when sessions.create
+  // durably proved lineage plus a canonicalized selected project. Every other
+  // combination either lacks a project, lacks that provenance, or names a managed
+  // worktree checkout rather than a registered project root.
+  //
+  // A spawned child executes from its creation-validated `spawnedCwd` as the run
+  // workspace (#162308), so `run.workspaceDir` follows that cwd. The agent's
+  // canonical bootstrap identity still resolves from the target agent workspace
+  // (the embedded runner passes it as `bootstrapWorkspaceDir`), so the provenance
+  // gate below decides the project-AGENTS layer independently of the run workspace.
+  it.each([
+    {
+      name: "spawned project child",
+      spawnedBy: "agent:default:main",
+      projectId: "project-1",
+      spawnedCwd: "/tmp/project-repo",
+      worktree: undefined,
+      // The child runs from the selected project root; the layer is the same root.
+      expectedWorkspaceDir: "/tmp/project-repo",
+      expected: "/tmp/project-repo",
+    },
+    {
+      name: "spawned cwd without a registered project",
+      spawnedBy: "agent:default:main",
+      projectId: undefined,
+      spawnedCwd: "/tmp/session-repo",
+      worktree: undefined,
+      // An explicit cwd runs the child in place but carries no project provenance.
+      expectedWorkspaceDir: "/tmp/session-repo",
+      expected: undefined,
+    },
+    {
+      name: "unmarked dashboard project session",
+      spawnedBy: undefined,
+      projectId: "project-1",
+      spawnedCwd: "/tmp/project-repo",
+      worktree: undefined,
+      // A dashboard project session already runs from the project root, so its
+      // AGENTS.md is canonical bootstrap and must not layer a second time.
+      expectedWorkspaceDir: "/tmp/project-repo",
+      expected: undefined,
+    },
+    {
+      // A worktree child carries the same lineage, project, and spawnedCwd triple,
+      // but its cwd is a checkout that may sit at or below the repo root, so it is
+      // never the registered project root this layer claims to be.
+      name: "project worktree child at its checkout root",
+      spawnedBy: "agent:default:main",
+      projectId: "project-1",
+      spawnedCwd: "/tmp/worktrees/repo",
+      worktree: { id: "wt-1", branch: "feature", repoRoot: "/tmp/repos/project-repo" },
+      expectedWorkspaceDir: "/tmp/worktrees/repo",
+      expected: undefined,
+    },
+    {
+      // session-worktree-preparation resolves a nested source workspace against
+      // the checkout, so a naive gate would layer packages/AGENTS.md as a project
+      // root instruction file.
+      name: "project worktree child with a nested spawned cwd",
+      spawnedBy: "agent:default:main",
+      projectId: "project-1",
+      spawnedCwd: "/tmp/worktrees/repo/packages/app",
+      worktree: { id: "wt-1", branch: "feature", repoRoot: "/tmp/repos/project-repo" },
+      expectedWorkspaceDir: "/tmp/worktrees/repo/packages/app",
+      expected: undefined,
+    },
+  ])("resolves the project instruction root for a $name", async (row) => {
+    await runPrepared({
+      cfg: { agents: { defaults: { cwd: "/tmp/default-repo" } } },
+      workspaceDir: "/tmp/agent-workspace",
+      sessionEntry: {
+        sessionId: "session-1",
+        updatedAt: Date.now(),
+        spawnedBy: row.spawnedBy,
+        projectId: row.projectId,
+        spawnedCwd: row.spawnedCwd,
+        worktree: row.worktree,
+      },
+    });
+    const run = requireRunReplyAgentCall().followupRun.run;
+    expect(run.workspaceDir).toBe(row.expectedWorkspaceDir);
+    expect(run.executionAgentsRootDir).toBe(row.expected);
+  });
+}
+
+export function expectTurnText(call: Parameters<typeof runReplyAgent>[0], text: string) {
+  expect(call).toMatchObject({
+    commandBody: text,
+    transcriptCommandBody: text,
+    followupRun: { prompt: text, transcriptPrompt: text },
   });
 }

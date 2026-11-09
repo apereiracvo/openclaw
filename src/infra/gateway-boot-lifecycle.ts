@@ -70,6 +70,9 @@ export type GatewayCrashLoopBreakerDecision = ReturnType<
   typeof buildGatewayCrashLoopBreakerDecision
 >;
 
+export type GatewayRestartResumeWindow = { startedAt: number; endedAt: number };
+export type GatewayRestartResumeWindows = Record<string, GatewayRestartResumeWindow[]>;
+
 /** Inspection keeps snapshot preparation off the caller's event loop. */
 export async function readGatewayLastShutdownAsync(env = process.env) {
   const reply = await executeExistingOpenClawStateRead(
@@ -91,7 +94,12 @@ export async function readGatewayLastInstallationReplacementAsync(env = process.
 export async function beginGatewayBootLifecycle(
   env: NodeJS.ProcessEnv = process.env,
   nowMs = Date.now(),
-): Promise<{ decision: GatewayCrashLoopBreakerDecision; id: string | undefined }> {
+): Promise<{
+  decision: GatewayCrashLoopBreakerDecision;
+  id: string | undefined;
+  restartResumeWindow?: GatewayRestartResumeWindow;
+  restartResumeWindows?: GatewayRestartResumeWindows;
+}> {
   try {
     const context = captureOpenClawStateWorkerContext({ env });
     return await runOpenClawStateWorkerOperation(context, (scope) =>
@@ -101,6 +109,18 @@ export async function beginGatewayBootLifecycle(
     gatewayLifecycleLog.warn(`crash-loop breaker state unavailable; fail-open: ${String(err)}`);
     return { decision: buildGatewayCrashLoopBreakerDecision({ uncleanBoots: 0 }), id: undefined };
   }
+}
+
+/** A completed agent pass retires only the crash intervals captured by that boot. */
+export async function completeGatewayAgentRestartRecovery(
+  agentId: string,
+  through: number,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const context = captureOpenClawStateWorkerContext({ env });
+  await runOpenClawStateWorkerOperation(context, (scope) =>
+    scope.execute({ type: "gatewayBoot.recoveredAgent", input: { agentId, through } }),
+  );
 }
 
 /** Runtime readers share the boot owner's decision without opening SQLite on the main thread. */

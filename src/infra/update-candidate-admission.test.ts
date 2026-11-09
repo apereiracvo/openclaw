@@ -230,11 +230,7 @@ it.each(["unknown-version", "artifact"] as const)(
     expect(mocks.spawn).toHaveBeenCalledWith(
       "/selected/node",
       [path.join(root, "dist", "index.js"), "update", "admit", "--context", contextPath],
-      expect.objectContaining({
-        cwd: root,
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      }),
+      expect.objectContaining({ cwd: root, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }),
     );
     expect(childEnv).toEqual({
       ...preservedEnv,
@@ -388,3 +384,313 @@ it("cleans the private context when spawning the candidate fails", async () => {
   });
   await expectContextRemoved();
 });
+
+// Missing opt-in assets are SKIPPED/UNRUN, never positive protocol evidence.
+// This Linux route uses the separately admitted RO D chunk/native-package mounts.
+const installedDModule = process.env.OPENCLAW_QA_INSTALLED_D_ADMISSION_MODULE;
+const builtCandidateRoot = process.env.OPENCLAW_QA_BUILT_CANDIDATE_ROOT;
+const admittedNode = process.env.OPENCLAW_QA_ADMISSION_NODE;
+it.skipIf(!installedDModule || !builtCandidateRoot || !admittedNode)(
+  "crosses actual installed D admission into the normal built candidate (opt-in)",
+  async () => {
+    expect(process.platform).toBe("linux");
+    for (const input of [installedDModule, builtCandidateRoot, admittedNode]) {
+      expect(path.isAbsolute(input!)).toBe(true);
+      await fs.access(input!); // An enabled but unavailable route is a setup failure, not a skip.
+    }
+    expect(path.basename(installedDModule!)).toBe("update-candidate-admission-DEWiGlpZ.mjs");
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(builtCandidateRoot!, "package.json"), "utf8"),
+    );
+    expect(manifest.openclaw.updateAdmissionProtocol).toBe(1);
+    expect(manifest.openclaw.updatePreflightProtocol).toBe(1);
+    expect(manifest.openclaw.schemaVersions).toEqual({ state: 39, agent: 41 });
+    // Executable observer must stay on the admitted owned filesystem, not /tmp noexec.
+    const sandbox = tempDirs.make("real-D-cell-");
+    const state = path.join(sandbox, "state");
+    const home = path.join(sandbox, "home");
+    const installation = path.join(sandbox, "installation");
+    const tmp = path.join(sandbox, "tmp");
+    for (const dir of [state, home, installation, tmp]) {
+      await fs.mkdir(dir, { recursive: true });
+    }
+    const configPath = path.join(state, "openclaw.json");
+    await fs.writeFile(
+      path.join(installation, "package.json"),
+      JSON.stringify({ name: "openclaw", version: "2026.10.8" }),
+    );
+    const wireContext: UpdateAdmissionContext = {
+      ...context,
+      installation: {
+        root: installation,
+        canonicalRoot: installation,
+        version: "2026.10.8",
+        installKind: "package",
+        packageManager: "pnpm",
+      },
+      target: {
+        spec: "openclaw@" + manifest.version,
+        version: manifest.version,
+        source: "registry",
+        channel: "stable",
+      },
+      request: {
+        yes: true,
+        noRestart: true,
+        acceptCapabilities: false,
+        json: true,
+        timeoutMs: 20_000,
+      },
+      run: { id: "synthetic-D-built-candidate" },
+      supervisor: { version: "2026.10.8", host: "synthetic", pid: 123 },
+    };
+    // Explicit environment only: no parent selectors, credentials, NODE_OPTIONS or Vitest preload.
+    const cleanEnv = {
+      HOME: home,
+      USERPROFILE: home,
+      TMPDIR: tmp,
+      TMP: tmp,
+      TEMP: tmp,
+      XDG_CONFIG_HOME: path.join(home, "config"),
+      XDG_CACHE_HOME: path.join(home, "cache"),
+      XDG_STATE_HOME: path.join(home, "state"),
+      OPENCLAW_STATE_DIR: state,
+      OPENCLAW_CONFIG_PATH: configPath,
+      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
+      NODE_DISABLE_COMPILE_CACHE: "1",
+      OPENCLAW_NO_RESPAWN: "1",
+    };
+    const sentinels = {
+      OPENCLAW_UPDATE_EXECUTOR_GRANT: "synthetic-grant",
+      OPENCLAW_UPDATE_IN_PROGRESS: "1",
+      OPENCLAW_SYSTEMD_UNIT: "synthetic.service",
+      OPENCLAW_CONTROL_PLANE_UPDATE_SENTINEL_META: "synthetic-sentinel",
+      OPENCLAW_GATEWAY_SERVICE_PID: "123",
+      NODE_COMPILE_CACHE: path.join(sandbox, "old-cache"),
+      OPENCLAW_COMPATIBILITY_HOST_VERSION: "synthetic-old",
+      OPENCLAW_DEV_SOURCE_ROOT: path.join(sandbox, "wrong-source"),
+      OPENCLAW_VERSION: "0.0.0",
+      OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(sandbox, "wrong-plugins"),
+    };
+    const { execFile } =
+      await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const observer = path.join(sandbox, "node-observer.cjs");
+    const observationPath = path.join(sandbox, "observed.json");
+    await fs.writeFile(
+      observer,
+      "#!" +
+        admittedNode +
+        "\n" +
+        [
+          "const fs = require('node:fs'); const { spawnSync } = require('node:child_process');",
+          "const keys = " +
+            JSON.stringify([
+              ...Object.keys(sentinels),
+              "NODE_DISABLE_COMPILE_CACHE",
+              "OPENCLAW_NO_RESPAWN",
+              "OPENCLAW_CONFIG_PATH",
+              "OPENCLAW_STATE_DIR",
+            ]) +
+            ";",
+          "const env = Object.fromEntries(keys.map(k => [k, process.env[k] ?? null]));",
+          "const args = process.argv.slice(2);",
+          "const contextPath = args[args.indexOf('--context') + 1];",
+          "fs.writeFileSync(" +
+            JSON.stringify(observationPath) +
+            ", JSON.stringify({ env, args," +
+            " context: JSON.parse(fs.readFileSync(contextPath, 'utf8')) }));",
+          "const child = spawnSync(" +
+            JSON.stringify(admittedNode) +
+            ", args, { env: process.env, stdio: 'inherit' });",
+          "if (child.error) throw child.error; process.exit(child.status ?? 2);",
+        ].join("\n"),
+      { mode: 0o700 },
+    );
+    const harness = `
+      import fs from 'node:fs/promises';
+      import path from 'node:path';
+      import { pathToFileURL } from 'node:url';
+      import { spawnSync } from 'node:child_process';
+      import { DatabaseSync } from 'node:sqlite';
+      const input = JSON.parse(await fs.readFile(process.argv[1], 'utf8'));
+      if (input.newerSchema) {
+        const databasePath = path.join(input.cleanEnv.OPENCLAW_STATE_DIR, 'state', 'openclaw.sqlite');
+        await fs.mkdir(path.dirname(databasePath), { recursive: true });
+        const db = new DatabaseSync(databasePath);
+        db.exec(await fs.readFile(input.schemaFixture, 'utf8'));
+        db.exec("PRAGMA user_version=99999; INSERT INTO schema_meta VALUES" +
+          " ('primary','global',99999,NULL,'9999.1.1',1,1)");
+        db.close();
+      }
+      const databasePath = path.join(input.cleanEnv.OPENCLAW_STATE_DIR, 'state', 'openclaw.sqlite');
+      const databaseBefore = input.newerSchema ? await fs.readFile(databasePath) : null;
+      const { runUpdateCandidateAdmission } = await import(pathToFileURL(input.module).href);
+      if (process.versions.node !== '26.12.1') throw new Error('Expected admitted Node26.12.1');
+      const result = await runUpdateCandidateAdmission({ candidateRoot: input.candidate,
+        context: input.context, env: input.driverEnv, nodeRunner: input.observer, timeoutMs: 20000 });
+      // Emitters are negative D-driver controls only, never the built-candidate positive.
+      if (input.negative) {
+        process.stdout.write(JSON.stringify({ result }));
+        process.exit(0);
+      }
+      const env = { ...input.cleanEnv, OPENCLAW_DEV_SOURCE_ROOT: input.candidate,
+        OPENCLAW_VERSION: input.context.target.version };
+      const entry = (await Promise.all(['index.js','index.mjs','entry.js','entry.mjs'].map(async name => {
+        const p = path.join(input.candidate, 'dist', name);
+        return await fs.access(p).then(() => p, () => null);
+      }))).find(Boolean);
+      if (!entry) throw new Error('Normal built candidate entry unavailable');
+      const directContext = path.join(input.sandbox, 'direct-context.json');
+      await fs.writeFile(directContext, JSON.stringify(input.context), { mode: 0o600 });
+      const direct = spawnSync(process.execPath, [entry, 'update', 'admit', '--context', directContext],
+        { cwd: input.candidate, env, encoding: 'utf8', timeout: 20000, maxBuffer: 1048576 });
+      if (direct.error) throw direct.error;
+      if (databaseBefore && !databaseBefore.equals(await fs.readFile(databasePath))) {
+        throw new Error('Synthetic refused database bytes changed');
+      }
+      process.stdout.write(JSON.stringify({ result, directCode: direct.status,
+        direct: JSON.parse(direct.stdout) }));
+    `;
+    async function invoke(candidate = builtCandidateRoot!, negative = false, newerSchema = false) {
+      const inputPath = path.join(sandbox, "input.json");
+      await fs.writeFile(
+        inputPath,
+        JSON.stringify({
+          module: installedDModule,
+          candidate,
+          context: wireContext,
+          cleanEnv,
+          driverEnv: { ...cleanEnv, ...sentinels },
+          sandbox,
+          negative,
+          observer,
+          newerSchema,
+          schemaFixture: new URL(
+            "../cli/update-cli/fixtures/admission-state-fac4.sql",
+            import.meta.url,
+          ).pathname,
+        }),
+      );
+      return await new Promise<{
+        result: { owner: string; fallbackReason?: string; verdict?: UpdateAdmissionVerdict };
+        directCode: number;
+        direct: UpdateAdmissionVerdict;
+      }>((resolve, reject) => {
+        execFile(
+          admittedNode!,
+          ["--input-type=module", "--eval", harness, inputPath],
+          {
+            cwd: sandbox,
+            env: cleanEnv,
+            timeout: 45_000,
+            maxBuffer: 1024 * 1024,
+            encoding: "utf8",
+          },
+          (error, stdout) => {
+            if (error) {
+              reject(new Error("Admission process failed", { cause: error }));
+              return;
+            }
+            try {
+              resolve(JSON.parse(stdout));
+            } catch (parseError) {
+              reject(new Error("Admission result invalid", { cause: parseError }));
+            }
+          },
+        );
+      });
+    }
+    for (const mode of ["valid", "invalid-config", "newer-schema"] as const) {
+      const source =
+        mode === "invalid-config"
+          ? JSON.stringify({ gateway: { port: "synthetic-invalid-port" } })
+          : "{}";
+      await fs.writeFile(configPath, source);
+      const observed = await invoke(builtCandidateRoot!, false, mode === "newer-schema");
+      expect(
+        observed.result.owner,
+        JSON.stringify({
+          mode,
+          result: observed.result,
+          directCode: observed.directCode,
+          direct: observed.direct,
+        }),
+      ).toBe("candidate");
+      expect(observed.result.verdict?.protocol).toBe(1);
+      expect(
+        observed.result.verdict?.verdict,
+        JSON.stringify({ mode, result: observed.result, direct: observed.direct }),
+      ).toBe(mode === "valid" ? "admit" : "refuse");
+      expect(observed.direct.protocol).toBe(1);
+      expect(observed.directCode).toBe(mode === "valid" ? 0 : 3);
+      expect(observed.direct.verdict).toBe(observed.result.verdict?.verdict);
+      expect(observed.direct.facts.checks.map(({ name, status }) => ({ name, status }))).toEqual(
+        observed.result.verdict?.facts.checks.map(({ name, status }) => ({ name, status })),
+      );
+      const observation = JSON.parse(await fs.readFile(observationPath, "utf8"));
+      for (const key of Object.keys(sentinels)) {
+        if (key !== "OPENCLAW_DEV_SOURCE_ROOT" && key !== "OPENCLAW_VERSION") {
+          expect(observation.env[key]).toBeNull();
+        }
+      }
+      expect(observation.env).toMatchObject({
+        OPENCLAW_DEV_SOURCE_ROOT: builtCandidateRoot,
+        OPENCLAW_VERSION: manifest.version,
+        NODE_DISABLE_COMPILE_CACHE: "1",
+        OPENCLAW_NO_RESPAWN: "1",
+        OPENCLAW_CONFIG_PATH: configPath,
+        OPENCLAW_STATE_DIR: state,
+      });
+      expect(observation.args.slice(1, 4)).toEqual(["update", "admit", "--context"]);
+      expect(path.dirname(observation.args[0])).toBe(path.join(builtCandidateRoot!, "dist"));
+      expect(observation.context).toEqual(wireContext);
+      expect(observed.result.verdict?.facts.checks).toContainEqual(
+        expect.objectContaining({
+          name: "config",
+          status: mode === "invalid-config" ? "refuse" : "ok",
+        }),
+      );
+      if (mode === "valid") {
+        expect(observed.result.verdict?.facts.checks).toContainEqual({
+          name: "database-schema",
+          status: "ok",
+        });
+      } else {
+        const code = mode === "invalid-config" ? "invalid-config" : "database-schema-preflight";
+        expect(observed.result.verdict?.reasons).toContainEqual(expect.objectContaining({ code }));
+        if (mode === "newer-schema") {
+          expect(observed.result.verdict?.facts.checks).toContainEqual(
+            expect.objectContaining({ name: "database-schema", status: "refuse" }),
+          );
+        }
+      }
+      expect(observed.result.verdict?.facts.candidateVersion).toBe(manifest.version);
+      expect(observed.result.verdict?.facts.installedVersion).toBe("2026.10.8");
+      expect(await fs.readFile(configPath, "utf8")).toBe(source);
+    }
+    for (const [kind, protocol, output, reason] of [
+      ["unsupported", 2, "", "unsupported-target"],
+      ["malformed", 1, "not JSON", "malformed-json"],
+    ] as const) {
+      const negativeRoot = path.join(sandbox, "negative-" + kind);
+      await fs.mkdir(path.join(negativeRoot, "dist"), { recursive: true });
+      await fs.writeFile(
+        path.join(negativeRoot, "package.json"),
+        JSON.stringify({
+          type: "module",
+          openclaw: { updateAdmissionProtocol: protocol },
+        }),
+      );
+      await fs.writeFile(
+        path.join(negativeRoot, "dist", "index.js"),
+        "process.stdout.write(" + JSON.stringify(output) + ");",
+      );
+      expect((await invoke(negativeRoot, true)).result).toMatchObject({
+        owner: "installed",
+        fallbackReason: reason,
+      });
+    }
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  },
+  180_000,
+);

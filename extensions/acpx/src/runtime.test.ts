@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { RequestedModelUnsupportedError, decodeAcpxRuntimeHandleState } from "acpx/runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
@@ -16,10 +15,14 @@ import { renderAgentCommand, type AcpxAgentCommand } from "./command-line.js";
 import { OPENCLAW_ACPX_LEASE_ID_ARG, OPENCLAW_GATEWAY_INSTANCE_ID_ARG } from "./process-lease.js";
 import {
   CODEX_ACP_WRAPPER_COMMAND,
+  collectEvents,
   makeEmptySessionStore,
   makeLeasedRuntime,
   makeLeaseStore,
   makeRuntime,
+  makeRecordStore,
+  readFakeAcpWireRequests,
+  writeFakeResumeAgent,
   makeSessionStore as sessionStore,
   makeTurn,
   observeLaunch,
@@ -53,14 +56,6 @@ const turnInput = {
   mode: "prompt" as const,
   requestId: "turn",
 };
-
-async function collectEvents(source: AsyncIterable<AcpRuntimeEvent>) {
-  const collected: AcpRuntimeEvent[] = [];
-  for await (const event of source) {
-    collected.push(event);
-  }
-  return collected;
-}
 
 async function* events(...values: AcpRuntimeEvent[]) {
   yield* values;
@@ -167,114 +162,6 @@ function seedLease(
     startedAt,
     state: "open",
   });
-}
-
-type FakeAcpWireRequest = {
-  method: string;
-  params: Record<string, unknown>;
-  pid: number;
-};
-
-async function writeFakeResumeAgent(params: {
-  logPath: string;
-  wrapperPath: string;
-}): Promise<void> {
-  const sdkUrl = pathToFileURL(
-    path.resolve("node_modules/@agentclientprotocol/sdk/dist/acp.js"),
-  ).href;
-  await fs.writeFile(
-    params.wrapperPath,
-    `#!/usr/bin/env node
-import fs from "node:fs";
-import { Readable, Writable } from "node:stream";
-import {
-  AgentSideConnection,
-  PROTOCOL_VERSION,
-  RequestError,
-  ndJsonStream,
-} from ${JSON.stringify(sdkUrl)};
-
-const logPath = ${JSON.stringify(params.logPath)};
-const log = (method, params = {}) => {
-  fs.appendFileSync(logPath, JSON.stringify({ method, params, pid: process.pid }) + "\\n");
-};
-
-class FakeResumeAgent {
-  initialize(params) {
-    log("initialize", params);
-    return {
-      protocolVersion: PROTOCOL_VERSION,
-      authMethods: [],
-      agentCapabilities: {
-        loadSession: false,
-        sessionCapabilities: { resume: {}, close: {} },
-      },
-    };
-  }
-  authenticate(params) {
-    log("authenticate", params);
-    return {};
-  }
-  newSession(params) {
-    log("session/new", params);
-    return { sessionId: "fresh-" + process.pid };
-  }
-  resumeSession(params) {
-    log("session/resume", params);
-    if (params.sessionId === "missing-target") {
-      throw RequestError.resourceNotFound(params.sessionId);
-    }
-    return {};
-  }
-  prompt(params) {
-    log("session/prompt", params);
-    return { stopReason: "end_turn" };
-  }
-  cancel(params) {
-    log("session/cancel", params);
-  }
-  closeSession(params) {
-    log("session/close", params);
-    return {};
-  }
-}
-
-const stream = ndJsonStream(
-  Writable.toWeb(process.stdout),
-  Readable.toWeb(process.stdin),
-);
-const connection = new AgentSideConnection(() => new FakeResumeAgent(), stream);
-void connection;
-`,
-    { mode: 0o755 },
-  );
-}
-
-async function readFakeAcpWireRequests(logPath: string): Promise<FakeAcpWireRequest[]> {
-  const contents = await fs.readFile(logPath, "utf8").catch(() => "");
-  return contents
-    .split(/\r?\n/u)
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as FakeAcpWireRequest);
-}
-
-function makeRecordStore(): {
-  records: Map<string, Record<string, unknown>>;
-  store: TestSessionStore;
-} {
-  const records = new Map<string, Record<string, unknown>>();
-  return {
-    records,
-    store: {
-      load: vi.fn(async (recordId: string) => {
-        const record = records.get(recordId);
-        return record ? structuredClone(record) : undefined;
-      }),
-      save: vi.fn(async (record) => {
-        records.set(String(record.acpxRecordId), structuredClone(record));
-      }),
-    },
-  };
 }
 
 describe("AcpxRuntime fresh reset wrapper", () => {
@@ -1165,5 +1052,3 @@ describe("AcpxRuntime one-shot resume identity", () => {
     }
   }, 20_000);
 });
-
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

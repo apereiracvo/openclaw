@@ -123,12 +123,8 @@ function compactDiagnosticText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function isGenericInternalAcpErrorMessage(message: string): boolean {
-  return message.trim() === "Internal error";
-}
-
 function isGenericInternalAcpError(error: unknown): error is Error {
-  return error instanceof Error && isGenericInternalAcpErrorMessage(error.message);
+  return error instanceof Error && error.message.trim() === "Internal error";
 }
 
 async function readCodexWrapperStderrTail(params: {
@@ -152,12 +148,8 @@ async function readCodexWrapperStderrTail(params: {
 }
 
 function readRecordSessionResumeSupported(record: AcpLoadedSessionRecord): boolean | undefined {
-  if (!record) {
-    return undefined;
-  }
-  return Boolean(
-    record.agentCapabilities?.sessionCapabilities?.resume || record.agentCapabilities?.loadSession,
-  );
+  const caps = record?.agentCapabilities;
+  return record && Boolean(caps?.sessionCapabilities?.resume || caps?.loadSession);
 }
 
 const CODEX_ACP_AGENT_ID = "codex";
@@ -190,11 +182,7 @@ type CodexAcpModelClassification =
   | { kind: "unsupported"; thinkingOverride?: CodexAcpModelOverride };
 
 function readAgentFromSessionKey(sessionKey: string | undefined): string | undefined {
-  const normalized = sessionKey?.trim();
-  if (!normalized) {
-    return undefined;
-  }
-  const match = /^agent:(?<agent>[^:]+):/i.exec(normalized);
+  const match = /^agent:(?<agent>[^:]+):/i.exec(sessionKey?.trim() ?? "");
   return normalizeAgentName(match?.groups?.agent);
 }
 
@@ -289,10 +277,7 @@ function classifyCodexAcpModelRequest(
   const reasoningEffort = rawThinking?.trim() ? thinkingReasoningEffort : modelReasoningEffort;
   return {
     kind: "override",
-    override: {
-      model,
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-    },
+    override: { model, ...(reasoningEffort ? { reasoningEffort } : {}) },
   };
 }
 
@@ -310,15 +295,7 @@ function withCodexSessionModel<T extends { model?: string }>(
 }
 
 function normalizeClaudeAcpModelOverride(rawModel: string | undefined): string | undefined {
-  const raw = rawModel?.trim();
-  if (!raw) {
-    return undefined;
-  }
-  const prefix = raw.match(CLAUDE_ACP_OPENCLAW_PREFIX);
-  if (!prefix) {
-    return raw;
-  }
-  return raw.slice(prefix[0].length).trim() || undefined;
+  return rawModel?.trim().replace(CLAUDE_ACP_OPENCLAW_PREFIX, "").trim() || undefined;
 }
 
 function appendCodexAcpConfigOverrides(
@@ -582,14 +559,13 @@ export class AcpxRuntime implements CompleteAcpRuntime {
       const recordSessionKey = record?.name?.trim() ?? "";
       // Explicit one-shot resume projects the original OpenClaw key over a synthetic ACPX record.
       // Lease ownership remains the synthetic record, so operation validation accepts that exact key.
-      const leaseSessionKeys = new Set([
-        resolveAcpxSessionResource(handle),
-        ...(recordSessionKey ? [recordSessionKey] : []),
-      ]);
+      const ownsLeaseSession = (key: string) =>
+        key === resolveAcpxSessionResource(handle) ||
+        Boolean(recordSessionKey && key === recordSessionKey);
       if (
         lease &&
         (lease.gatewayInstanceId !== identity.gatewayInstanceId ||
-          !leaseSessionKeys.has(lease.sessionKey) ||
+          !ownsLeaseSession(lease.sessionKey) ||
           lease.wrapperRoot !== this.wrapperRoot)
       ) {
         throw new AcpRuntimeError(
@@ -659,9 +635,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         record.name !== sessionKey ||
         record.acpSessionId !== (persistedHandle?.backendSessionId ?? decoded?.backendSessionId) ||
         (!record.agentCapabilities?.loadSession &&
-          !record.agentCapabilities?.sessionCapabilities?.resume) ||
-        record.lastPromptAt !== undefined ||
-        record.messages.some((message) => typeof message !== "string" && "User" in message))
+          !record.agentCapabilities?.sessionCapabilities?.resume))
     ) {
       return undefined;
     }
@@ -927,11 +901,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
       generation,
       resolveBridgeSession(logicalInput)?.native === true,
     );
-    const logicalTarget = {
-      sessionKey: logicalInput.sessionKey,
-      agentId: logicalInput.agentId,
-      bridgeSession: logicalInput.bridgeSession,
-    };
+    const { sessionKey, agentId, bridgeSession } = logicalInput;
     const input = { ...logicalInput, sessionKey: resolveAcpxSessionResource(logicalInput) };
     const isCodexAcp =
       normalizeAgentName(input.agent) === CODEX_ACP_AGENT_ID && isCodexAcpCommand(command);
@@ -1014,16 +984,12 @@ export class AcpxRuntime implements CompleteAcpRuntime {
     });
     // The runtime record may be synthetic for explicit one-shot resumption, but
     // callers retain the original OpenClaw session target and actor.
-    const openClawHandle = { ...handle, ...logicalTarget };
-    let sessionResumeSupported: boolean | undefined;
-    try {
-      sessionResumeSupported = readRecordSessionResumeSupported(
-        await this.sessionStore.load(handle.acpxRecordId ?? handle.sessionKey),
-      );
-    } catch {
-      // Capability observation is best-effort for a newly ensured session. Durable resume
-      // admission requires an explicit true later, so a read failure must remain unknown.
-    }
+    const openClawHandle = { ...handle, sessionKey, agentId, bridgeSession };
+    // Capability observation is best-effort; a failed read must remain unknown for admission.
+    const sessionResumeSupported = await this.sessionStore
+      .load(handle.acpxRecordId ?? handle.sessionKey)
+      .then(readRecordSessionResumeSupported)
+      .catch(() => undefined);
     return {
       ...openClawHandle,
       ...(sessionResumeSupported !== undefined ? { sessionResumeSupported } : {}),
@@ -1113,7 +1079,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
           if (
             result.status !== "failed" ||
             !isCodexAcpCommand(command) ||
-            !isGenericInternalAcpErrorMessage(result.error.message)
+            result.error.message.trim() !== "Internal error"
           ) {
             return result;
           }

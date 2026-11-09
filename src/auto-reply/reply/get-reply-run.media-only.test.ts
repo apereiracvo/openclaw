@@ -17,7 +17,6 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdmittedRunOperatorAuthority } from "../../agents/admitted-run-context.js";
 import { createTestAdmittedRunContext } from "../../agents/admitted-run-context.test-support.js";
-import { buildPrAttributionPrompt } from "../../agents/pr-attribution.js";
 import { createCronTool } from "../../agents/tools/cron-tool.js";
 import {
   getGatewayToolCallerIdentity,
@@ -83,6 +82,8 @@ import {
   nonReasoningModelState,
   preparedTarget,
   resetPreparedReplySessionStore,
+  registerPreparedReplyWorkspaceCases,
+  expectTurnText,
 } from "./get-reply-run.test-support.js";
 import { buildGroupIntro, buildSourceConversationContext } from "./groups.js";
 import {
@@ -137,20 +138,6 @@ const envMockState = vi.hoisted(() => ({ fastTestRuntime: true }));
 vi.mock("../../infra/env.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../infra/env.js")>()),
   isFastTestRuntimeEnv: () => envMockState.fastTestRuntime,
-}));
-
-vi.mock("../../agents/main-session-recovery/main-session-recovery-owner-release.js", () => ({
-  scheduleMainSessionRecoveryPendingTarget: vi.fn(),
-}));
-
-vi.mock("../../config/sessions/restart-recovery-state.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../config/sessions/restart-recovery-state.js")>()),
-  isMainRestartRecoveryCandidate: vi.fn().mockReturnValue(false),
-}));
-
-vi.mock("../../agents/main-session-recovery/main-session-recovery-store.js", () => ({
-  claimMainSessionRecoveryOwner: vi.fn(),
-  releaseMainSessionRecoveryOwner: vi.fn(),
 }));
 
 // Provider profile discovery is owned by thinking.test.ts. Keep the real thinking-policy
@@ -457,17 +444,6 @@ function requireRunReplyAgentCall(index = 0) {
   );
 }
 
-function expectTurnText(call: ReturnType<typeof requireRunReplyAgentCall>, text: string) {
-  expect(call).toMatchObject({
-    commandBody: text,
-    transcriptCommandBody: text,
-    followupRun: { prompt: text, transcriptPrompt: text },
-  });
-}
-
-const PR_ATTRIBUTION_OFF = `PR attribution: ⟦openclaw:ctx⟧
-${buildPrAttributionPrompt(false)}`;
-
 describe("runPreparedReply media-only handling", () => {
   describe.each(["followup", "collect"] as const)("queued owner authority: %s", (mode) => {
     it.each([
@@ -635,8 +611,8 @@ describe("runPreparedReply media-only handling", () => {
           }
           if (kind === "owner-overflow") {
             expect(getExistingFollowupQueue(key)?.items).toHaveLength(1);
-            expect(getExistingFollowupQueue(key)?.summarySources).toHaveLength(1);
-            expect(getExistingFollowupQueue(key)?.summaryElisions[0]?.sources).toHaveLength(1);
+            expect(getExistingFollowupQueue(key)?.summaryEntries).toHaveLength(1);
+            expect(getExistingFollowupQueue(key)?.summaryElisions[0]?.entries).toHaveLength(1);
           }
           if (kind === "revoked-before-drain") {
             current = false;
@@ -849,117 +825,7 @@ describe("runPreparedReply media-only handling", () => {
     expect(requireRunReplyAgentCall().followupRun.run.workspaceDir).toBe("/tmp/session-worktree");
   });
 
-  it.each([
-    { name: "initial", storedCwd: undefined, expected: "/tmp/session-repo" },
-    { name: "replaced", storedCwd: "/tmp/current-repo", expected: "/tmp/current-repo" },
-    { name: "cleared", storedCwd: null, expected: "/tmp/agent-repo" },
-  ])("uses the $name admitted session cwd for execution", async ({ storedCwd, expected }) => {
-    const sessionEntry: SessionEntry = {
-      sessionId: "session-1",
-      updatedAt: 1,
-      spawnedCwd: "/tmp/session-repo",
-      spawnedBy: "agent:default:main",
-    };
-    await runPrepared({
-      cfg: {
-        agents: {
-          defaults: { cwd: "/tmp/default-repo" },
-          entries: { default: { cwd: "/tmp/agent-repo" } },
-        },
-      },
-      sessionEntry,
-      sessionStore:
-        storedCwd !== undefined
-          ? { "session-key": { ...sessionEntry, spawnedCwd: storedCwd ?? undefined } }
-          : undefined,
-    });
-
-    expect(requireRunReplyAgentCall().followupRun.run.cwd).toBe(expected);
-  });
-
-  // A project root may only layer project instructions when sessions.create
-  // durably proved lineage plus a canonicalized selected project. Every other
-  // combination either lacks a project, lacks that provenance, or names a managed
-  // worktree checkout rather than a registered project root.
-  //
-  // A spawned child executes from its creation-validated `spawnedCwd` as the run
-  // workspace (#162308), so `run.workspaceDir` follows that cwd. The agent's
-  // canonical bootstrap identity still resolves from the target agent workspace
-  // (the embedded runner passes it as `bootstrapWorkspaceDir`), so the provenance
-  // gate below decides the project-AGENTS layer independently of the run workspace.
-  it.each([
-    {
-      name: "spawned project child",
-      spawnedBy: "agent:default:main",
-      projectId: "project-1",
-      spawnedCwd: "/tmp/project-repo",
-      worktree: undefined,
-      // The child runs from the selected project root; the layer is the same root.
-      expectedWorkspaceDir: "/tmp/project-repo",
-      expected: "/tmp/project-repo",
-    },
-    {
-      name: "spawned cwd without a registered project",
-      spawnedBy: "agent:default:main",
-      projectId: undefined,
-      spawnedCwd: "/tmp/session-repo",
-      worktree: undefined,
-      // An explicit cwd runs the child in place but carries no project provenance.
-      expectedWorkspaceDir: "/tmp/session-repo",
-      expected: undefined,
-    },
-    {
-      name: "unmarked dashboard project session",
-      spawnedBy: undefined,
-      projectId: "project-1",
-      spawnedCwd: "/tmp/project-repo",
-      worktree: undefined,
-      // A dashboard project session already runs from the project root, so its
-      // AGENTS.md is canonical bootstrap and must not layer a second time.
-      expectedWorkspaceDir: "/tmp/project-repo",
-      expected: undefined,
-    },
-    {
-      // A worktree child carries the same lineage, project, and spawnedCwd triple,
-      // but its cwd is a checkout that may sit at or below the repo root, so it is
-      // never the registered project root this layer claims to be.
-      name: "project worktree child at its checkout root",
-      spawnedBy: "agent:default:main",
-      projectId: "project-1",
-      spawnedCwd: "/tmp/worktrees/repo",
-      worktree: { id: "wt-1", branch: "feature", repoRoot: "/tmp/repos/project-repo" },
-      expectedWorkspaceDir: "/tmp/worktrees/repo",
-      expected: undefined,
-    },
-    {
-      // session-worktree-preparation resolves a nested source workspace against
-      // the checkout, so a naive gate would layer packages/AGENTS.md as a project
-      // root instruction file.
-      name: "project worktree child with a nested spawned cwd",
-      spawnedBy: "agent:default:main",
-      projectId: "project-1",
-      spawnedCwd: "/tmp/worktrees/repo/packages/app",
-      worktree: { id: "wt-1", branch: "feature", repoRoot: "/tmp/repos/project-repo" },
-      expectedWorkspaceDir: "/tmp/worktrees/repo/packages/app",
-      expected: undefined,
-    },
-  ])("resolves the project instruction root for a $name", async (row) => {
-    await runPrepared({
-      cfg: { agents: { defaults: { cwd: "/tmp/default-repo" } } },
-      workspaceDir: "/tmp/agent-workspace",
-      sessionEntry: {
-        sessionId: "session-1",
-        updatedAt: Date.now(),
-        spawnedBy: row.spawnedBy,
-        projectId: row.projectId,
-        spawnedCwd: row.spawnedCwd,
-        worktree: row.worktree,
-      },
-    });
-    const run = requireRunReplyAgentCall().followupRun.run;
-    expect(run.workspaceDir).toBe(row.expectedWorkspaceDir);
-    expect(run.executionAgentsRootDir).toBe(row.expected);
-  });
+  registerPreparedReplyWorkspaceCases({ runPrepared, requireRunReplyAgentCall });
 
   beforeEach(async () => {
     loadSessionEntryMock.mockReset();
@@ -1153,7 +1019,6 @@ describe("runPreparedReply media-only handling", () => {
     expectTurnText(call, "please answer here");
     expect(call.followupRun.currentInboundContext?.text).toBe(
       [
-        PR_ATTRIBUTION_OFF,
         "Current message:\nchat_id=-100123\ninbound_event_kind: user_request",
         MESSAGE_TOOL_ONLY_DELIVERY_HINT,
       ].join("\n\n"),
@@ -2358,9 +2223,7 @@ describe("runPreparedReply media-only handling", () => {
 
     const followupRun = requireRunReplyAgentCall().followupRun;
     const context = followupRun.currentInboundContext;
-    expect(followupRun.prompt).toBe(
-      [PR_ATTRIBUTION_OFF, "A new session was started via /new or /reset."].join("\n\n"),
-    );
+    expect(followupRun.prompt).toBe("A new session was started via /new or /reset.");
     for (const event of [
       "Slack reaction added: :eyes:",
       "Slack message in #claw-test from Alice",
